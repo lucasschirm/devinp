@@ -40,6 +40,7 @@ jobs:
 
       - run: npm ci
       - run: npm test
+      - run: npm run build # bundle src → bin/ (also runs via prepack)
 
       - name: Bump patch version
         run: |

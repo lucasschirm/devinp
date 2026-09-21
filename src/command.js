@@ -64,7 +64,7 @@ export default class Devinp extends Command {
       this.error(error instanceof Error ? error.message : String(error), {exit: 1})
     }
 
-    const swe = await loadSweScores()
+    const swe = await loadSweScores(this.config.root)
     const rows = buildRows(data, swe)
 
     if (flags.json) {

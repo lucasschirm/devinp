@@ -8,7 +8,6 @@
   },
   "files": [
     "bin",
-    "src",
     "data"
   ],
   "repository": {
@@ -31,6 +30,10 @@
     "node": ">=18.0.0"
   },
   "scripts": {
+    "build": "node scripts/build.js",
+    "dev": "npm run build && node bin/run.js",
+    "prepack": "npm run build",
+    "prepare": "npm run build",
     "test": "node --test",
     "update-swe": "node scripts/update-swe.js"
   },
@@ -39,13 +42,14 @@
     "dirname": "devinp",
     "commands": {
       "strategy": "single",
-      "target": "./src/command.js"
+      "target": "./bin/command.js"
     }
   },
-  "dependencies": {
+  "license": "MIT",
+  "devDependencies": {
     "@oclif/core": "^5.0.0",
     "ansis": "^3.17.0",
+    "esbuild": "^0.28.2",
     "fastify": "^5.12.4"
-  },
-  "license": "MIT"
+  }
 }
