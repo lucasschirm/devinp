@@ -1,0 +1,55 @@
+{
+  "name": "@lucasschirm/devinp",
+  "version": "0.1.0",
+  "description": "Pretty pricing table for Devin models, powered by `devin models list`",
+  "type": "module",
+  "bin": {
+    "devinp": "./bin/run.js"
+  },
+  "files": [
+    "bin",
+    "data"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lucasschirm/devinp.git"
+  },
+  "bugs": "https://github.com/lucasschirm/devinp/issues",
+  "homepage": "https://github.com/lucasschirm/devinp#readme",
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "devin",
+    "pricing",
+    "models",
+    "swe-bench",
+    "cli"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "build": "node scripts/build.js",
+    "dev": "npm run build && node bin/run.js",
+    "prepack": "npm run build",
+    "prepare": "npm run build",
+    "test": "node --test",
+    "update-swe": "node scripts/update-swe.js"
+  },
+  "oclif": {
+    "bin": "devinp",
+    "dirname": "devinp",
+    "commands": {
+      "strategy": "single",
+      "target": "./bin/command.js"
+    }
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@oclif/core": "^5.0.0",
+    "ansis": "^3.17.0",
+    "esbuild": "^0.28.2",
+    "fastify": "^5.12.4"
+  }
+}
