@@ -1,0 +1,52 @@
+name: publish
+
+# Publishes a patch release on every push to main (and on manual dispatch).
+# Uses npm trusted publishing (OIDC) — no NPM_TOKEN secret needed.
+# Requires the trusted publisher to be configured on npmjs.com:
+#   package Settings → Publishing access → GitHub Actions
+#   repository: lucasschirm/devinp · workflow: publish.yml
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write # push the version-bump commit + tag
+  id-token: write # OIDC token for npm trusted publishing
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    # Skip when the pushed commit is the version bump this workflow created.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      !startsWith(github.event.head_commit.message, 'chore(release)')
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          registry-url: https://registry.npmjs.org
+
+      # npm >= 11.5.1 is required for OIDC trusted publishing.
+      - run: npm install -g npm@latest
+
+      - run: npm ci
+      - run: npm test
+
+      - name: Bump patch version
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          npm version patch -m "chore(release): %s"
+
+      - run: git push --follow-tags
+
+      - run: npm publish --provenance --access public
