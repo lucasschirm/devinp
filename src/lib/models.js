@@ -69,9 +69,10 @@ export function buildRows(data, scores = {}) {
 }
 
 function computeValue(score, output) {
+  // Free models are unbeatable value — with or without a bench score.
+  if (output === 0) return Number.POSITIVE_INFINITY
   if (score == null) return null
   if (output == null) return null
-  if (output === 0) return Number.POSITIVE_INFINITY
   return score / output
 }
 
@@ -85,6 +86,7 @@ export const SORTS = {
   cached: priceAsc('cached'),
   output: priceAsc('output'),
   bench: (a, b) =>
+    (b.free ? 1 : 0) - (a.free ? 1 : 0) ||
     (b.bench?.score ?? -1) - (a.bench?.score ?? -1) ||
     (a.output ?? Number.POSITIVE_INFINITY) - (b.output ?? Number.POSITIVE_INFINITY) ||
     a.label.localeCompare(b.label),

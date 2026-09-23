@@ -54,8 +54,9 @@ devinp --json                # emit normalized rows as JSON
 
 - Prices are USD per 1M tokens; columns are heat-colored green → red.
 - **Value** = `Bench % ÷ output $/1M` — the score you buy per output dollar.
-  Free models show `∞`; models without a Bench score show `—` and sort last
-  under `-o=bench` / `-o=value`.
+  Free models always show `∞` and sort first under `-o=bench` / `-o=value`,
+  even without a Bench score. Paid models without a score show `—` and sort
+  last.
 - Markers: `β` = beta, `●` = new, magenta name = free. `Sidekick` shows the
   partner-model pricing for Fusion rows.
 - Colors disable automatically when piping; `NO_COLOR` / `FORCE_COLOR` are
