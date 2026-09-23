@@ -33,7 +33,7 @@ const PAGE = `<!doctype html>
   td.name, th.name { text-align: left; font-weight: 600; }
   td.dim { color: #64748b; }
   td.free { color: #e879f9; }
-  td.swe { color: #22d3ee; font-weight: 600; }
+  td.bench { color: #22d3ee; font-weight: 600; }
   td.value { color: #4ade80; font-weight: 700; }
   tr.section td {
     color: #7dd3fc; font-weight: 700; text-align: left;
@@ -44,12 +44,12 @@ const PAGE = `<!doctype html>
 </head>
 <body>
   <h1>devinp</h1>
-  <div class="sub">Devin model prices · per 1M tokens · value = SWE % ÷ output $/1M</div>
+  <div class="sub">Devin model prices · per 1M tokens · value = Bench % ÷ output $/1M</div>
   <div class="controls">
     <label>sort
       <select id="order">
-        <option value="value">best value (SWE ÷ output)</option>
-        <option value="swe">SWE-bench score</option>
+        <option value="value">best value (Bench ÷ output)</option>
+        <option value="bench">BenchLM score</option>
         <option value="input">input price</option>
         <option value="cached">cached price</option>
         <option value="output">output price</option>
@@ -68,7 +68,7 @@ const PAGE = `<!doctype html>
   <table>
     <thead><tr>
       <th>#</th><th class="name">Model</th><th>Ctx</th><th>Input</th>
-      <th>Cached</th><th>Output</th><th>SWE %</th><th>Value</th><th id="sk"></th>
+      <th>Cached</th><th>Output</th><th>Bench %</th><th>Value</th><th id="sk"></th>
     </tr></thead>
     <tbody id="body"></tbody>
   </table>
@@ -82,7 +82,7 @@ const heat = (v, lo, hi) => v == null ? '<span class="dim">—</span>'
 
 async function main() {
   const res = await fetch('/api/models');
-  const {rows, swe} = await res.json();
+  const {rows, bench} = await res.json();
   const range = (f) => { const vs = rows.map(r => r[f]).filter(v => v != null); return [Math.min(...vs), Math.max(...vs)]; };
   const RI = range('input'), RC = range('cached'), RO = range('output');
   const hasSk = rows.some(r => r.sidekick);
@@ -92,8 +92,8 @@ async function main() {
     input: (a, b) => (a.input ?? 1e9) - (b.input ?? 1e9) || (a.output ?? 1e9) - (b.output ?? 1e9) || a.label.localeCompare(b.label),
     cached: (a, b) => (a.cached ?? 1e9) - (b.cached ?? 1e9) || (a.output ?? 1e9) - (b.output ?? 1e9) || a.label.localeCompare(b.label),
     output: (a, b) => (a.output ?? 1e9) - (b.output ?? 1e9) || a.label.localeCompare(b.label),
-    swe: (a, b) => (b.swe?.resolved ?? -1) - (a.swe?.resolved ?? -1) || (a.output ?? 1e9) - (b.output ?? 1e9) || a.label.localeCompare(b.label),
-    value: (a, b) => (b.value ?? -1) - (a.value ?? -1) || (b.swe?.resolved ?? -1) - (a.swe?.resolved ?? -1) || a.label.localeCompare(b.label),
+    bench: (a, b) => (b.bench?.score ?? -1) - (a.bench?.score ?? -1) || (a.output ?? 1e9) - (b.output ?? 1e9) || a.label.localeCompare(b.label),
+    value: (a, b) => (b.value ?? -1) - (a.value ?? -1) || (b.bench?.score ?? -1) - (a.bench?.score ?? -1) || a.label.localeCompare(b.label),
   };
   const GROUPS = {
     family: {key: r => r.familySlug, head: r => r.familyLabel},
@@ -129,7 +129,7 @@ async function main() {
           + '<td>' + heat(r.input, ...RI) + '</td>'
           + '<td>' + heat(r.cached, ...RC) + '</td>'
           + '<td>' + heat(r.output, ...RO) + '</td>'
-          + '<td class="swe">' + (r.swe ? r.swe.resolved + '%' : '<span class="dim">—</span>') + '</td>'
+          + '<td class="bench">' + (r.bench ? r.bench.score + '%' : '<span class="dim">—</span>') + '</td>'
           + '<td class="value">' + (r.value == null ? '<span class="dim">—</span>' : !isFinite(r.value) ? '∞' : r.value.toFixed(2)) + '</td>'
           + (hasSk ? '<td class="dim">' + (r.sidekick ? '$' + r.sidekick.input + '/$' + r.sidekick.cached + '/$' + r.sidekick.output : '—') + '</td>' : '')
           + '</tr>';
@@ -137,9 +137,9 @@ async function main() {
     }
     document.getElementById('body').innerHTML = html;
     document.getElementById('count').textContent = n + ' rows';
-    document.getElementById('legend').textContent = swe.updated
-      ? 'SWE-bench Verified (mini-SWE-agent) · scores updated ' + swe.updated
-      : 'SWE scores not available';
+    document.getElementById('legend').textContent = bench.updated
+      ? 'BenchLM (coding) · scores updated ' + bench.updated
+      : 'Bench scores not available';
   }
   document.getElementById('order').onchange = render;
   document.getElementById('group').onchange = render;
@@ -150,13 +150,13 @@ main();
 </body>
 </html>`
 
-export async function startServer({rows, sweMeta, port, log}) {
+export async function startServer({rows, benchMeta, port, log}) {
   const app = Fastify({logger: false})
 
   app.get('/', async (_request, reply) => {
     reply.type('text/html').send(PAGE)
   })
-  app.get('/api/models', async () => ({rows, swe: sweMeta ?? {}}))
+  app.get('/api/models', async () => ({rows, bench: benchMeta ?? {}}))
 
   const address = await app.listen({port, host: '127.0.0.1'})
   log(`devinp web — ${address}`)

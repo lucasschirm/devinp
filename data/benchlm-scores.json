@@ -1,0 +1,293 @@
+{
+  "updated": "2026-09-22",
+  "source": "https://benchlm.ai/api/data/leaderboard?category=coding&limit=200",
+  "models": {
+    "claude-fable-5": {
+      "score": 74.47,
+      "benchName": "Claude Fable 5",
+      "supported": true
+    },
+    "claude-fable-5.1": {
+      "score": 81.29,
+      "benchName": "Claude Fable 5.1",
+      "supported": true
+    },
+    "claude-haiku-4.5": {
+      "score": 19.77,
+      "benchName": "Claude Haiku 4.5",
+      "supported": true
+    },
+    "claude-opus-4.5": {
+      "score": 46.1,
+      "benchName": "Claude Opus 4.5",
+      "supported": false
+    },
+    "claude-opus-4.6": {
+      "score": 51.32,
+      "benchName": "Claude Opus 4.6",
+      "supported": true
+    },
+    "claude-opus-4.7": {
+      "score": 59.77,
+      "benchName": "Claude Opus 4.7",
+      "supported": true
+    },
+    "claude-opus-4.8": {
+      "score": 63.58,
+      "benchName": "Claude Opus 4.8",
+      "supported": true
+    },
+    "claude-opus-5": {
+      "score": 72.91,
+      "benchName": "Claude Opus 5",
+      "supported": true
+    },
+    "claude-opus-5.5": {
+      "score": 86.85,
+      "benchName": "Claude Opus 5.5",
+      "supported": true
+    },
+    "claude-sonnet-4.6": {
+      "score": 48.52,
+      "benchName": "Claude Sonnet 4.6",
+      "supported": true
+    },
+    "claude-sonnet-5": {
+      "score": 61.05,
+      "benchName": "Claude Sonnet 5",
+      "supported": true
+    },
+    "gemini-3-flash": {
+      "score": 36.84,
+      "benchName": "Gemini 3 Flash",
+      "supported": true
+    },
+    "gemini-3.1-pro": {
+      "score": 43.36,
+      "benchName": "Gemini 3.1 Pro",
+      "supported": true
+    },
+    "gemini-3.5-flash": {
+      "score": 53.7,
+      "benchName": "Gemini 3.5 Flash",
+      "supported": true
+    },
+    "gemini-3.6-flash": {
+      "score": 54.73,
+      "benchName": "Gemini 3.6 Flash",
+      "supported": true
+    },
+    "gemini-3.7-flash": {
+      "score": 59.79,
+      "benchName": "Gemini 3.7 Flash",
+      "supported": true
+    },
+    "gemini-3.8-flash": {
+      "score": 64.14,
+      "benchName": "Gemini 3.8 Flash",
+      "supported": true
+    },
+    "glm-5.2": {
+      "score": 57.32,
+      "benchName": "GLM-5.2",
+      "supported": true
+    },
+    "glm-5.3": {
+      "score": 58.15,
+      "benchName": "GLM-5.3",
+      "supported": true
+    },
+    "glm-5.3-flash": {
+      "score": 51.6,
+      "benchName": "GLM-5.3-Flash",
+      "supported": true
+    },
+    "gpt-5.1": {
+      "score": 39.77,
+      "benchName": "GPT-5.1",
+      "supported": true
+    },
+    "gpt-5.2": {
+      "score": 41.57,
+      "benchName": "GPT-5.2",
+      "supported": true
+    },
+    "gpt-5.3-codex": {
+      "score": 56.8,
+      "benchName": "GPT-5.3 Codex",
+      "supported": true
+    },
+    "gpt-5.4": {
+      "score": 50.93,
+      "benchName": "GPT-5.4",
+      "supported": true
+    },
+    "gpt-5.4-mini": {
+      "score": 38.61,
+      "benchName": "GPT-5.4 mini",
+      "supported": true
+    },
+    "gpt-5.5": {
+      "score": 64.47,
+      "benchName": "GPT-5.5",
+      "supported": true
+    },
+    "gpt-5.6-luna": {
+      "score": 64.72,
+      "benchName": "GPT-5.6 Luna",
+      "supported": true
+    },
+    "gpt-5.6-sol": {
+      "score": 71.77,
+      "benchName": "GPT-5.6 Sol",
+      "supported": true
+    },
+    "gpt-5.6-terra": {
+      "score": 65.05,
+      "benchName": "GPT-5.6 Terra",
+      "supported": true
+    },
+    "gpt-6-astra": {
+      "score": 74.43,
+      "benchName": "GPT-6 Astra",
+      "supported": true
+    },
+    "gpt-6-luna": {
+      "score": 59.93,
+      "benchName": "GPT-6 Luna",
+      "supported": true
+    },
+    "gpt-6-sol": {
+      "score": 65.48,
+      "benchName": "GPT-6 Sol",
+      "supported": true
+    },
+    "grok-4.5": {
+      "score": 58.55,
+      "benchName": "Grok 4.5",
+      "supported": true
+    },
+    "grok-4.6": {
+      "score": 62.55,
+      "benchName": "Grok 4.6",
+      "supported": true
+    },
+    "inkling": {
+      "score": 37.23,
+      "benchName": "Inkling",
+      "supported": true
+    },
+    "kimi-k2.6": {
+      "score": 47.36,
+      "benchName": "Kimi K2.6",
+      "supported": true
+    },
+    "kimi-k3": {
+      "score": 63.31,
+      "benchName": "Kimi K3",
+      "supported": true
+    },
+    "nemotron-3-ultra": {
+      "score": 23.53,
+      "benchName": "Nemotron 3 Ultra",
+      "supported": true
+    }
+  },
+  "unmatched": [
+    "Apodex 1.1",
+    "Claude 3 Opus",
+    "Command A+",
+    "DeepSeek V3",
+    "DeepSeek V3.2",
+    "DeepSeek V3.2 (Thinking)",
+    "DeepSeek V4 Pro 0813",
+    "GLM-4.6",
+    "GLM-4.7",
+    "GLM-5",
+    "GLM-5.1",
+    "GLM-5V-Turbo",
+    "GPT-4 Turbo",
+    "GPT-4.1 mini",
+    "GPT-4.1 nano",
+    "GPT-4o mini",
+    "GPT-5 (medium)",
+    "GPT-5 mini",
+    "GPT-5.1-Codex",
+    "GPT-5.2-Codex",
+    "GPT-5.4 nano",
+    "GPT-OSS 120B",
+    "GPT-OSS 20B",
+    "Gemini 1.5 Pro",
+    "Gemini 2.5 Pro",
+    "Gemini 3 Pro",
+    "Gemini 3.1 Flash-Lite",
+    "Gemini 3.5 Flash-Lite",
+    "Gemma 3 27B",
+    "Gemma 4 12B",
+    "Gemma 4 26B A4B",
+    "Gemma 4 31B",
+    "Gemma 4 E2B",
+    "Gemma 4 E4B",
+    "Granite 4.2 8B",
+    "Grok 4 Fast (Reasoning)",
+    "Grok 4.1 Fast (Reasoning)",
+    "Grok 4.20",
+    "Grok 4.3",
+    "Grok Build 0.1",
+    "Grok Code Fast 1",
+    "Hy3",
+    "Hy3 Preview",
+    "Hy4 preview",
+    "Inkling-Small",
+    "K-Exaone",
+    "Kimi K2.5",
+    "Kimi K2.7 Code",
+    "LFM2.5-2.6B",
+    "Laguna M.1",
+    "Laguna XS.2",
+    "Ling 2.6 Flash",
+    "Ling 3.0 Flash",
+    "Llama 4 Maverick",
+    "Llama 4 Scout",
+    "Mercury 2",
+    "Mercury 2.5",
+    "MiMo-V2-Flash",
+    "MiMo-V2-Pro",
+    "MiMo-V2.5",
+    "MiMo-V2.5-Pro",
+    "MiniMax M2.5",
+    "MiniMax M2.7",
+    "MiniMax M3",
+    "Ministral 3 14B",
+    "Ministral 3 3B",
+    "Ministral 3 8B",
+    "Mistral Large 3",
+    "Mistral Medium 3.5 128B",
+    "Mistral Small 4",
+    "Muse Glimmer 30B",
+    "Muse Spark",
+    "Muse Spark 1.1",
+    "Muse Spark 1.2",
+    "Nemotron 3 Nano Omni 30B A3B",
+    "Nemotron 3.5 Lightning 30B A3B NVFP4",
+    "Ornith-1.5-35B-A3B",
+    "Ornith-1.5-397B",
+    "Qwen 3.6 Max (preview)",
+    "Qwen3.5 Flash",
+    "Qwen3.5-122B-A10B",
+    "Qwen3.5-27B",
+    "Qwen3.5-35B-A3B",
+    "Qwen3.6 Plus",
+    "Qwen3.6-27B",
+    "Qwen3.6-35B-A3B",
+    "Qwen3.7 Max",
+    "Qwen3.7 Plus",
+    "Qwen3.8 Max",
+    "Qwen3.8-27B",
+    "Qwen3.8-Flash-Next",
+    "Step 3.7 Flash",
+    "Trinity-Large-Thinking",
+    "o1",
+    "o1-preview"
+  ]
+}

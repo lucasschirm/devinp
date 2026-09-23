@@ -52,8 +52,8 @@ describe('buildRows', () => {
     assert.ok(withSk.every((r) => r.label.startsWith('Fusion (')))
   })
 
-  it('computes value = resolved / output and leaves it null without a score', () => {
-    const scored = buildRows(data, {models: {'gemini-3-flash': {resolved: 75.8}}})
+  it('computes value = score / output and leaves it null without a score', () => {
+    const scored = buildRows(data, {models: {'gemini-3-flash': {score: 75.8}}})
     const flash = scored.find((r) => r.familySlug === 'gemini-3-flash')
     assert.ok(Math.abs(flash.value - 75.8 / flash.output) < 1e-9)
     const unscored = scored.find((r) => r.familySlug === 'claude-opus-5')
@@ -76,11 +76,11 @@ describe('arrangeRows', () => {
     assert.ok(sections.every((s) => typeof s.header === 'string'))
   })
 
-  it('puts rows without SWE scores last in swe order', () => {
-    const sections = arrangeRows(rows, {order: 'swe'})
+  it('puts rows without Bench scores last in bench order', () => {
+    const sections = arrangeRows(rows, {order: 'bench'})
     const flat = sections[0].rows
-    const scored = flat.filter((r) => r.swe)
-    assert.ok(scored.length === 0 || flat.indexOf(scored.at(-1)) < flat.indexOf(flat.find((r) => !r.swe) ?? flat.at(-1)))
+    const scored = flat.filter((r) => r.bench)
+    assert.ok(scored.length === 0 || flat.indexOf(scored.at(-1)) < flat.indexOf(flat.find((r) => !r.bench) ?? flat.at(-1)))
   })
 })
 

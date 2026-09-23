@@ -2,15 +2,15 @@ import {Command, Flags} from '@oclif/core'
 
 import {arrangeRows, buildRows, GROUP_IDS, SORT_IDS} from './lib/models.js'
 import {renderTable} from './lib/render-table.js'
+import {loadScores} from './lib/scores.js'
 import {startServer} from './lib/server.js'
 import {loadModelData} from './lib/source.js'
-import {loadSweScores} from './lib/swe.js'
 
 export default class Devinp extends Command {
   static summary = 'Show Devin model prices in a pretty table'
   static description = [
     'Reads prices from `devin models list --format json` (or a saved snapshot via',
-    '--source), joins SWE-bench Verified scores from data/swe-scores.json, and',
+    '--source), joins BenchLM coding scores from data/benchlm-scores.json, and',
     'renders a sorted pricing table. Thinking-effort variants that share a price',
     'are collapsed into one row.',
   ].join('\n')
@@ -18,7 +18,7 @@ export default class Devinp extends Command {
   static examples = [
     '<%= config.bin %>',
     '<%= config.bin %> -o=input',
-    '<%= config.bin %> -o=swe -g=family',
+    '<%= config.bin %> -o=bench -g=family',
     '<%= config.bin %> --web --port 8080',
     '<%= config.bin %> --source sample/models.json',
   ]
@@ -28,7 +28,7 @@ export default class Devinp extends Command {
       char: 'o',
       options: SORT_IDS,
       default: 'value',
-      summary: 'sort by input | cached | output price, swe score, or value (SWE ÷ output)',
+      summary: 'sort by input | cached | output price, bench score, or value (Bench ÷ output)',
     }),
     group: Flags.string({
       char: 'g',
@@ -64,8 +64,8 @@ export default class Devinp extends Command {
       this.error(error instanceof Error ? error.message : String(error), {exit: 1})
     }
 
-    const swe = await loadSweScores(this.config.root)
-    const rows = buildRows(data, swe)
+    const scores = await loadScores(this.config.root)
+    const rows = buildRows(data, scores)
 
     if (flags.json) {
       this.log(JSON.stringify(rows, null, 2))
@@ -73,11 +73,11 @@ export default class Devinp extends Command {
     }
 
     if (flags.web) {
-      await startServer({rows, sweMeta: swe.meta, port: flags.port, log: (m) => this.log(m)})
+      await startServer({rows, benchMeta: scores.meta, port: flags.port, log: (m) => this.log(m)})
       return
     }
 
     const sections = arrangeRows(rows, {order: flags.order, group: flags.group})
-    this.log(renderTable(sections, {sweMeta: swe.meta}))
+    this.log(renderTable(sections, {benchMeta: scores.meta}))
   }
 }

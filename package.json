@@ -23,7 +23,7 @@
     "devin",
     "pricing",
     "models",
-    "swe-bench",
+    "benchlm",
     "cli"
   ],
   "engines": {
@@ -35,7 +35,7 @@
     "prepack": "npm run build",
     "prepare": "npm run build",
     "test": "node --test",
-    "update-swe": "node scripts/update-swe.js"
+    "update-benchlm": "node scripts/update-benchlm.js"
   },
   "oclif": {
     "bin": "devinp",

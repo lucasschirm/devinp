@@ -32,10 +32,10 @@ function priceKey(cost) {
  * Flatten {families: [...]} into display rows. Effort variants that share the
  * same normalized label, context and prices collapse into one row.
  */
-export function buildRows(data, sweScores = {}) {
+export function buildRows(data, scores = {}) {
   const rows = new Map()
   for (const family of data.families ?? []) {
-    const swe = sweScores.models?.[family.slug] ?? null
+    const bench = scores.models?.[family.slug] ?? null
     for (const variant of family.variants ?? []) {
       const cost = parseCostSummary(variant.cost_summary)
       const label = normalizeLabel(variant.label, family.family_label)
@@ -60,19 +60,19 @@ export function buildRows(data, sweScores = {}) {
         isBeta: Boolean(variant.is_beta),
         isNew: Boolean(variant.is_new),
         variantCount: 1,
-        swe: swe ? {resolved: swe.resolved, sweName: swe.sweName} : null,
-        value: computeValue(swe?.resolved, cost.output),
+        bench: bench ? {score: bench.score, benchName: bench.benchName} : null,
+        value: computeValue(bench?.score, cost.output),
       })
     }
   }
   return [...rows.values()]
 }
 
-function computeValue(resolved, output) {
-  if (resolved == null) return null
+function computeValue(score, output) {
+  if (score == null) return null
   if (output == null) return null
   if (output === 0) return Number.POSITIVE_INFINITY
-  return resolved / output
+  return score / output
 }
 
 const priceAsc = (field) => (a, b) =>
@@ -84,13 +84,13 @@ export const SORTS = {
   input: priceAsc('input'),
   cached: priceAsc('cached'),
   output: priceAsc('output'),
-  swe: (a, b) =>
-    (b.swe?.resolved ?? -1) - (a.swe?.resolved ?? -1) ||
+  bench: (a, b) =>
+    (b.bench?.score ?? -1) - (a.bench?.score ?? -1) ||
     (a.output ?? Number.POSITIVE_INFINITY) - (b.output ?? Number.POSITIVE_INFINITY) ||
     a.label.localeCompare(b.label),
   value: (a, b) =>
     (b.value ?? -1) - (a.value ?? -1) ||
-    (b.swe?.resolved ?? -1) - (a.swe?.resolved ?? -1) ||
+    (b.bench?.score ?? -1) - (a.bench?.score ?? -1) ||
     a.label.localeCompare(b.label),
 }
 
