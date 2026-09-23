@@ -35,10 +35,10 @@ function formatValue(c, row) {
   return c.bold.green(row.value.toFixed(2))
 }
 
-function formatSwe(c, row) {
-  if (row.swe == null) return c.dim('—')
-  const text = `${row.swe.resolved}%`
-  return row.swe.resolved >= 70 ? c.cyan.bold(text) : c.cyan(text)
+function formatBench(c, row) {
+  if (row.bench == null) return c.dim('—')
+  const text = `${row.bench.score}%`
+  return row.bench.score >= 70 ? c.cyan.bold(text) : c.cyan(text)
 }
 
 function formatLabel(c, row) {
@@ -67,7 +67,7 @@ export function colorsEnabled(stream = process.stdout) {
 /**
  * Render sections [{header, rows}] as a colored unicode table.
  */
-export function renderTable(sections, {sweMeta, colors = colorsEnabled()} = {}) {
+export function renderTable(sections, {benchMeta, colors = colorsEnabled()} = {}) {
   const c = colors ? ansis : plain
   const allRows = sections.flatMap((s) => s.rows)
   const hasSidekick = allRows.some((r) => r.sidekick)
@@ -84,7 +84,7 @@ export function renderTable(sections, {sweMeta, colors = colorsEnabled()} = {}) 
     {title: 'Input', align: 'right'},
     {title: 'Cached', align: 'right'},
     {title: 'Output', align: 'right'},
-    {title: 'SWE %', align: 'right'},
+    {title: 'Bench %', align: 'right'},
     {title: 'Value', align: 'right'},
   ]
   if (hasSidekick) columns.push({title: 'Sidekick i/c/o', align: 'left'})
@@ -103,7 +103,7 @@ export function renderTable(sections, {sweMeta, colors = colorsEnabled()} = {}) 
           formatPrice(c, row.input, ...ranges.input),
           formatPrice(c, row.cached, ...ranges.cached),
           formatPrice(c, row.output, ...ranges.output),
-          formatSwe(c, row),
+          formatBench(c, row),
           formatValue(c, row),
           ...(hasSidekick ? [formatSidekick(c, row)] : []),
         ],
@@ -139,10 +139,10 @@ export function renderTable(sections, {sweMeta, colors = colorsEnabled()} = {}) 
 
   const legend = [
     c.dim('prices per 1M tokens'),
-    c.dim('value = SWE % ÷ output $/1M'),
-    sweMeta?.updated
-      ? c.dim(`SWE-bench Verified (mini-SWE-agent) · updated ${sweMeta.updated}`)
-      : c.dim('SWE scores: not available'),
+    c.dim('value = Bench % ÷ output $/1M'),
+    benchMeta?.updated
+      ? c.dim(`BenchLM (coding) · updated ${benchMeta.updated}`)
+      : c.dim('Bench scores: not available'),
   ]
   return `${out.join('\n')}\n${legend.join(c.dim(' · '))}`
 }

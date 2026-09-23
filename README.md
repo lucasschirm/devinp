@@ -1,7 +1,7 @@
 # devinp
 
 Pretty pricing table for [Devin](https://devin.ai) models — reads live prices
-from `devin models list`, joins SWE-bench Verified scores, and renders a
+from `devin models list`, joins BenchLM coding scores, and renders a
 sorted table in your terminal or a web page.
 
 Thinking-effort variants that share a price (`low`, `medium`, `high`, `xhigh`,
@@ -27,12 +27,12 @@ The package ships as a self-contained bundle — no dependencies are installed.
 ## Usage
 
 ```sh
-devinp                       # table sorted by best value (SWE % ÷ output price)
+devinp                       # table sorted by best value (Bench % ÷ output price)
 devinp -o=input              # cheapest input price first
 devinp -o=cached             # cheapest cached-input price first
 devinp -o=output             # cheapest output price first
-devinp -o=swe                # highest SWE-bench Verified score first
-devinp -o=value              # default: best SWE score per output dollar
+devinp -o=bench              # highest BenchLM coding score first
+devinp -o=value              # default: best Bench score per output dollar
 
 devinp -g=family             # section the table by model family
 devinp -g=price              # section by identical price tier
@@ -48,33 +48,35 @@ devinp --json                # emit normalized rows as JSON
 ### Reading the table
 
 ```
-│  # │ Model           │   Ctx │ Input │ Cached │ Output │  SWE % │ Value │ Sidekick i/c/o │
-│  1 │ Gemini 3 Flash  │ 1.05M │  $0.5 │  $0.05 │     $3 │  75.8% │ 25.27 │ —              │
+│  # │ Model           │   Ctx │ Input │ Cached │ Output │ Bench % │ Value │ Sidekick i/c/o │
+│  1 │ Gemini 3.8 Flash│ 1.05M │ $0.75 │  $0.08 │  $3.75 │  64.1%  │ 17.10 │ —              │
 ```
 
 - Prices are USD per 1M tokens; columns are heat-colored green → red.
-- **Value** = `SWE % ÷ output $/1M` — the score you buy per output dollar.
-  Free models show `∞`; models without a SWE score show `—` and sort last
-  under `-o=swe` / `-o=value`.
+- **Value** = `Bench % ÷ output $/1M` — the score you buy per output dollar.
+  Free models show `∞`; models without a Bench score show `—` and sort last
+  under `-o=bench` / `-o=value`.
 - Markers: `β` = beta, `●` = new, magenta name = free. `Sidekick` shows the
   partner-model pricing for Fusion rows.
 - Colors disable automatically when piping; `NO_COLOR` / `FORCE_COLOR` are
   respected.
 
-## SWE-bench scores
+## BenchLM scores
 
-Scores live in `data/swe-scores.json` and ship with the package. To refresh
+Scores live in `data/benchlm-scores.json` and ship with the package. To refresh
 them (maintainers, manual — not automated):
 
 ```sh
-npm run update-swe
+npm run update-benchlm
 ```
 
-This scrapes the embedded leaderboard JSON on
-[swebench.com](https://www.swebench.com) — the **Verified** board's
-`mini-SWE-agent` ("Bash Only") entries — and writes `data/swe-scores.json`.
-Leaderboard names that don't map to a family slug are reported under
-`unmatched`; add entries to `MANUAL_MAP` in `scripts/update-swe.js` to fix them.
+This fetches the [BenchLM](https://benchlm.ai/embed) leaderboard API
+(`api/data/leaderboard?category=coding&limit=200` — the limit is raised from
+the default 50 so the long tail of the board is included) and writes
+`data/benchlm-scores.json`. Model names are
+matched to Devin family slugs order-insensitively; names that still don't map
+are reported under `unmatched` — add entries to `MANUAL_MAP` in
+`scripts/update-benchlm.js` to fix them.
 
 ## Development
 
