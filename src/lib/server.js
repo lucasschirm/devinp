@@ -92,7 +92,7 @@ async function main() {
     input: (a, b) => (a.input ?? 1e9) - (b.input ?? 1e9) || (a.output ?? 1e9) - (b.output ?? 1e9) || a.label.localeCompare(b.label),
     cached: (a, b) => (a.cached ?? 1e9) - (b.cached ?? 1e9) || (a.output ?? 1e9) - (b.output ?? 1e9) || a.label.localeCompare(b.label),
     output: (a, b) => (a.output ?? 1e9) - (b.output ?? 1e9) || a.label.localeCompare(b.label),
-    bench: (a, b) => (b.bench?.score ?? -1) - (a.bench?.score ?? -1) || (a.output ?? 1e9) - (b.output ?? 1e9) || a.label.localeCompare(b.label),
+    bench: (a, b) => (b.free ? 1 : 0) - (a.free ? 1 : 0) || (b.bench?.score ?? -1) - (a.bench?.score ?? -1) || (a.output ?? 1e9) - (b.output ?? 1e9) || a.label.localeCompare(b.label),
     value: (a, b) => (b.value ?? -1) - (a.value ?? -1) || (b.bench?.score ?? -1) - (a.bench?.score ?? -1) || a.label.localeCompare(b.label),
   };
   const GROUPS = {

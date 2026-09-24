@@ -76,11 +76,23 @@ describe('arrangeRows', () => {
     assert.ok(sections.every((s) => typeof s.header === 'string'))
   })
 
-  it('puts rows without Bench scores last in bench order', () => {
+  it('puts paid rows without Bench scores last in bench order', () => {
     const sections = arrangeRows(rows, {order: 'bench'})
-    const flat = sections[0].rows
+    const flat = sections[0].rows.filter((r) => !r.free)
     const scored = flat.filter((r) => r.bench)
     assert.ok(scored.length === 0 || flat.indexOf(scored.at(-1)) < flat.indexOf(flat.find((r) => !r.bench) ?? flat.at(-1)))
+  })
+
+  it('puts free models first even without a bench score', () => {
+    for (const order of ['bench', 'value']) {
+      const flat = arrangeRows(rows, {order})[0].rows
+      const lastFree = flat.reduce((i, r, j) => (r.free ? j : i), -1)
+      const firstPaid = flat.findIndex((r) => !r.free)
+      assert.ok(lastFree === -1 || firstPaid === -1 || lastFree < firstPaid)
+      assert.equal(flat[0].free, true)
+    }
+    const freeRow = rows.find((r) => r.free)
+    assert.equal(freeRow.value, Number.POSITIVE_INFINITY)
   })
 })
 
