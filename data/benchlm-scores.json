@@ -1,206 +1,231 @@
 {
-  "updated": "2026-09-22",
+  "updated": "2026-09-29",
   "source": "https://benchlm.ai/api/data/leaderboard?category=coding&limit=200",
   "models": {
     "claude-fable-5": {
-      "score": 74.47,
+      "score": 73.1,
       "benchName": "Claude Fable 5",
       "supported": true
     },
     "claude-fable-5.1": {
-      "score": 81.29,
+      "score": 79.99,
       "benchName": "Claude Fable 5.1",
       "supported": true
     },
     "claude-haiku-4.5": {
-      "score": 19.77,
+      "score": 19.61,
       "benchName": "Claude Haiku 4.5",
       "supported": true
     },
     "claude-opus-4.5": {
-      "score": 46.1,
+      "score": 42.56,
       "benchName": "Claude Opus 4.5",
       "supported": false
     },
     "claude-opus-4.6": {
-      "score": 51.32,
+      "score": 49.68,
       "benchName": "Claude Opus 4.6",
       "supported": true
     },
     "claude-opus-4.7": {
-      "score": 59.77,
+      "score": 58.1,
       "benchName": "Claude Opus 4.7",
       "supported": true
     },
     "claude-opus-4.8": {
-      "score": 63.58,
+      "score": 62.37,
       "benchName": "Claude Opus 4.8",
       "supported": true
     },
     "claude-opus-5": {
-      "score": 72.91,
+      "score": 72.18,
       "benchName": "Claude Opus 5",
       "supported": true
     },
     "claude-opus-5.5": {
-      "score": 86.85,
+      "score": 83.6,
       "benchName": "Claude Opus 5.5",
       "supported": true
     },
     "claude-sonnet-4.6": {
-      "score": 48.52,
+      "score": 47.04,
       "benchName": "Claude Sonnet 4.6",
       "supported": true
     },
     "claude-sonnet-5": {
-      "score": 61.05,
+      "score": 59.96,
       "benchName": "Claude Sonnet 5",
       "supported": true
     },
+    "claude-sonnet-5.5": {
+      "score": 85.12,
+      "benchName": "Claude Sonnet 5.5",
+      "supported": true
+    },
+    "deepseek-v4-pro": {
+      "score": 49.36,
+      "benchName": "DeepSeek V4 Pro 0813",
+      "supported": true
+    },
+    "deepseek-v4.1-flash": {
+      "score": 49.63,
+      "benchName": "DeepSeek V4.1 Flash",
+      "supported": false
+    },
     "gemini-3-flash": {
-      "score": 36.84,
+      "score": 36.38,
       "benchName": "Gemini 3 Flash",
       "supported": true
     },
     "gemini-3.1-pro": {
-      "score": 43.36,
+      "score": 42.44,
       "benchName": "Gemini 3.1 Pro",
       "supported": true
     },
     "gemini-3.5-flash": {
-      "score": 53.7,
+      "score": 52.43,
       "benchName": "Gemini 3.5 Flash",
       "supported": true
     },
     "gemini-3.6-flash": {
-      "score": 54.73,
+      "score": 53.78,
       "benchName": "Gemini 3.6 Flash",
       "supported": true
     },
     "gemini-3.7-flash": {
-      "score": 59.79,
+      "score": 59.48,
       "benchName": "Gemini 3.7 Flash",
       "supported": true
     },
     "gemini-3.8-flash": {
-      "score": 64.14,
+      "score": 64.16,
       "benchName": "Gemini 3.8 Flash",
       "supported": true
     },
     "glm-5.2": {
-      "score": 57.32,
+      "score": 56.29,
       "benchName": "GLM-5.2",
       "supported": true
     },
     "glm-5.3": {
-      "score": 58.15,
+      "score": 56.84,
       "benchName": "GLM-5.3",
       "supported": true
     },
     "glm-5.3-flash": {
-      "score": 51.6,
+      "score": 52.54,
       "benchName": "GLM-5.3-Flash",
       "supported": true
     },
     "gpt-5.1": {
-      "score": 39.77,
+      "score": 38.86,
       "benchName": "GPT-5.1",
       "supported": true
     },
     "gpt-5.2": {
-      "score": 41.57,
+      "score": 39.7,
       "benchName": "GPT-5.2",
       "supported": true
     },
     "gpt-5.3-codex": {
-      "score": 56.8,
+      "score": 55.5,
       "benchName": "GPT-5.3 Codex",
       "supported": true
     },
     "gpt-5.4": {
-      "score": 50.93,
+      "score": 49.83,
       "benchName": "GPT-5.4",
       "supported": true
     },
     "gpt-5.4-mini": {
-      "score": 38.61,
+      "score": 36.92,
       "benchName": "GPT-5.4 mini",
       "supported": true
     },
     "gpt-5.5": {
-      "score": 64.47,
+      "score": 62.83,
       "benchName": "GPT-5.5",
       "supported": true
     },
     "gpt-5.6-luna": {
-      "score": 64.72,
+      "score": 63.3,
       "benchName": "GPT-5.6 Luna",
       "supported": true
     },
     "gpt-5.6-sol": {
-      "score": 71.77,
+      "score": 70.53,
       "benchName": "GPT-5.6 Sol",
       "supported": true
     },
     "gpt-5.6-terra": {
-      "score": 65.05,
+      "score": 64.41,
       "benchName": "GPT-5.6 Terra",
       "supported": true
     },
     "gpt-6-astra": {
-      "score": 74.43,
+      "score": 74.18,
       "benchName": "GPT-6 Astra",
       "supported": true
     },
     "gpt-6-luna": {
-      "score": 59.93,
+      "score": 51.37,
       "benchName": "GPT-6 Luna",
       "supported": true
     },
     "gpt-6-sol": {
-      "score": 65.48,
+      "score": 62.99,
       "benchName": "GPT-6 Sol",
       "supported": true
     },
+    "gpt-6.1-sol": {
+      "score": 66.97,
+      "benchName": "GPT-6.1 Sol",
+      "supported": true
+    },
     "grok-4.5": {
-      "score": 58.55,
+      "score": 58.07,
       "benchName": "Grok 4.5",
       "supported": true
     },
     "grok-4.6": {
-      "score": 62.55,
+      "score": 61.62,
       "benchName": "Grok 4.6",
       "supported": true
     },
     "inkling": {
-      "score": 37.23,
+      "score": 36.56,
       "benchName": "Inkling",
       "supported": true
     },
     "kimi-k2.6": {
-      "score": 47.36,
+      "score": 46.36,
       "benchName": "Kimi K2.6",
       "supported": true
     },
+    "kimi-k2.7": {
+      "score": 44.45,
+      "benchName": "Kimi K2.7 Code",
+      "supported": true
+    },
     "kimi-k3": {
-      "score": 63.31,
+      "score": 61.59,
       "benchName": "Kimi K3",
       "supported": true
     },
     "nemotron-3-ultra": {
-      "score": 23.53,
+      "score": 22.78,
       "benchName": "Nemotron 3 Ultra",
       "supported": true
     }
   },
   "unmatched": [
     "Apodex 1.1",
+    "Celeris-1",
     "Claude 3 Opus",
     "Command A+",
     "DeepSeek V3",
     "DeepSeek V3.2",
     "DeepSeek V3.2 (Thinking)",
-    "DeepSeek V4 Pro 0813",
     "GLM-4.6",
     "GLM-4.7",
     "GLM-5",
@@ -241,7 +266,6 @@
     "Inkling-Small",
     "K-Exaone",
     "Kimi K2.5",
-    "Kimi K2.7 Code",
     "LFM2.5-2.6B",
     "Laguna M.1",
     "Laguna XS.2",
@@ -255,6 +279,8 @@
     "MiMo-V2-Pro",
     "MiMo-V2.5",
     "MiMo-V2.5-Pro",
+    "MiMo-V2.6-Flash",
+    "MiMo-V2.6-Pro",
     "MiniMax M2.5",
     "MiniMax M2.7",
     "MiniMax M3",
@@ -272,6 +298,7 @@
     "Nemotron 3.5 Lightning 30B A3B NVFP4",
     "Ornith-1.5-35B-A3B",
     "Ornith-1.5-397B",
+    "Quasar 438B",
     "Qwen 3.6 Max (preview)",
     "Qwen3.5 Flash",
     "Qwen3.5-122B-A10B",
@@ -286,6 +313,7 @@
     "Qwen3.8-27B",
     "Qwen3.8-Flash-Next",
     "Step 3.7 Flash",
+    "Step 5 Preview",
     "Trinity-Large-Thinking",
     "o1",
     "o1-preview"

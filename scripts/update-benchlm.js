@@ -29,7 +29,10 @@ const SAMPLE_FILE = fileURLToPath(new URL('../sample/models.json', import.meta.u
  * slug. Key: normalize(model name), value: family slug.
  * Extend this when the run reports unmatched names below.
  */
-const MANUAL_MAP = {}
+const MANUAL_MAP = {
+  kimik27code: 'kimi-k2.7',
+  deepseekv4pro0813: 'deepseek-v4-pro',
+}
 
 function normalize(name) {
   return name
