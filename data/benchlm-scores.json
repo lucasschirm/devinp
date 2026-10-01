@@ -1,154 +1,154 @@
 {
-  "updated": "2026-09-29",
+  "updated": "2026-10-01",
   "source": "https://benchlm.ai/api/data/leaderboard?category=coding&limit=200",
   "models": {
     "claude-fable-5": {
-      "score": 73.1,
+      "score": 72.98,
       "benchName": "Claude Fable 5",
       "supported": true
     },
     "claude-fable-5.1": {
-      "score": 79.99,
+      "score": 79.75,
       "benchName": "Claude Fable 5.1",
       "supported": true
     },
     "claude-haiku-4.5": {
-      "score": 19.61,
+      "score": 19.58,
       "benchName": "Claude Haiku 4.5",
       "supported": true
     },
     "claude-opus-4.5": {
-      "score": 42.56,
+      "score": 42.64,
       "benchName": "Claude Opus 4.5",
       "supported": false
     },
     "claude-opus-4.6": {
-      "score": 49.68,
+      "score": 49.58,
       "benchName": "Claude Opus 4.6",
       "supported": true
     },
     "claude-opus-4.7": {
-      "score": 58.1,
+      "score": 57.97,
       "benchName": "Claude Opus 4.7",
       "supported": true
     },
     "claude-opus-4.8": {
-      "score": 62.37,
+      "score": 62.28,
       "benchName": "Claude Opus 4.8",
       "supported": true
     },
     "claude-opus-5": {
-      "score": 72.18,
+      "score": 72.05,
       "benchName": "Claude Opus 5",
       "supported": true
     },
     "claude-opus-5.5": {
-      "score": 83.6,
+      "score": 83.32,
       "benchName": "Claude Opus 5.5",
       "supported": true
     },
     "claude-sonnet-4.6": {
-      "score": 47.04,
+      "score": 47.14,
       "benchName": "Claude Sonnet 4.6",
       "supported": true
     },
     "claude-sonnet-5": {
-      "score": 59.96,
+      "score": 59.84,
       "benchName": "Claude Sonnet 5",
       "supported": true
     },
     "claude-sonnet-5.5": {
-      "score": 85.12,
+      "score": 85.56,
       "benchName": "Claude Sonnet 5.5",
       "supported": true
     },
     "deepseek-v4-pro": {
-      "score": 49.36,
+      "score": 49.26,
       "benchName": "DeepSeek V4 Pro 0813",
       "supported": true
     },
     "deepseek-v4.1-flash": {
-      "score": 49.63,
+      "score": 58.89,
       "benchName": "DeepSeek V4.1 Flash",
       "supported": false
     },
     "gemini-3-flash": {
-      "score": 36.38,
+      "score": 36.32,
       "benchName": "Gemini 3 Flash",
       "supported": true
     },
     "gemini-3.1-pro": {
-      "score": 42.44,
+      "score": 42.32,
       "benchName": "Gemini 3.1 Pro",
       "supported": true
     },
     "gemini-3.5-flash": {
-      "score": 52.43,
+      "score": 52.36,
       "benchName": "Gemini 3.5 Flash",
       "supported": true
     },
     "gemini-3.6-flash": {
-      "score": 53.78,
+      "score": 53.68,
       "benchName": "Gemini 3.6 Flash",
       "supported": true
     },
     "gemini-3.7-flash": {
-      "score": 59.48,
+      "score": 59.32,
       "benchName": "Gemini 3.7 Flash",
       "supported": true
     },
     "gemini-3.8-flash": {
-      "score": 64.16,
+      "score": 63.66,
       "benchName": "Gemini 3.8 Flash",
       "supported": true
     },
     "glm-5.2": {
-      "score": 56.29,
+      "score": 56.27,
       "benchName": "GLM-5.2",
       "supported": true
     },
     "glm-5.3": {
-      "score": 56.84,
+      "score": 56.65,
       "benchName": "GLM-5.3",
       "supported": true
     },
     "glm-5.3-flash": {
-      "score": 52.54,
+      "score": 52.23,
       "benchName": "GLM-5.3-Flash",
       "supported": true
     },
     "gpt-5.1": {
-      "score": 38.86,
+      "score": 38.92,
       "benchName": "GPT-5.1",
       "supported": true
     },
     "gpt-5.2": {
-      "score": 39.7,
+      "score": 39.68,
       "benchName": "GPT-5.2",
       "supported": true
     },
     "gpt-5.3-codex": {
-      "score": 55.5,
+      "score": 56.08,
       "benchName": "GPT-5.3 Codex",
       "supported": true
     },
     "gpt-5.4": {
-      "score": 49.83,
+      "score": 49.67,
       "benchName": "GPT-5.4",
       "supported": true
     },
     "gpt-5.4-mini": {
-      "score": 36.92,
+      "score": 36.95,
       "benchName": "GPT-5.4 mini",
       "supported": true
     },
     "gpt-5.5": {
-      "score": 62.83,
+      "score": 62.79,
       "benchName": "GPT-5.5",
       "supported": true
     },
     "gpt-5.6-luna": {
-      "score": 63.3,
+      "score": 63.38,
       "benchName": "GPT-5.6 Luna",
       "supported": true
     },
@@ -158,62 +158,62 @@
       "supported": true
     },
     "gpt-5.6-terra": {
-      "score": 64.41,
+      "score": 64.33,
       "benchName": "GPT-5.6 Terra",
       "supported": true
     },
     "gpt-6-astra": {
-      "score": 74.18,
+      "score": 74.03,
       "benchName": "GPT-6 Astra",
       "supported": true
     },
     "gpt-6-luna": {
-      "score": 51.37,
+      "score": 50.18,
       "benchName": "GPT-6 Luna",
       "supported": true
     },
     "gpt-6-sol": {
-      "score": 62.99,
+      "score": 61.88,
       "benchName": "GPT-6 Sol",
       "supported": true
     },
     "gpt-6.1-sol": {
-      "score": 66.97,
+      "score": 59.06,
       "benchName": "GPT-6.1 Sol",
       "supported": true
     },
     "grok-4.5": {
-      "score": 58.07,
+      "score": 58.11,
       "benchName": "Grok 4.5",
       "supported": true
     },
     "grok-4.6": {
-      "score": 61.62,
+      "score": 61.42,
       "benchName": "Grok 4.6",
       "supported": true
     },
     "inkling": {
-      "score": 36.56,
+      "score": 36.41,
       "benchName": "Inkling",
       "supported": true
     },
     "kimi-k2.6": {
-      "score": 46.36,
+      "score": 46.09,
       "benchName": "Kimi K2.6",
       "supported": true
     },
     "kimi-k2.7": {
-      "score": 44.45,
+      "score": 44.55,
       "benchName": "Kimi K2.7 Code",
       "supported": true
     },
     "kimi-k3": {
-      "score": 61.59,
+      "score": 61.39,
       "benchName": "Kimi K3",
       "supported": true
     },
     "nemotron-3-ultra": {
-      "score": 22.78,
+      "score": 23.14,
       "benchName": "Nemotron 3 Ultra",
       "supported": true
     }
@@ -247,6 +247,7 @@
     "Gemini 3 Pro",
     "Gemini 3.1 Flash-Lite",
     "Gemini 3.5 Flash-Lite",
+    "Gemini 4 Argon",
     "Gemma 3 27B",
     "Gemma 4 12B",
     "Gemma 4 26B A4B",
