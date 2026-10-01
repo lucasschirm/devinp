@@ -1,6 +1,6 @@
 {
   "name": "@lucasschirm/devinp",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Pretty pricing table for Devin models, powered by `devin models list`",
   "type": "module",
   "bin": {
