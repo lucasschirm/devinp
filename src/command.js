@@ -59,7 +59,11 @@ export default class Devinp extends Command {
 
     let data
     try {
-      data = await loadModelData({source: flags.source})
+      const loaded = await loadModelData({source: flags.source})
+      if (loaded.truncated) {
+        this.warn('devin output was truncated mid-stream — showing partial data, re-run for the full list')
+      }
+      data = loaded.data
     } catch (error) {
       this.error(error instanceof Error ? error.message : String(error), {exit: 1})
     }
