@@ -24,6 +24,19 @@ The package ships as a self-contained bundle — no dependencies are installed.
   not authenticated, `devinp` exits with an error (use `--source` for a saved
   snapshot).
 
+### When `devin` fails or truncates
+
+- Prices are captured through a temp file in `os.tmpdir()` — `devin`'s
+  interactive CLI can truncate a pipe stream mid-write, so `devinp` points
+  `devin`'s stdout at a real file instead. The temp file is always removed
+  after the run.
+- If `devin`'s output is cut off mid-stream, `devinp` repairs the document,
+  prints a warning, and renders the partial table.
+- If the output cannot be recovered, `devinp` reports a diagnostic with the
+  size and tail of what `devin` wrote, and suggests re-running or saving the
+  output manually: `devin models list --format json > models.json`, then
+  `devinp --source models.json`.
+
 ## Usage
 
 ```sh
