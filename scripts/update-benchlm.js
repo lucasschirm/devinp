@@ -32,6 +32,7 @@ const SAMPLE_FILE = fileURLToPath(new URL('../sample/models.json', import.meta.u
 const MANUAL_MAP = {
   kimik27code: 'kimi-k2.7',
   deepseekv4pro0813: 'deepseek-v4-pro',
+  deepseekv41flash1017: 'deepseek-v4.1-flash',
 }
 
 function normalize(name) {
