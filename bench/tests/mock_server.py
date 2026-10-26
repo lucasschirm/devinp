@@ -8,9 +8,10 @@
 
   - ``ok``: full happy path — startup vendor notifications, initialize,
     ``session/new``, ``session/prompt`` that echoes the (multi-line) prompt
-    text back in a streamed update, three permission requests (web_fetch /
-    bash-exec / edit-outside-allowed-dirs), usage update, ``end_turn`` +
-    verbatim usage, and clean exit on ``session/close``.
+    text back in a streamed update, four permission requests (web_fetch /
+    bash-exec-in-/testbed / code-search / edit-outside-allowed-dirs), usage
+    update, ``end_turn`` + verbatim usage, and clean exit on
+    ``session/close``.
   - ``hang``: answers initialize/session-new, then stalls the prompt
     forever (stall → cancel + kill test).
   - ``malformed``: emits a non-JSON line in the middle of the prompt
@@ -59,9 +60,12 @@ def send(o):
     sys.stdout.write(json.dumps(o) + "\n")
     sys.stdout.flush()
 
-# env fact: was the refusal-fallback var present in the child env?
+# env facts: was the refusal-fallback var present in the child env (must be
+# stripped by the client), and is a caller-supplied marker var preserved
+# (env overrides must survive — the adapter injects PATH/CONDA_DEFAULT_ENV)?
 state("started", pid=os.getpid(),
-      devin_refusal_fallback=os.environ.get("DEVIN_REFUSAL_FALLBACK", "ABSENT"))
+      devin_refusal_fallback=os.environ.get("DEVIN_REFUSAL_FALLBACK", "ABSENT"),
+      bench_env_marker=os.environ.get("BENCH_ENV_MARKER", "ABSENT"))
 
 # Unsolicited startup vendor notifications (WP0: real `devin acp` emits
 # _cognition.ai/mcp/serversChanged at boot, before any client request).
@@ -135,8 +139,11 @@ def handle(obj):
             emit_permission(100, {"name": "web_fetch", "kind": "web",
                                  "rawInput": {"url": "https://example.com"}})
             emit_permission(101, {"name": "bash", "kind": "execute",
-                                 "rawInput": {"command": "pytest -q"}})
-            emit_permission(102, {"name": "write", "kind": "edit",
+                                 "rawInput": {"command": "pytest -q",
+                                            "cwd": "/testbed"}})
+            emit_permission(102, {"name": "search", "kind": "search",
+                                 "rawInput": {"pattern": "def foo"}})
+            emit_permission(103, {"name": "write", "kind": "edit",
                                  "rawInput": {"file_path": "/etc/evil.txt"}})
         elif mode == "hang":
             send({"jsonrpc": "2.0", "method": "session/update",
