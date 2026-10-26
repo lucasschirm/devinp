@@ -34,6 +34,16 @@ Acceptance mapping (issue #12 — WP1b):
 * env-isolation assertion (``DEVIN_REFUSAL_FALLBACK`` stripped, caller env
   overrides preserved) + refusal → terminal error →
   :func:`test_refusal_is_terminal_and_fallback_env_isolated`
+* review round 1 (Devin/swe-2) follow-ups: real-wire toolCall shape
+  (no top-level ``name``; name via ``_meta``/``toolCallId``; spec
+  ``ToolKind`` ``fetch`` = web, incl. the in-scope-path bypass regression)
+  → :func:`test_permission_policy_acceptance_matrix` +
+  :func:`test_permission_policy_applied_via_wire` (mock emits the
+  WP0-captured shape), ACP ``PermissionOptionKind`` exact matching →
+  :func:`test_option_kinds_matched_exactly`, ``--refusal-fallback=x``
+  form → :func:`test_refusal_fallback_cli_flag_refused`, lexical-check
+  hardening (``~``/``$VAR``, relative paths, ``locations``/``content``
+  path blocks) → :func:`test_permission_policy_acceptance_matrix`
 """
 
 from __future__ import annotations
@@ -165,7 +175,9 @@ def test_permission_policy_applied_via_wire(tmp_path):
     finally:
         s.close()
     out = _permission_outcomes(state)
-    # web_fetch tool request -> denied
+    # the mock emits the WP0-captured real wire shape (no top-level
+    # ``name``; spec ToolKind — web is kind "fetch")
+    # web_fetch tool request (kind "fetch") -> denied
     assert out[100] == ("selected", "deny")
     # shell execution with an in-scope declared cwd (/testbed) -> allowed
     # (the agent must be able to run pytest, WP1b AC1)
@@ -198,6 +210,10 @@ def test_permission_policy_acceptance_matrix():
              "options": options}
         ).allow
 
+    def decide_tool(tool):
+        """Full toolCall dict — the real wire shape (no top-level name)."""
+        return p.decide({"toolCall": tool, "options": options}).allow
+
     cases = [
         # AC1 — allow read (unscoped)
         ("read", "read", {}, True),
@@ -221,7 +237,10 @@ def test_permission_policy_acceptance_matrix():
         ("bash", "execute", {"command": "touch x", "cwd": "/root"}, False),
         ("bash", "execute", {"command": "ls", "cwd": "../../etc"}, False),
         ("bash", "execute", {"command": "ls", "cwd": "src"}, True),  # rel -> workdir
-        # AC2 — deny web-search/fetch tools
+        ("bash", "execute", {"command": "ls", "workingDirectory": "/etc"}, False),
+        ("bash", "execute", {"command": "ls", "cwd": "~"}, False),  # ~ expands
+        ("bash", "execute", {"command": "ls", "cwd": "$HOME"}, False),  # $VAR expands
+        # AC2 — deny web-search/fetch tools (name markers)
         ("web_fetch", "web", {"url": "https://example.com"}, False),
         ("web_search", "web", {"query": "swe-bench"}, False),
         ("search_web", "", {}, False),
@@ -232,6 +251,8 @@ def test_permission_policy_acceptance_matrix():
         ("write", "edit", {"file_path": "/evil.txt"}, False),
         ("write", "edit", {"file_path": "/testbed-evil/x"}, False),  # prefix trick
         ("write", "edit", {"file_path": "/testbed/a", "path": "/etc/b"}, False),
+        ("write", "edit", {"file_path": "src/app.py"}, True),  # rel -> workdir
+        ("write", "edit", {"file_path": "../../etc/x"}, False),  # rel escapes
         # fail-closed + default deny
         ("write", "edit", {}, False),            # write, no declared path
         ("list", "edit", {}, False),            # mislabel: kind wins, no path
@@ -243,6 +264,37 @@ def test_permission_policy_acceptance_matrix():
         got = decide(name, kind, raw)
         assert got is want, f"{name!r} (kind={kind!r}, raw={raw!r}): want {want}, got {got}"
 
+    # Review round 1 (Devin/swe-2): real wire shape (WP0 capture — no
+    # top-level ``name``; name via _meta / toolCallId prefix; kind is a
+    # spec ToolKind — "fetch" = "retrieving external data", not "web").
+    tool_cases = [
+        # kind "fetch" = web — the in-scope declared path must NOT rescue it
+        ({"kind": "fetch", "rawInput": {"url": "https://example.com",
+                                        "path": "/tmp/out"}}, False),
+        ({"kind": "fetch", "rawInput": {"url": "https://example.com"}}, False),
+        # name via _meta (real devin wire), kind "other"
+        ({"toolCallId": "web_fetch:0#x", "kind": "other", "rawInput": {},
+          "_meta": {"cognition.ai/inferenceToolName": "web_fetch"}}, False),
+        # name via toolCallId prefix (write class, no kind → name fallback)
+        ({"toolCallId": "write:0#x", "kind": "",
+          "rawInput": {"file_path": "/testbed/a"}}, True),
+        ({"toolCallId": "write:0#x", "kind": "",
+          "rawInput": {"file_path": "/etc/a"}}, False),
+        # spec write kinds: delete / move — path-scoped
+        ({"kind": "delete", "rawInput": {"file_path": "/testbed/x"}}, True),
+        ({"kind": "move", "rawInput": {"file_path": "/etc/x"}}, False),
+        # locations[].path / content[].path — WP0-captured path carriers
+        ({"kind": "edit", "rawInput": {},
+          "locations": [{"path": "/etc/x"}]}, False),
+        ({"kind": "edit", "rawInput": {},
+          "locations": [{"path": "/testbed/x"}]}, True),
+        ({"kind": "edit", "rawInput": {"file_path": "/testbed/a"},
+          "content": [{"type": "diff", "path": "/etc/b"}]}, False),
+    ]
+    for tool, want in tool_cases:
+        got = decide_tool(tool)
+        assert got is want, f"tool={tool!r}: want {want}, got {got}"
+
     # option mapping: allow -> proceed option, deny -> deny option
     d = p.decide({"toolCall": {"name": "bash", "kind": "execute",
                               "rawInput": {}}, "options": options})
@@ -250,6 +302,36 @@ def test_permission_policy_acceptance_matrix():
     d = p.decide({"toolCall": {"name": "web_fetch", "kind": "web",
                               "rawInput": {}}, "options": options})
     assert d.allow is False and d.option_id == "deny"
+
+
+def test_option_kinds_matched_exactly():
+    """Review round 1 (Devin/swe-2): the ACP-spec PermissionOptionKind
+    values (allow_once/allow_always/reject_once/reject_always) are
+    matched **exactly**, so a substring in an option id ("ok" in
+    "token") or name can never mis-select."""
+    p = ac.SwebenchPolicy()
+    acao = [{"optionId": "allow_once", "kind": "allow_once",
+             "name": "Allow once"},
+            {"optionId": "reject_once", "kind": "reject_once",
+             "name": "Reject once"}]
+    d = p.decide({"toolCall": {"name": "bash", "kind": "execute",
+                              "rawInput": {}}, "options": acao})
+    assert d.allow is True and d.option_id == "allow_once"
+    d = p.decide({"toolCall": {"name": "web_fetch", "kind": "fetch",
+                              "rawInput": {}}, "options": acao})
+    assert d.allow is False and d.option_id == "reject_once"
+    # adversarial: id/name substrings contradict the kind — the kind
+    # (the spec semantic) must win
+    trap = [{"optionId": "proceed_ok", "kind": "reject_once",
+             "name": "No"},
+            {"optionId": "deny_no", "kind": "allow_once",
+             "name": "Yes"}]
+    d = p.decide({"toolCall": {"name": "bash", "kind": "execute",
+                              "rawInput": {}}, "options": trap})
+    assert d.option_id == "deny_no"  # kind allow_once, despite the id
+    d = p.decide({"toolCall": {"name": "web_fetch", "kind": "fetch",
+                              "rawInput": {}}, "options": trap})
+    assert d.option_id == "proceed_ok"  # kind reject_once, despite the id
 
 
 # ---------------------------------------------------------------------------
@@ -375,13 +457,16 @@ def test_refusal_is_terminal_and_fallback_env_isolated(tmp_path):
 
 def test_refusal_fallback_cli_flag_refused(tmp_path):
     """PLAN §3.4: the ``--refusal-fallback`` CLI flag is refused too —
-    a refusal must be terminal, never a mid-run model switch."""
-    wrapper, _ = make_mock(tmp_path, "ok")
-    s = ac.AcpSession(devin_bin=wrapper, model="swe-2-high",
-                     extra_args=["--refusal-fallback", "swe-1-6"])
-    with pytest.raises(ac.AcpProtocolError):
-        s.start()
-    s.close()  # no process was spawned — close must be a safe no-op
+    a refusal must be terminal, never a mid-run model switch. Both the
+    space-separated and ``=`` forms (review round 1, Devin/swe-2)."""
+    for args in (["--refusal-fallback", "swe-1-6"],
+                 ["--refusal-fallback=swe-1-6"]):
+        wrapper, _ = make_mock(tmp_path, "ok")
+        s = ac.AcpSession(devin_bin=wrapper, model="swe-2-high",
+                         extra_args=args)
+        with pytest.raises(ac.AcpProtocolError):
+            s.start()
+        s.close()  # no process was spawned — close must be a safe no-op
 
 
 # ---------------------------------------------------------------------------

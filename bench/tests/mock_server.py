@@ -12,6 +12,13 @@
     bash-exec-in-/testbed / code-search / edit-outside-allowed-dirs), usage
     update, ``end_turn`` + verbatim usage, and clean exit on
     ``session/close``.
+
+  The permission ``toolCall`` frames use the **WP0-captured real wire
+  shape** (``notes/acp-probe-handshake2.frames.jsonl`` + ACP schema v1):
+  no top-level ``name`` field; the tool name arrives in
+  ``_meta["cognition.ai/inferenceToolName"]`` and as the ``toolCallId``
+  prefix; ``kind`` is a spec ``ToolKind`` — web is ``fetch``
+  ("retrieving external data"), not a "web" kind.
   - ``hang``: answers initialize/session-new, then stalls the prompt
     forever (stall → cancel + kill test).
   - ``malformed``: emits a non-JSON line in the middle of the prompt
@@ -86,6 +93,13 @@ def emit_permission(rid, tool_call, options=OPTIONS):
           "params": {"sessionId": "mock-sid", "toolCall": tool_call,
                     "options": options}})
 
+def tc(name, kind, raw):
+    # WP0-captured real wire shape (no top-level "name" field; name via
+    # _meta + toolCallId prefix; kind is a spec ToolKind).
+    return {"toolCallId": name + ":0#mock", "title": name, "kind": kind,
+            "rawInput": raw,
+            "_meta": {"cognition.ai/inferenceToolName": name}}
+
 def finish_prompt():
     # interleaved vendor notification, then the prompt response
     send({"jsonrpc": "2.0", "method": "_cognition.ai/turn_stats",
@@ -136,15 +150,17 @@ def handle(obj):
             # interleaved vendor notification (log + ignore contract)
             send({"jsonrpc": "2.0",
                   "method": "_cognition.ai/mcp/serversChanged", "params": {}})
-            emit_permission(100, {"name": "web_fetch", "kind": "web",
-                                 "rawInput": {"url": "https://example.com"}})
-            emit_permission(101, {"name": "bash", "kind": "execute",
-                                 "rawInput": {"command": "pytest -q",
-                                            "cwd": "/testbed"}})
-            emit_permission(102, {"name": "search", "kind": "search",
-                                 "rawInput": {"pattern": "def foo"}})
-            emit_permission(103, {"name": "write", "kind": "edit",
-                                 "rawInput": {"file_path": "/etc/evil.txt"}})
+            # web tool: kind "fetch" (ACP ToolKind "retrieving external
+            # data") — the real wire has no "web" kind.
+            emit_permission(100, tc("web_fetch", "fetch",
+                                   {"url": "https://example.com"}))
+            emit_permission(101, tc("bash", "execute",
+                                   {"command": "pytest -q",
+                                    "cwd": "/testbed"}))
+            emit_permission(102, tc("search", "search",
+                                   {"pattern": "def foo"}))
+            emit_permission(103, tc("write", "edit",
+                                   {"file_path": "/etc/evil.txt"}))
         elif mode == "hang":
             send({"jsonrpc": "2.0", "method": "session/update",
                   "params": {"sessionId": "mock-sid",
@@ -171,8 +187,8 @@ def handle(obj):
                                       "content": {"type": "text", "text": big}}}})
             # permission request with an EMPTY options list — the client
             # must fail closed ("cancelled") rather than guess an option.
-            emit_permission(103, {"name": "write", "kind": "edit",
-                                 "rawInput": {"file_path": "/tmp/x.txt"}},
+            emit_permission(103, tc("write", "edit",
+                                   {"file_path": "/tmp/x.txt"}),
                            options=[])
         return
     if m == "session/cancel":
