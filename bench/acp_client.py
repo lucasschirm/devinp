@@ -304,6 +304,15 @@ class _Ndjrpc:
         self._proc = proc
         self._buf = b""
         self._next_id = 0
+        #: set when a write deadline fires mid-frame (a partial NDJSON line is
+        # now sitting in the pipe) or the pipe dies — any further frame
+        # appended to a torn line would be a wire parse error, so the
+        # best-effort sends (cancel/close) skip a broken transport.
+        self._broken = False
+
+    @property
+    def broken(self) -> bool:
+        return self._broken
 
     # -- send ------------------------------------------------------------
 
@@ -355,6 +364,7 @@ class _Ndjrpc:
             while view:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
+                    self._broken = True  # partial frame now sits in the pipe
                     raise AcpTimeoutError("stdin write deadline exceeded")
                 _, writable, _ = select.select([], [fd], [],
                                              min(remaining, self._SLICE))
@@ -366,6 +376,7 @@ class _Ndjrpc:
                     continue  # pipe momentarily full — re-select
                 view = view[n:]
         except (OSError, ValueError) as exc:
+            self._broken = True  # pipe dead (EBADF/EPIPE) — don't retry sends
             raise AcpTransportError(f"agent stdin write failed: {exc}") from exc
 
     # -- receive ---------------------------------------------------------
@@ -676,9 +687,14 @@ class AcpSession:
         )
 
     def cancel(self) -> None:
-        """Best-effort ``session/cancel`` notification for the session."""
+        """Best-effort ``session/cancel`` notification for the session.
+
+        Skipped when the transport is broken (a torn NDJSON line in the
+        pipe would corrupt this frame); termination is the group kill's job.
+        """
         if (self._tx is not None and self._proc is not None
-                and self.session_id and self._state not in ("new", "closed")):
+                and self.session_id and self._state not in ("new", "closed")
+                and not self._tx.broken):
             try:
                 self._tx.send_notification(
                     WIRE["SESSION_CANCEL"], {"sessionId": self.session_id},
@@ -704,15 +720,17 @@ class AcpSession:
             if self.session_id and self._state in ("session", "prompting"):
                 if self._state == "prompting":
                     self.cancel()
-                try:
+                if not self._tx.broken:
                     # request (schema: CloseSessionRequest) — its reply is
                     # best-effort: the real server may never answer it.
-                    self._tx.send_request(
-                        WIRE["SESSION_CLOSE"], {"sessionId": self.session_id},
-                        deadline=time.monotonic() + self._close_grace,
-                    )
-                except (OSError, ValueError, AcpError):
-                    pass
+                    try:
+                        self._tx.send_request(
+                            WIRE["SESSION_CLOSE"],
+                            {"sessionId": self.session_id},
+                            deadline=time.monotonic() + self._close_grace,
+                        )
+                    except (OSError, ValueError, AcpError):
+                        pass
             # Grace for a natural exit (the mock honors close; the real
             # server often does not — WP0 §1).
             try:
