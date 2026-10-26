@@ -296,6 +296,9 @@ class _Ndjrpc:
 
     _CHUNK = 65536
     _SLICE = 0.25  # max select slice — keeps deadline checks tight
+    #: hard cap applied when a caller omits the deadline — the write stays
+    # bounded even if a future caller forgets ("never hangs").
+    _FALLBACK_WRITE_CAP_S = 10.0
 
     def __init__(self, proc: "subprocess.Popen") -> None:
         self._proc = proc
@@ -341,17 +344,18 @@ class _Ndjrpc:
                 "NDJSON frame must not contain raw newline/CR characters"
             )
         view = memoryview(line.encode("utf-8") + b"\n")
+        if deadline is None:
+            deadline = time.monotonic() + self._FALLBACK_WRITE_CAP_S
         try:
             fd = self._proc.stdin.fileno()
             while view:
-                if deadline is not None:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise AcpTimeoutError("stdin write deadline exceeded")
-                    _, writable, _ = select.select([], [fd], [],
-                                                 min(remaining, self._SLICE))
-                    if not writable:
-                        continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AcpTimeoutError("stdin write deadline exceeded")
+                _, writable, _ = select.select([], [fd], [],
+                                             min(remaining, self._SLICE))
+                if not writable:
+                    continue
                 n = os.write(fd, view)
                 view = view[n:]
         except (OSError, ValueError) as exc:
@@ -707,14 +711,24 @@ class AcpSession:
             self._kill_group()
         finally:
             self._state = "closed"
+            # Join the stderr drain thread (bounded) BEFORE touching the
+            # stderr pipe: while the thread is inside read1(), close()
+            # blocks on the buffer's lock — and a detached grandchild
+            # that survived the group kill keeps the write end open, so
+            # the join can time out. A leaked fd + a lingering daemon
+            # thread beats a hung close(). Joining first also lets
+            # _capture_stderr() pick up the final drained bytes.
+            drain = getattr(self, "_stderr_thread", None)
+            if drain is not None:
+                drain.join(timeout=1.0)
             self._capture_stderr()
             self._close_stdin()
-            # close the read pipes too — unblocks the stderr drain thread
-            # (OSError out of read1) and stops dead sessions accumulating
-            # fds in a long sequential harness.
             if self._proc is not None:
                 self._close_pipe(self._proc.stdout)
-                self._close_pipe(self._proc.stderr)
+                # stderr: only close once the drain thread has exited
+                # (no in-flight read1 -> close cannot block on its lock)
+                if drain is None or not drain.is_alive():
+                    self._close_pipe(self._proc.stderr)
 
     # -- introspection ---------------------------------------------------
 
@@ -875,6 +889,9 @@ class AcpSession:
                 chunk = self._proc.stderr.read1(65536)
             except (OSError, ValueError):
                 return
+            except Exception as exc:  # never let the daemon die silently:
+                log.warning("stderr drain thread exiting: %r", exc)  # a dead
+                return  # thread re-exposes the 64KB-pipe mid-session stall
             if not chunk:
                 return  # clean EOF
             with self._stderr_lock:
