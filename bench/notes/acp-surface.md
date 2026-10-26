@@ -373,6 +373,13 @@ must have docker to pull the eval images anyway).
    (ACP convention) but were not exercised in the probes — confirm in
    Pilot A if the adapter needs mode switching (it likely does: default
    `accept-edits` may not auto-allow exec).
+7. **`session/close` wire shape (WP1, issue #11)** — the WP0 probe sent
+   close as a JSON-RPC *notification* (no id); the WP1 client
+   (`bench/acp_client.py`) sends it as a *request* (schema
+   `CloseSessionRequest`), best-effort — the reply is optional and
+   termination always falls through to the group kill. Confirm against
+   the real server in Pilot A which shape it prefers (the WP0
+   handler-error dump happened with the notification form).
 
 ---
 

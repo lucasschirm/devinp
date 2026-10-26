@@ -43,6 +43,7 @@ import os
 import select
 import signal
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -242,16 +243,15 @@ class SwebenchPolicy(PermissionPolicy):
                     option_id=opt.get("optionId") or opt.get("id"),
                     reason=reason,
                 )
-        # No matching option: allow falls back to the first option; a deny
-        # with no deny-option is expressed as outcome "cancelled".
-        if allow and options:
-            first = options[0]
-            return PermissionDecision(
-                allow=True,
-                option_id=first.get("optionId") or first.get("id"),
-                reason=reason,
-            )
-        return PermissionDecision(allow=allow, option_id=None, reason=reason)
+        # No matching option. A deny without a deny-option is expressed as
+        # outcome "cancelled". An allow without a proceed-option **fails
+        # closed**: the wire cannot express the allow, so we send
+        # "cancelled" rather than gamble on a wrong option (the decision
+        # keeps allow=True so the transcript records the intent truthfully).
+        return PermissionDecision(
+            allow=allow, option_id=None,
+            reason=f"{reason} (no matching option; failed closed)",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -304,31 +304,58 @@ class _Ndjrpc:
 
     # -- send ------------------------------------------------------------
 
-    def send_request(self, method: str, params: Optional[dict] = None) -> int:
+    def send_request(self, method: str, params: Optional[dict] = None,
+                    deadline: Optional[float] = None) -> int:
         self._next_id += 1
         msg: dict = {"jsonrpc": "2.0", "id": self._next_id, "method": method}
         if params is not None:
             msg["params"] = params
-        self._send(msg)
+        self._send(msg, deadline)
         return self._next_id
 
-    def send_notification(self, method: str, params: Optional[dict] = None) -> None:
+    def send_notification(self, method: str, params: Optional[dict] = None,
+                         deadline: Optional[float] = None) -> None:
         msg: dict = {"jsonrpc": "2.0", "method": method}
         if params is not None:
             msg["params"] = params
-        self._send(msg)
+        self._send(msg, deadline)
 
-    def send_response(self, frame: dict) -> None:
-        self._send(frame)
+    def send_response(self, frame: dict,
+                     deadline: Optional[float] = None) -> None:
+        self._send(frame, deadline)
 
-    def _send(self, msg: dict) -> None:
+    def _send(self, msg: dict, deadline: Optional[float] = None) -> None:
+        """Write one NDJSON frame to the agent's stdin.
+
+        ``json.dumps`` escapes every control character (``\n`` → ``\\n``),
+        so a multi-line string always stays on **one line** — NDJSON-safe by
+        construction (enforced explicitly below, not via ``assert``, so the
+        check survives ``python -O``). When a ``deadline`` is given the write
+        is bounded (select + raw ``os.write``): a server that stops reading
+        stdin cannot hang the client, and a dead process surfaces as a typed
+        :class:`AcpTransportError` rather than a raw ``BrokenPipeError``.
+        """
         line = json.dumps(msg, ensure_ascii=False)
-        # Invariant: json.dumps escapes \n inside strings, so a frame is a
-        # single physical line. Enforce it — a raw newline would corrupt
-        # the NDJSON stream.
-        assert "\n" not in line, "NDJSON frame must not contain raw newline"
-        self._proc.stdin.write(line.encode("utf-8") + b"\n")
-        self._proc.stdin.flush()
+        if "\n" in line or "\r" in line:
+            raise AcpProtocolError(
+                "NDJSON frame must not contain raw newline/CR characters"
+            )
+        view = memoryview(line.encode("utf-8") + b"\n")
+        fd = self._proc.stdin.fileno()
+        try:
+            while view:
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise AcpTimeoutError("stdin write deadline exceeded")
+                    _, writable, _ = select.select([], [fd], [],
+                                                 min(remaining, self._SLICE))
+                    if not writable:
+                        continue
+                n = os.write(fd, view)
+                view = view[n:]
+        except (OSError, ValueError) as exc:
+            raise AcpTransportError(f"agent stdin write failed: {exc}") from exc
 
     # -- receive ---------------------------------------------------------
 
@@ -444,6 +471,8 @@ class AcpSession:
         self._state = "new"  # new -> running -> initialized -> session -> closed
         self._killed = False
         self._closed = False
+        self._stderr_chunks: list = []
+        self._stderr_max_bytes = 1 << 20  # keep at most ~1 MB for diagnostics
 
         self.session_id: Optional[str] = None
         self.agent_info: dict = {}
@@ -469,6 +498,18 @@ class AcpSession:
         """Spawn the agent process (own process group, env hygiene)."""
         if self._proc is not None:
             raise AcpProtocolError("session already started")
+        if self._closed or self._state != "new":
+            raise AcpProtocolError(
+                "session already closed — AcpSession is one-shot"
+            )
+        # PLAN §3.4: the refusal fallback must stay off — both the env var
+        # and the CLI flag (a refusal must be terminal, never a model switch).
+        for arg in self._extra_args:
+            if str(arg) == "--refusal-fallback" or str(arg).startswith(
+                    "--refusal-fallback="):
+                raise AcpProtocolError(
+                    "--refusal-fallback is forbidden (PLAN §3.4)"
+                )
         # Env hygiene (PLAN §3.4): refusal-fallback is NEVER in the child
         # env, even if the caller supplied it.
         env = dict(os.environ)
@@ -490,13 +531,25 @@ class AcpSession:
         self._tx = _Ndjrpc(self._proc)
         self._state = "running"
         log.debug("spawned agent: pid=%s cmd=%r", self._proc.pid, cmd)
+        # Continuously drain stderr in a daemon thread: a chatty agent (WP0
+        # saw a huge stderr dump on close) must not fill the 64 KB pipe and
+        # stall the agent mid-session, and close() must never block on an
+        # unbounded stderr read (a detached grandchild that escapes the group
+        # kill but holds the fd would hang it forever). The daemon thread
+        # simply lives until the process dies or the fd's last holder closes.
+        self._stderr_thread = threading.Thread(
+            target=self._drain_stderr, daemon=True
+        )
+        self._stderr_thread.start()
 
     def initialize(self) -> dict:
         """Handshake (``initialize``); returns the agent info verbatim."""
         self._require_state("running")
+        deadline = time.monotonic() + self._init_timeout
         rid = self._tx.send_request(
             WIRE["INITIALIZE"],
             {"protocolVersion": ACP_PROTOCOL_VERSION, "clientCapabilities": {}},
+            deadline=deadline,
         )
         frame = self._wait_for_response(rid, self._init_timeout)
         self.agent_info = frame["result"]
@@ -507,10 +560,12 @@ class AcpSession:
                       mcp_servers: Optional[list] = None) -> str:
         """``session/new`` (benchmark default: ``cwd="/testbed"``)."""
         self._require_state("initialized")
+        deadline = time.monotonic() + self._session_timeout
         rid = self._tx.send_request(
             WIRE["SESSION_NEW"],
             {"cwd": cwd or self._cwd or "/testbed",
              "mcpServers": mcp_servers if mcp_servers is not None else []},
+            deadline=deadline,
         )
         frame = self._wait_for_response(rid, self._session_timeout)
         result = frame["result"]
@@ -534,27 +589,36 @@ class AcpSession:
         :class:`AcpRefusalError` (terminal — no model switch, no retry).
         """
         self._require_state("session")
-        self._state = "prompting"
         if blocks is None:
             if text is None:
                 raise AcpProtocolError("prompt requires text or blocks")
             blocks = [{"type": "text", "text": text}]
+        self._state = "prompting"  # after validation — a bad call must not
+        timeout_s = (timeout if timeout is not None
+                    else (self._prompt_timeout or DEFAULT_PROMPT_TIMEOUT_S))
         t0 = time.monotonic()
         updates_at_start = sum(1 for e in self.transcript if e.kind == "update")
-        rid = self._tx.send_request(
-            WIRE["SESSION_PROMPT"],
-            {"sessionId": self.session_id, "prompt": blocks},
-        )
         try:
-            frame = self._wait_for_response(
-                rid,
-                timeout if timeout is not None
-                else (self._prompt_timeout or DEFAULT_PROMPT_TIMEOUT_S),
+            rid = self._tx.send_request(
+                WIRE["SESSION_PROMPT"],
+                {"sessionId": self.session_id, "prompt": blocks},
+                deadline=t0 + timeout_s,
             )
+            frame = self._wait_for_response(rid, timeout_s)
         except AcpTimeoutError:
-            # Stalled session: cancel, grace, kill the group (PLAN §5 WP1).
+            # Stalled session: cancel, best-effort close, grace, kill the
+            # group (PLAN §5 WP1). The close is sent *before* the kill so
+            # the wire contract holds even on the stall path.
             self.cancel()
             time.sleep(self._cancel_grace)
+            if self.session_id:
+                try:
+                    self._tx.send_request(
+                        WIRE["SESSION_CLOSE"], {"sessionId": self.session_id},
+                        deadline=time.monotonic() + 1.0,
+                    )
+                except (OSError, ValueError, AcpError):
+                    pass  # best-effort — the group kill follows
             self._kill_group()
             raise
         except (AcpTransportError, AcpMalformedFrameError):
@@ -585,9 +649,11 @@ class AcpSession:
                 and self.session_id and self._state not in ("new", "closed")):
             try:
                 self._tx.send_notification(
-                    WIRE["SESSION_CANCEL"], {"sessionId": self.session_id}
+                    WIRE["SESSION_CANCEL"], {"sessionId": self.session_id},
+                    deadline=time.monotonic()
+                    + max(1.0, self._cancel_grace),
                 )
-            except (OSError, ValueError):
+            except (OSError, ValueError, AcpError):
                 pass  # process already gone — the kill below covers it
 
     def close(self) -> None:
@@ -610,9 +676,10 @@ class AcpSession:
                     # request (schema: CloseSessionRequest) — its reply is
                     # best-effort: the real server may never answer it.
                     self._tx.send_request(
-                        WIRE["SESSION_CLOSE"], {"sessionId": self.session_id}
+                        WIRE["SESSION_CLOSE"], {"sessionId": self.session_id},
+                        deadline=time.monotonic() + self._close_grace,
                     )
-                except (OSError, ValueError):
+                except (OSError, ValueError, AcpError):
                     pass
             # Grace for a natural exit (the mock honors close; the real
             # server often does not — WP0 §1).
@@ -660,6 +727,13 @@ class AcpSession:
         while True:
             frame = self._tx.read_frame(deadline)
             self._dispatch(frame)
+            if "error" in frame and frame.get("id") != rid:
+                # e.g. a server-side parse error for one of our lines —
+                # surface it instead of silently waiting out the deadline.
+                log.warning(
+                    "server error response for unmatched id=%r: %r",
+                    frame.get("id"), frame.get("error"),
+                )
             if frame.get("id") == rid and ("result" in frame or "error" in frame):
                 if "error" in frame:
                     err = frame["error"] if isinstance(frame["error"], dict) else {}
@@ -676,18 +750,22 @@ class AcpSession:
         if "id" in frame:
             # Server-initiated request — the client MUST answer it.
             if method == WIRE["SESSION_PERMISSION"]:
-                self._answer_permission(frame)
+                if self._session_matches(frame):
+                    self._answer_permission(frame)
             else:
-                log.debug("ignoring server request %s", method)
+                log.debug("rejecting unknown server request %s", method)
                 try:
                     self._tx.send_response({
                         "jsonrpc": "2.0", "id": frame["id"],
-                        "result": {"outcome": {"outcome": "cancelled"}},
+                        "error": {"code": -32601,
+                                 "message": f"Method not found: {method}"},
                     })
-                except (OSError, ValueError):
+                except (OSError, ValueError, AcpError):
                     pass
             return
         # Notification.
+        if not self._session_matches(frame):
+            return
         if method == WIRE["SESSION_UPDATE"]:
             self._on_update(frame)
         elif method.startswith("_"):
@@ -697,6 +775,19 @@ class AcpSession:
             log.info("vendor notification ignored: %s", method)
         else:
             log.debug("ignoring unknown notification: %s", method)
+
+    def _session_matches(self, frame: dict) -> bool:
+        """Ignore frames that name a *foreign* session id (stray-session
+        guard — a permission request must only be answered for our session)."""
+        params = frame.get("params")
+        if not isinstance(params, dict):
+            return True
+        sid = params.get("sessionId")
+        if sid and self.session_id and sid != self.session_id:
+            log.warning("ignoring %s frame for foreign session %r",
+                       frame.get("method"), sid)
+            return False
+        return True
 
     def _on_update(self, frame: dict) -> None:
         params = frame.get("params") or {}
@@ -727,7 +818,7 @@ class AcpSession:
             self._tx.send_response(
                 {"jsonrpc": "2.0", "id": frame["id"], "result": result}
             )
-        except (OSError, ValueError):
+        except (OSError, ValueError, AcpError):
             pass  # process dying — kill path covers it
 
     def _kill_group(self) -> None:
@@ -753,14 +844,23 @@ class AcpSession:
             log.warning("agent process did not exit after SIGKILL: pid=%s",
                        self._proc.pid)
 
+    def _drain_stderr(self) -> None:
+        """Daemon: copy the agent's stderr into a bounded buffer."""
+        while True:
+            try:
+                chunk = self._proc.stderr.read1(65536)
+            except (OSError, ValueError):
+                return
+            if not chunk:
+                return  # clean EOF
+            self._stderr_chunks.append(chunk)
+            total = sum(map(len, self._stderr_chunks))
+            while total > self._stderr_max_bytes and len(self._stderr_chunks) > 1:
+                total -= len(self._stderr_chunks.pop(0))
+
     def _capture_stderr(self) -> None:
-        if self._proc is None or self._proc.stderr is None:
-            return
-        try:
-            data = self._proc.stderr.read()
-            self.stderr_tail = data.decode("utf-8", "replace")[-4000:]
-        except (OSError, ValueError):
-            pass
+        data = b"".join(self._stderr_chunks)
+        self.stderr_tail = data[-4000:].decode("utf-8", "replace")
 
     def _close_stdin(self) -> None:
         if self._proc is not None and self._proc.stdin is not None:

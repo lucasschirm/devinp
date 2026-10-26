@@ -20,11 +20,19 @@ zero quota, no real ``devin`` binary. Acceptance mapping (issue #11):
   :func:`test_short_read_typed_error`, :func:`test_process_death_typed_error`
 * refusal-fallback isolation + terminal refusal →
   :func:`test_refusal_is_terminal_and_fallback_env_isolated`
+* review round 1 (Devin/swe-2) follow-ups: server error responses
+  (:func:`test_server_error_response_is_typed`), bounded handshake
+  (:func:`test_initialize_timeout_is_bounded`), >64 KB frame round-trip
+  + empty-options fail-closed (:func:`test_large_frame_roundtrip_and_empty_options`),
+  close-without-start / start-after-close lifecycle guards,
+  transport bounded-write + typed write errors
 """
 
 from __future__ import annotations
 
 import json
+import os
+import select
 import time
 
 import pytest
@@ -303,24 +311,23 @@ def test_refusal_is_terminal_and_fallback_env_isolated(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_transport_send_is_single_line_for_multiline_strings():
-    class _In:
-        def __init__(self):
-            self.buf = b""
-
-        def write(self, b):
-            self.buf += b
-
-        def flush(self):
-            pass
-
-    stdin = _In()
+    r_fd, w_fd = os.pipe()
+    stdin = type("_In", (), {"fileno": lambda self: w_fd})()
     proc = type("_Proc", (), {"stdin": stdin})()
     tx = ac._Ndjrpc(proc)
     text = "line1\nline2\ttabbed\rwindows"
     tx.send_request(
         "session/prompt", {"sessionId": "s", "prompt": [{"type": "text", "text": text}]}
     )
-    data = stdin.buf
+    # drain the pipe (the frame is small — one write, fully buffered)
+    data = b""
+    while True:
+        ready, _, _ = select.select([r_fd], [], [], 1.0)
+        if not ready:
+            break
+        data += os.read(r_fd, 1 << 20)
+    os.close(r_fd)
+    os.close(w_fd)
     assert data.endswith(b"\n")
     body = data[:-1]
     # one physical line: no raw newlines/CRs inside the frame
@@ -329,3 +336,103 @@ def test_transport_send_is_single_line_for_multiline_strings():
     assert msg["jsonrpc"] == "2.0"
     assert msg["method"] == "session/prompt"
     assert msg["params"]["prompt"][0]["text"] == text  # escapes round-trip
+
+
+def test_transport_send_bounded_deadline_and_typed_errors():
+    r_fd, w_fd = os.pipe()
+    stdin = type("_In", (), {"fileno": lambda self: w_fd})()
+    proc = type("_Proc", (), {"stdin": stdin})()
+    tx = ac._Ndjrpc(proc)
+    # deadline already passed -> typed AcpTimeoutError, never a raw block
+    with pytest.raises(ac.AcpTimeoutError):
+        tx.send_request("initialize", {}, deadline=time.monotonic() - 1.0)
+    # dead pipe -> typed AcpTransportError (no raw BrokenPipeError/OSError)
+    os.close(r_fd)
+    os.close(w_fd)
+    with pytest.raises(ac.AcpTransportError):
+        tx.send_request("initialize", {})
+
+
+# ---------------------------------------------------------------------------
+# 7. review round 1 (Devin/swe-2) follow-ups
+# ---------------------------------------------------------------------------
+
+def test_server_error_response_is_typed(tmp_path):
+    s, state = _session(tmp_path, "rpc_error")
+    try:
+        with pytest.raises(ac.AcpRpcError) as ei:
+            s.initialize()
+        assert ei.value.code == -32600
+        s.close()
+    finally:
+        s.close()
+    _assert_no_orphans(s)
+
+
+def test_initialize_timeout_is_bounded(tmp_path):
+    wrapper, state = make_mock(tmp_path, "init_hang")
+    s = ac.AcpSession(devin_bin=wrapper, model="swe-2-high",
+                     initialize_timeout_s=1.5)
+    s.start()
+    t0 = time.monotonic()
+    with pytest.raises(ac.AcpTimeoutError):
+        s.initialize()
+    assert time.monotonic() - t0 < 15  # bounded — never hangs
+    s.close()
+    _assert_no_orphans(s)
+
+
+def test_large_frame_roundtrip_and_empty_options(tmp_path):
+    s, state = _session(tmp_path, "bigframe")
+    try:
+        s.initialize()
+        s.create_session(cwd="/testbed")
+        result = s.prompt("x", timeout=20)
+        s.close()
+    finally:
+        s.close()
+    # >64 KB frame read across multiple chunks, intact
+    chunks = [e for e in s.transcript
+             if e.kind == "update" and e.method == "agent_message_chunk"]
+    assert len(chunks) == 1
+    assert len(chunks[0].payload["update"]["content"]["text"]) == 300000
+    assert result.stop_reason == "end_turn"
+    # allow decision with an empty options list -> failed closed (cancelled)
+    perms = _permission_outcomes(state)
+    assert perms[103] == ("cancelled", None)
+    _assert_no_orphans(s)
+
+
+def test_lifecycle_close_before_start_and_start_after_close(tmp_path):
+    wrapper, state = make_mock(tmp_path, "ok")
+    s = ac.AcpSession(devin_bin=wrapper, model="swe-2-high")
+    s.close()  # close without start: safe, must not raise
+    # one-shot: a closed session must not respawn (group-leak guard)
+    with pytest.raises(ac.AcpProtocolError):
+        s.start()
+    # a normal session still cleans up
+    s2 = ac.AcpSession(devin_bin=wrapper, model="swe-2-high")
+    s2.start()
+    s2.initialize()
+    s2.close()
+    _assert_no_orphans(s2)
+
+
+def test_permission_policy_no_proceed_option_fails_closed():
+    p = ac.SwebenchPolicy()
+    # allowed tool, but the only option is a deny one -> allow intent,
+    # wire fails closed (no option id -> "cancelled")
+    d = p.decide({"toolCall": {"name": "bash", "kind": "execute",
+                              "rawInput": {}},
+                 "options": [{"optionId": "deny"}]})
+    assert d.allow is True and d.option_id is None
+    # no options at all -> same
+    d = p.decide({"toolCall": {"name": "bash", "kind": "execute",
+                              "rawInput": {}},
+                 "options": []})
+    assert d.allow is True and d.option_id is None
+    # deny with no deny option also maps to cancelled
+    d = p.decide({"toolCall": {"name": "web_fetch", "kind": "web",
+                              "rawInput": {}},
+                 "options": []})
+    assert d.allow is False and d.option_id is None

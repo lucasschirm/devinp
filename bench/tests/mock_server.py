@@ -20,6 +20,12 @@
   - ``crash``: exits immediately on ``session/prompt`` (EOF typed-error).
   - ``refusal``: prompt responds ``stopReason: "refusal"`` (no usage).
   - ``bad_new``: ``session/new`` returns a result without ``sessionId``.
+  - ``rpc_error``: ``initialize`` is answered with a JSON-RPC error object
+    (``AcpRpcError`` path).
+  - ``init_hang``: never answers ``initialize`` (handshake timeout path).
+  - ``bigframe``: prompt stream includes a ~300 KB ``session/update``
+    (multi-chunk read path) and a permission request with an **empty**
+    options list (fail-closed path).
 
 * ``mock-devin-<mode>`` — a POSIX wrapper that the client spawns as its
   ``devin`` binary (the trailing ``acp``/``--model`` args are ignored);
@@ -69,12 +75,12 @@ rid_prompt = None
 OPTIONS = [{"optionId": "proceed", "name": "Proceed", "kind": "proceed_once"},
           {"optionId": "deny", "name": "Deny", "kind": "reject"}]
 
-def emit_permission(rid, tool_call):
+def emit_permission(rid, tool_call, options=OPTIONS):
     pending[rid] = True
     send({"jsonrpc": "2.0", "id": rid,
           "method": "session/request_permission",
           "params": {"sessionId": "mock-sid", "toolCall": tool_call,
-                    "options": OPTIONS}})
+                    "options": options}})
 
 def finish_prompt():
     # interleaved vendor notification, then the prompt response
@@ -90,6 +96,12 @@ def handle(obj):
     m = obj.get("method")
     rid = obj.get("id")
     if m == "initialize":
+        if mode == "init_hang":
+            return  # never answer — handshake timeout path
+        if mode == "rpc_error":
+            send({"jsonrpc": "2.0", "id": rid,
+                 "error": {"code": -32600, "message": "Invalid request (mock)"}})
+            return
         send({"jsonrpc": "2.0", "id": rid, "result": {
             "protocolVersion": 1,
             "agentCapabilities": {"loadSession": True,
@@ -143,13 +155,25 @@ def handle(obj):
             sys.exit(0)
         elif mode == "crash":
             sys.exit(0)
+        elif mode == "bigframe":
+            # ~300 KB update — larger than the client's 64 KB read chunks.
+            big = "B" * 300000
+            send({"jsonrpc": "2.0", "method": "session/update",
+                  "params": {"sessionId": "mock-sid",
+                            "update": {"sessionUpdate": "agent_message_chunk",
+                                      "content": {"type": "text", "text": big}}}})
+            # permission request with an EMPTY options list — the client
+            # must fail closed ("cancelled") rather than guess an option.
+            emit_permission(103, {"name": "write", "kind": "edit",
+                                 "rawInput": {"file_path": "/tmp/x.txt"}},
+                           options=[])
         return
     if m == "session/cancel":
         state("cancel")
         return
     if m == "session/close":
         state("close")
-        if mode in ("ok", "refusal"):
+        if mode in ("ok", "refusal", "bigframe"):
             sys.exit(0)
         return
     if rid in pending:
@@ -164,6 +188,7 @@ def handle(obj):
             finish_prompt()
         return
 
+buf = b""
 while True:
     r, _, _ = select.select([sys.stdin.buffer], [], [], 30)
     if not r:
@@ -171,7 +196,11 @@ while True:
     chunk = sys.stdin.buffer.read1(4096)
     if not chunk:
         break
-    for line in chunk.split(b"\n"):
+    buf += chunk
+    # buffer until a full line — a client frame larger than one read1()
+    # chunk (or split across reads) must not be mangled.
+    while b"\n" in buf:
+        line, buf = buf.split(b"\n", 1)
         line = line.strip()
         if not line:
             continue

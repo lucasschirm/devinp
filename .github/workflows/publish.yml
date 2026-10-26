@@ -9,6 +9,9 @@ name: publish
 on:
   push:
     branches: [main]
+    # bench/ is a separate Python package (bench/PLAN.md §8.1) — bench-only
+    # commits must not trigger npm patch releases.
+    paths-ignore: ['bench/**']
   workflow_dispatch:
 
 permissions:
