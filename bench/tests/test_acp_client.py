@@ -1,4 +1,5 @@
-"""WP1 (issue #11) — ``acp_client`` NDJSON JSON-RPC 2.0 client core tests.
+"""WP1 (issue #11) — ``acp_client`` NDJSON JSON-RPC 2.0 client core tests,
+and WP1b (issue #12) — ACP permission policy + refusal-fallback isolation.
 
 All tests run against the in-process mock server (``mock_server.py``):
 zero quota, no real ``devin`` binary. Acceptance mapping (issue #11):
@@ -9,23 +10,40 @@ zero quota, no real ``devin`` binary. Acceptance mapping (issue #11):
 * wire order initialize → session/new (cwd=/testbed) → session/prompt →
   stream session/update → session/cancel → session/close before exit →
   happy path + :func:`test_stall_timeout_cancel_kill_no_orphans`
-* permission policy (web denied / exec-in-workdir allowed /
-  edit-outside denied) → :func:`test_permission_policy_applied_via_wire`
-  + :func:`test_permission_policy_unit`
-* vendor notifications logged & ignored, never an error → happy path
 * timeout → cancel + kill group, no orphans (process table) →
   :func:`test_stall_timeout_cancel_kill_no_orphans`
 * malformed/short read → typed error, never hangs →
   :func:`test_malformed_frame_typed_error_no_hang`,
   :func:`test_short_read_typed_error`, :func:`test_process_death_typed_error`
-* refusal-fallback isolation + terminal refusal →
-  :func:`test_refusal_is_terminal_and_fallback_env_isolated`
 * review round 1 (Devin/swe-2) follow-ups: server error responses
   (:func:`test_server_error_response_is_typed`), bounded handshake
   (:func:`test_initialize_timeout_is_bounded`), >64 KB frame round-trip
   + empty-options fail-closed (:func:`test_large_frame_roundtrip_and_empty_options`),
   close-without-start / start-after-close lifecycle guards,
   transport bounded-write + typed write errors
+
+Acceptance mapping (issue #12 — WP1b):
+
+* permission policy — allow read (incl. code search); edit/write + shell
+  exec (exec/terminal) inside ``/testbed`` + ``/tmp`` (the agent must run
+  pytest) → :func:`test_permission_policy_acceptance_matrix` +
+  :func:`test_permission_policy_applied_via_wire`
+* deny web-search/fetch tools; deny writes outside ``/testbed``+``/tmp``
+  → :func:`test_permission_policy_acceptance_matrix` +
+  :func:`test_permission_policy_applied_via_wire`
+* env-isolation assertion (``DEVIN_REFUSAL_FALLBACK`` stripped, caller env
+  overrides preserved) + refusal → terminal error →
+  :func:`test_refusal_is_terminal_and_fallback_env_isolated`
+* review round 1 (Devin/swe-2) follow-ups: real-wire toolCall shape
+  (no top-level ``name``; name via ``_meta``/``toolCallId``; spec
+  ``ToolKind`` ``fetch`` = web, incl. the in-scope-path bypass regression)
+  → :func:`test_permission_policy_acceptance_matrix` +
+  :func:`test_permission_policy_applied_via_wire` (mock emits the
+  WP0-captured shape), ACP ``PermissionOptionKind`` exact matching →
+  :func:`test_option_kinds_matched_exactly`, ``--refusal-fallback=x``
+  form → :func:`test_refusal_fallback_cli_flag_refused`, lexical-check
+  hardening (``~``/``$VAR``, relative paths, ``locations``/``content``
+  path blocks) → :func:`test_permission_policy_acceptance_matrix`
 """
 
 from __future__ import annotations
@@ -95,12 +113,15 @@ def test_happy_path_framing_and_transcript(tmp_path):
     echo = s.transcript[0].payload["update"]["content"]["text"]
     assert echo == text
 
-    # Happy-path transcript: expected notification sequence, stream order.
+    # Happy-path transcript: expected notification sequence, stream order
+    # (WP1b: web_fetch denied, bash-in-/testbed allowed, code search
+    # allowed, edit-outside-allowed-dirs denied).
     kinds = [(e.kind, e.method) for e in s.transcript]
     assert kinds == [
         ("update", "agent_message_chunk"),
         ("permission", "web_fetch"),
         ("permission", "bash"),
+        ("permission", "search"),
         ("permission", "write"),
         ("update", "usage_update"),
     ]
@@ -154,43 +175,176 @@ def test_permission_policy_applied_via_wire(tmp_path):
     finally:
         s.close()
     out = _permission_outcomes(state)
-    # web_fetch tool request -> denied
+    # the mock emits the WP0-captured real wire shape (no top-level
+    # ``name``; spec ToolKind — web is kind "fetch")
+    # web_fetch tool request (kind "fetch") -> denied
     assert out[100] == ("selected", "deny")
-    # shell execution inside /testbed (the session cwd) -> allowed
+    # shell execution with an in-scope declared cwd (/testbed) -> allowed
+    # (the agent must be able to run pytest, WP1b AC1)
     assert out[101] == ("selected", "proceed")
-    # edit outside /testbed + /tmp -> denied
-    assert out[102] == ("selected", "deny")
+    # code search (ACP kind "search" — a read, NOT a web tool) -> allowed
+    assert out[102] == ("selected", "proceed")
+    # edit outside /testbed + /tmp -> denied (WP1b AC2)
+    assert out[103] == ("selected", "deny")
     _assert_no_orphans(s)
 
 
-def test_permission_policy_unit():
+def test_permission_policy_acceptance_matrix():
+    """Issue #12 AC — table-driven policy matrix (unit).
+
+    * **Allow:** read (unscoped, incl. code search); edit/write inside
+      ``/testbed`` + ``/tmp``; shell execution (exec/terminal) — so the
+      agent can reproduce bugs and run pytest.
+    * **Deny:** web-search/fetch tools; writes outside ``/testbed``+``/tmp``;
+      out-of-scope exec cwd; write tools with no declared path (fail
+      closed); mislabelled write tools (kind wins over name); anything
+      else (default deny).
+    """
     p = ac.SwebenchPolicy()  # workdir=/testbed, extra=/tmp
-    options = [{"optionId": "proceed"}, {"optionId": "deny"}]
+    options = [{"optionId": "proceed", "name": "Proceed"},
+              {"optionId": "deny", "name": "Deny"}]
 
     def decide(name, kind, raw):
         return p.decide(
             {"toolCall": {"name": name, "kind": kind, "rawInput": raw},
              "options": options}
-        )
+        ).allow
 
-    assert decide("web_fetch", "web", {}).allow is False
-    assert decide("search_web", "", {}).allow is False
-    assert decide("fetch", "web", {}).allow is False
-    assert decide("read_file", "read", {"path": "/etc/hostname"}).allow is True
-    assert decide("bash", "execute", {"command": "pytest -q"}).allow is True
-    assert decide("write", "edit", {"file_path": "/testbed/src/app.py"}).allow is True
-    assert decide("write", "edit", {"file_path": "/tmp/scratch.txt"}).allow is True
-    assert decide("write", "edit", {"file_path": "/etc/passwd"}).allow is False
-    assert decide("write", "edit", {"file_path": "/evil.txt"}).allow is False
-    # prefix-trick path must not match the allow dir
-    assert decide("write", "edit", {"file_path": "/testbed-evil/x"}).allow is False
-    # default deny
-    assert decide("mystery_tool", "weird", {}).allow is False
+    def decide_tool(tool):
+        """Full toolCall dict — the real wire shape (no top-level name)."""
+        return p.decide({"toolCall": tool, "options": options}).allow
+
+    cases = [
+        # AC1 — allow read (unscoped)
+        ("read", "read", {}, True),
+        ("read_file", "read", {"path": "/etc/hostname"}, True),
+        ("search", "search", {"pattern": "def foo"}, True),  # code search = read
+        ("grep", "", {"pattern": "x"}, True),
+        # AC1 — allow edit/write inside /testbed + /tmp
+        ("write", "edit", {"file_path": "/testbed/src/app.py"}, True),
+        ("write", "edit", {"file_path": "/testbed"}, True),
+        ("write", "edit", {"filePath": "/tmp/scratch.txt"}, True),
+        ("write", "edit", {"file_path": "/testbed/sub/dir"}, True),
+        # AC1 — allow shell execution (exec/terminal): run pytest
+        ("bash", "execute", {"command": "pytest -q"}, True),
+        ("bash", "execute", {"command": "pytest -q", "cwd": "/testbed"}, True),
+        ("bash", "execute", {"command": "ls", "cwd": "/testbed/src"}, True),
+        ("bash", "execute", {"command": "make test", "cwd": "/tmp"}, True),
+        ("terminal", "", {"command": "pytest"}, True),
+        ("run_command", "", {"command": "python -m pytest"}, True),
+        # AC1/AC2 — exec cwd scoping: out-of-scope declared cwd denied
+        ("bash", "execute", {"command": "rm -rf /", "cwd": "/etc"}, False),
+        ("bash", "execute", {"command": "touch x", "cwd": "/root"}, False),
+        ("bash", "execute", {"command": "ls", "cwd": "../../etc"}, False),
+        ("bash", "execute", {"command": "ls", "cwd": "src"}, True),  # rel -> workdir
+        ("bash", "execute", {"command": "ls", "workingDirectory": "/etc"}, False),
+        ("bash", "execute", {"command": "ls",
+                             "cwd": "/testbed", "workingDirectory": "/etc"},
+         False),  # dual declaration: the out-of-scope key is checked too
+        ("bash", "execute", {"command": "ls", "cwd": "~"}, False),  # ~ expands
+        ("bash", "execute", {"command": "ls", "cwd": "$HOME"}, False),  # $VAR expands
+        # AC2 — deny web-search/fetch tools (name markers)
+        ("web_fetch", "web", {"url": "https://example.com"}, False),
+        ("web_search", "web", {"query": "swe-bench"}, False),
+        ("search_web", "", {}, False),
+        ("fetch", "web", {}, False),
+        ("http_get", "", {"url": "https://example.com"}, False),
+        # AC2 — deny writes outside /testbed + /tmp
+        ("write", "edit", {"file_path": "/etc/passwd"}, False),
+        ("write", "edit", {"file_path": "/evil.txt"}, False),
+        ("write", "edit", {"file_path": "/testbed-evil/x"}, False),  # prefix trick
+        ("write", "edit", {"file_path": "/testbed/a", "path": "/etc/b"}, False),
+        ("write", "edit", {"file_path": "src/app.py"}, True),  # rel -> workdir
+        ("write", "edit", {"file_path": "../../etc/x"}, False),  # rel escapes
+        # fail-closed + default deny
+        ("write", "edit", {}, False),            # write, no declared path
+        ("list", "edit", {}, False),            # mislabel: kind wins, no path
+        ("readme_tool", "edit", {"file_path": "/testbed/x"}, True),  # mislabel: path checked
+        ("list_sessions", "", {}, False),
+        ("mystery_tool", "weird", {}, False),
+    ]
+    for name, kind, raw, want in cases:
+        got = decide(name, kind, raw)
+        assert got is want, f"{name!r} (kind={kind!r}, raw={raw!r}): want {want}, got {got}"
+
+    # Review round 1 (Devin/swe-2): real wire shape (WP0 capture — no
+    # top-level ``name``; name via _meta / toolCallId prefix; kind is a
+    # spec ToolKind — "fetch" = "retrieving external data", not "web").
+    tool_cases = [
+        # kind "fetch" = web — the in-scope declared path must NOT rescue it
+        ({"kind": "fetch", "rawInput": {"url": "https://example.com",
+                                        "path": "/tmp/out"}}, False),
+        ({"kind": "fetch", "rawInput": {"url": "https://example.com"}}, False),
+        # name via _meta (real devin wire), kind "other"
+        ({"toolCallId": "web_fetch:0#x", "kind": "other", "rawInput": {},
+          "_meta": {"cognition.ai/inferenceToolName": "web_fetch"}}, False),
+        # contradicting sources: _meta wins over the toolCallId prefix
+        ({"toolCallId": "search:0#x", "kind": "other", "rawInput": {},
+          "_meta": {"cognition.ai/inferenceToolName": "web_fetch"}}, False),
+        # empty toolCallId prefix falls through to the spec name field
+        ({"toolCallId": ":x", "name": "bash", "kind": ""}, True),
+        # whitespace prefix is not a name either — falls through to name
+        ({"toolCallId": " :x", "name": "bash", "kind": ""}, True),
+        # non-list locations is type-guarded (no crash) — fail closed
+        ({"kind": "edit", "rawInput": {}, "locations": 5}, False),
+        ({"kind": "edit", "rawInput": {}, "content": 5}, False),
+        # name via toolCallId prefix (write class, no kind → name fallback)
+        ({"toolCallId": "write:0#x", "kind": "",
+          "rawInput": {"file_path": "/testbed/a"}}, True),
+        ({"toolCallId": "write:0#x", "kind": "",
+          "rawInput": {"file_path": "/etc/a"}}, False),
+        # spec write kinds: delete / move — path-scoped
+        ({"kind": "delete", "rawInput": {"file_path": "/testbed/x"}}, True),
+        ({"kind": "move", "rawInput": {"file_path": "/etc/x"}}, False),
+        # locations[].path / content[].path — WP0-captured path carriers
+        ({"kind": "edit", "rawInput": {},
+          "locations": [{"path": "/etc/x"}]}, False),
+        ({"kind": "edit", "rawInput": {},
+          "locations": [{"path": "/testbed/x"}]}, True),
+        ({"kind": "edit", "rawInput": {"file_path": "/testbed/a"},
+          "content": [{"type": "diff", "path": "/etc/b"}]}, False),
+    ]
+    for tool, want in tool_cases:
+        got = decide_tool(tool)
+        assert got is want, f"tool={tool!r}: want {want}, got {got}"
+
     # option mapping: allow -> proceed option, deny -> deny option
-    d = decide("bash", "execute", {})
-    assert d.option_id == "proceed"
-    d = decide("web_fetch", "web", {})
-    assert d.option_id == "deny"
+    d = p.decide({"toolCall": {"name": "bash", "kind": "execute",
+                              "rawInput": {}}, "options": options})
+    assert d.allow is True and d.option_id == "proceed"
+    d = p.decide({"toolCall": {"name": "web_fetch", "kind": "web",
+                              "rawInput": {}}, "options": options})
+    assert d.allow is False and d.option_id == "deny"
+
+
+def test_option_kinds_matched_exactly():
+    """Review round 1 (Devin/swe-2): the ACP-spec PermissionOptionKind
+    values (allow_once/allow_always/reject_once/reject_always) are
+    matched **exactly**, so a substring in an option id ("ok" in
+    "token") or name can never mis-select."""
+    p = ac.SwebenchPolicy()
+    acao = [{"optionId": "allow_once", "kind": "allow_once",
+             "name": "Allow once"},
+            {"optionId": "reject_once", "kind": "reject_once",
+             "name": "Reject once"}]
+    d = p.decide({"toolCall": {"name": "bash", "kind": "execute",
+                              "rawInput": {}}, "options": acao})
+    assert d.allow is True and d.option_id == "allow_once"
+    d = p.decide({"toolCall": {"name": "web_fetch", "kind": "fetch",
+                              "rawInput": {}}, "options": acao})
+    assert d.allow is False and d.option_id == "reject_once"
+    # adversarial: id/name substrings contradict the kind — the kind
+    # (the spec semantic) must win
+    trap = [{"optionId": "proceed_ok", "kind": "reject_once",
+             "name": "No"},
+            {"optionId": "deny_no", "kind": "allow_once",
+             "name": "Yes"}]
+    d = p.decide({"toolCall": {"name": "bash", "kind": "execute",
+                              "rawInput": {}}, "options": trap})
+    assert d.option_id == "deny_no"  # kind allow_once, despite the id
+    d = p.decide({"toolCall": {"name": "web_fetch", "kind": "fetch",
+                              "rawInput": {}}, "options": trap})
+    assert d.option_id == "proceed_ok"  # kind reject_once, despite the id
 
 
 # ---------------------------------------------------------------------------
@@ -287,13 +441,18 @@ def test_bad_session_new_protocol_error(tmp_path):
 def test_refusal_is_terminal_and_fallback_env_isolated(tmp_path):
     s, state = _session(
         tmp_path, "refusal",
-        env={"DEVIN_REFUSAL_FALLBACK": "swe-1-6"},  # must be stripped
+        env={"DEVIN_REFUSAL_FALLBACK": "swe-1-6",  # must be stripped
+             "BENCH_ENV_MARKER": "keep-me"},  # caller override must survive
     )
     try:
         s.initialize()
         started = [e for e in read_state(state) if e["event"] == "started"][0]
-        # the client env never contains DEVIN_REFUSAL_FALLBACK
+        # env-isolation assertion: the client env never contains
+        # DEVIN_REFUSAL_FALLBACK
         assert started["devin_refusal_fallback"] == "ABSENT"
+        # caller env overrides are preserved (the adapter injects
+        # PATH/CONDA_DEFAULT_ENV this way, PLAN §3.5)
+        assert started["bench_env_marker"] == "keep-me"
 
         s.create_session(cwd="/testbed")
         with pytest.raises(ac.AcpRefusalError) as ei:
@@ -303,6 +462,50 @@ def test_refusal_is_terminal_and_fallback_env_isolated(tmp_path):
         # further prompts.
         with pytest.raises(ac.AcpProtocolError):
             s.prompt("again", timeout=20)
+        s.close()
+    finally:
+        s.close()
+    _assert_no_orphans(s)
+
+
+def test_refusal_fallback_cli_flag_refused(tmp_path):
+    """PLAN §3.4: the ``--refusal-fallback`` CLI flag is refused too —
+    a refusal must be terminal, never a mid-run model switch. Both the
+    space-separated and ``=`` forms (review round 1, Devin/swe-2)."""
+    for args in (["--refusal-fallback", "swe-1-6"],
+                 ["--refusal-fallback=swe-1-6"]):
+        wrapper, _ = make_mock(tmp_path, "ok")
+        s = ac.AcpSession(devin_bin=wrapper, model="swe-2-high",
+                         extra_args=args)
+        with pytest.raises(ac.AcpProtocolError):
+            s.start()
+        s.close()  # no process was spawned — close must be a safe no-op
+
+
+def test_non_dict_params_does_not_crash_dispatch(tmp_path):
+    """Review round 3 (Devin/swe-2): a truthy non-dict ``params`` on the
+    wire path must not crash ``_dispatch`` before ``decide()`` runs —
+    it is normalized to ``{}`` (permission → graceful default-deny
+    "cancelled"; update → recorded as unknown), not an uncaught
+    AttributeError."""
+    s, state = _session(tmp_path, "ok")
+    try:
+        s.initialize()
+        s.create_session(cwd="/testbed")
+        s._dispatch({"jsonrpc": "2.0", "id": 900,
+                    "method": "session/request_permission",
+                    "params": [1, 2, 3]})
+        s._dispatch({"jsonrpc": "2.0", "method": "session/update",
+                    "params": [1, 2, 3]})
+        # side effects (round-4 NIT): the permission frame got a
+        # default-deny ("cancelled" — no option id, so a regression
+        # that skipped _answer_permission would show option_id present),
+        # and the update was recorded as "unknown".
+        perm = [e for e in s.transcript if e.kind == "permission"]
+        assert perm and perm[0].payload["allow"] is False
+        assert perm[0].payload["option_id"] is None
+        assert any(e.kind == "update" and e.method == "unknown"
+                   for e in s.transcript)
         s.close()
     finally:
         s.close()

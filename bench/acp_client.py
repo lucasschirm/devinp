@@ -1,4 +1,5 @@
-"""NDJSON JSON-RPC 2.0 client core for `devin acp` — WP1 (issue #11).
+"""NDJSON JSON-RPC 2.0 client core for `devin acp` — WP1 (issue #11)
++ WP1b (issue #12: ACP permission policy + refusal-fallback isolation).
 
 Wire contract (bench/PLAN.md §1, verified live in WP0 — ``notes/acp-surface.md``):
 
@@ -25,10 +26,33 @@ Hygiene (PLAN.md §3, risk table):
   SIGTERM → SIGKILL's the whole group, so no orphan ``devin`` process leaks
   quota. Use the context-manager form so close runs on all paths.
 * ``DEVIN_REFUSAL_FALLBACK`` is **always unset** in the child env (PLAN
-  §3.4), even if the caller passes it. A refusal stop-reason is a terminal
+  §3.4), even if the caller passes it, and the ``--refusal-fallback`` CLI
+  flag is refused. A refusal stop-reason is a terminal
   :class:`AcpRefusalError` — never a model switch, never a retry.
 * Every blocking read is **deadline-bounded**; malformed/short reads raise
   typed errors and the client **never hangs**.
+
+Permission policy (PLAN.md §3.7, issue #12 — :class:`SwebenchPolicy`):
+
+* **Allow:** read-only tools (unscoped — a read may leave ``/testbed``,
+  e.g. ``/etc``); edit/write **and** shell execution (exec/terminal)
+  inside the workdir (``/testbed``) and ``/tmp`` — the agent must be able
+  to reproduce bugs and run pytest. An exec that declares a ``cwd`` outside
+  the allowed dirs fails closed; an exec with no declared ``cwd`` runs in
+  the session cwd (``/testbed``), so it is in scope.
+* **Deny:** web-search/fetch tools — ACP ``ToolKind`` ``fetch`` ("retrieving
+  external data") plus an explicit name marker list; the code-search tool
+  (toolCallKind ``search``) is a *read*, not web; writes outside
+  workdir+``/tmp`` (every declared path — ``rawInput`` keys, ``locations``
+  and ``content`` blocks — must be in scope); anything else (default deny).
+* **Kind-first classification:** ``toolCall.kind`` is the classifier; the
+  tool *name* (resolved from ``_meta["cognition.ai/inferenceToolName"]`` →
+  ``toolCallId`` prefix → spec ``name`` field, per the WP0 live capture)
+  is a fallback only when the kind is absent/``other``. A mislabelled
+  write tool (kind ``edit``) is never allowed via a read-like name without
+  a path check.
+* Path checks are lexical (after ``~``/``$VAR`` expansion); they do not
+  resolve symlinks — the allow dirs are real dirs in the sweb.eval images.
 
 The module is pure stdlib: no SDK dependency, no real ``devin`` binary —
 the whole behaviour is unit-tested against an in-process mock server
@@ -145,10 +169,84 @@ class AcpRefusalError(AcpError):
 # ---------------------------------------------------------------------------
 
 #: option-id/name/kind markers used to map a policy decision onto the
-#: server-provided option list (WP0: real option shape is an open item;
-#: ACP-spec ``selected``/``cancelled`` outcomes are what the client emits).
+#: server-provided option list — fallback for non-spec option shapes (the
+#: ACP-spec ``PermissionOptionKind`` values are matched exactly first, see
+#: :meth:`SwebenchPolicy._pick`).
 _PROCEED_MARKERS = ("proceed", "allow", "approved", "yes", "ok")
 _DENY_MARKERS = ("deny", "reject", "denied", "no", "cancel", "refuse")
+
+#: ACP-spec ``PermissionOptionKind`` values (schema v1) — matched exactly,
+#: so a substring in an option id (e.g. "ok" in "token") can never
+#: mis-select.
+_ACP_OPTION_KINDS = {
+    True: ("allow_once", "allow_always"),
+    False: ("reject_once", "reject_always"),
+}
+
+#: Explicit web-tool name markers — the name-level web deny (PLAN §3.7:
+#: "Deny: web-search/fetch tools"), in addition to the spec ``ToolKind``
+#: ``fetch`` ("retrieving external data"). Deliberately an exact-name set,
+#: not a prefix match: ACP's ``search`` toolCallKind (codebase search) is a
+#: *read*, not a web tool — a prefix heuristic denied it and would break
+#: the benchmark agent's code search.
+_WEB_TOOL_NAMES = frozenset({
+    "web", "web_fetch", "websearch", "web_search", "search_web",
+    "web_browse", "browse", "browser",
+    "fetch", "fetch_url", "url_fetch",
+    "http", "http_get", "http_post", "http_request",
+})
+
+#: read-only tool names — fallback when kind is absent/"other" (a read
+#: tool with kind "read"/"search" is allowed regardless of name).
+_READ_NAMES = frozenset({
+    "read", "read_file", "view", "list", "ls", "glob",
+    "search", "grep",
+})
+
+#: shell-execution tool names — fallback when kind is absent/"other".
+_EXEC_NAMES = frozenset({
+    "bash", "shell", "exec", "terminal", "run", "run_command",
+})
+
+#: write-class tool kinds (ACP toolCallKind) and names — every declared
+#: path must be inside the allowed dirs.
+_WRITE_KINDS = ("edit", "delete", "move")
+_WRITE_NAMES = frozenset({
+    "write", "edit", "multiedit", "create_file", "delete_file",
+    "rename", "move", "apply_patch", "patch",
+})
+
+#: rawInput keys that declare a file path (any of them may appear; when
+#: several do, **all** declared paths are checked). A toolCall also carries
+#: affected paths in ``locations[].path`` and ``content[].path`` (WP0 live
+#: capture: ``content: [{type: "diff", path: …}]``) — both are collected
+#: too, so a write that declares its target only there is still checked.
+_PATH_KEYS = ("file_path", "filePath", "path", "notebook_path")
+
+
+def _tool_name(tool: dict) -> str:
+    """The tool name of a ToolCall, resolved for the **real wire shape**.
+
+    The WP0 live capture (``notes/acp-probe-handshake2.frames.jsonl``)
+    shows ``devin acp`` sends tool names in
+    ``_meta["cognition.ai/inferenceToolName"]`` and as the ``toolCallId``
+    prefix (e.g. ``"write:0#…"``) — with **no** top-level ``name`` field
+    (it is optional in the ACP schema, absent in the capture). The
+    human-readable ``title`` is deliberately *not* a name source: it is a
+    display string ("Wrote ./wp0_probe.txt"), not a tool identifier.
+    """
+    meta = tool.get("_meta")
+    if isinstance(meta, dict):
+        n = meta.get("cognition.ai/inferenceToolName")
+        if isinstance(n, str) and n:
+            return n.lower()
+    cid = tool.get("toolCallId")
+    if isinstance(cid, str) and ":" in cid:
+        pre = cid.split(":", 1)[0].strip()
+        if pre:  # an empty/blank prefix is not a name — fall through
+            return pre.lower()
+    n = tool.get("name")
+    return str(n).lower() if n else ""
 
 
 @dataclass(frozen=True)
@@ -168,13 +266,28 @@ class PermissionPolicy:
 
 
 class SwebenchPolicy(PermissionPolicy):
-    """Default benchmark policy (PLAN.md §3.7).
+    """Default benchmark policy (PLAN.md §3.7, issue #12).
 
-    * **Allow:** read; edit/write inside *workdir* and ``/tmp``; shell
-      execution (exec/terminal) inside *workdir* (the agent process runs
-      there, so its shell does too).
-    * **Deny:** web-search/fetch tools; writes outside *workdir*+``/tmp``;
-      anything else (default deny).
+    * **Allow:** read-only tools (unscoped); edit/write inside *workdir*
+      (``/testbed``) and ``/tmp``; shell execution (exec/terminal) — an
+      undeclared ``cwd`` runs in the session cwd (``/testbed``), an
+      out-of-scope declared ``cwd`` is denied. The agent must be able to
+      reproduce bugs and run pytest.
+    * **Deny:** web-search/fetch tools (ACP ``ToolKind`` ``fetch`` + an
+      explicit name marker list — a code-search tool is a *read*, not
+      web); writes outside workdir+``/tmp``; anything else (default deny).
+
+    Classification is **kind-first**: ``toolCall.kind`` decides the class;
+    the tool name is a fallback only when the kind is absent/``other``,
+    so a mislabelled write tool (kind ``edit``) is never allowed via a
+    read-like name without a path check. Relative declared paths and
+    relative exec cwds resolve against the policy's *workdir* (default
+    ``/testbed`` — the adapter creates the session with ``cwd=/testbed``),
+    not the client process cwd; ``~``/``$VAR`` are expanded; symlinks are
+    not resolved (lexical checks — the allow dirs are real dirs in the
+    sweb.eval images). The exec ``cwd`` rawInput key is unobserved live
+    (WP0 §9.1): ``cwd``/``workingDirectory`` are checked; Pilot A confirms
+    the real key set.
     """
 
     def __init__(self, workdir: str = "/testbed",
@@ -186,36 +299,70 @@ class SwebenchPolicy(PermissionPolicy):
     # -- public ----------------------------------------------------------
 
     def decide(self, params: dict) -> PermissionDecision:
+        if not isinstance(params, dict):
+            params = {}
         tool = params.get("toolCall") or {}
         if not isinstance(tool, dict):
             tool = {}
-        name = str(tool.get("name") or "").lower()
+        name = _tool_name(tool)
         kind = str(tool.get("kind") or "").lower()
         raw = tool.get("rawInput")
         raw = raw if isinstance(raw, dict) else {}
         options = params.get("options") or []
         options = [o for o in options if isinstance(o, dict)]
 
-        # 1) web-search / fetch — always denied.
-        if kind == "web" or name.startswith(("web", "fetch", "search", "http")):
+        # 1) web-search / fetch — always denied. ``kind == "fetch"`` is
+        #    the ACP ToolKind for "retrieving external data" (schema v1;
+        #    the real devin wire has no "web" kind — "web" is kept for
+        #    non-spec servers); a code-search tool (kind "search") is a
+        #    read, not web, so it never lands here.
+        if kind in ("web", "fetch") or name in _WEB_TOOL_NAMES:
             return self._pick(options, False, "web tools are denied")
 
-        # 2) shell execution inside the workdir — allowed.
-        if kind in ("execute", "shell") or name in (
-            "bash", "shell", "exec", "terminal", "run", "run_command"
-        ):
-            return self._pick(options, True, "shell execution inside workdir")
+        # 2) shell execution — allowed (the agent must run pytest). Every
+        #    *declared* cwd outside the allowed dirs fails closed (both
+        #    keys checked — a divergent dual declaration cannot launder);
+        #    no declared cwd → the session cwd (workdir), which is in
+        #    scope. (The cwd rawInput keys are unobserved live — WP0 §9.1;
+        #    Pilot A confirms the real key set.)
+        if kind in ("execute", "shell") \
+                or (kind in ("", "other") and name in _EXEC_NAMES):
+            cwds = [str(raw[k]) for k in ("cwd", "workingDirectory")
+                    if raw.get(k)]
+            if any(not self._exec_cwd_allowed(c) for c in cwds):
+                return self._pick(options, False,
+                                 "exec cwd outside allowed dirs")
+            return self._pick(options, True,
+                             "shell execution (in-scope cwd)")
 
-        # 3) reads — allowed.
-        if kind == "read" or name.startswith(("read", "list", "glob")):
-            return self._pick(options, True, "read access")
+        # 3) read-only — allowed, unscoped (a read may leave the allowed
+        #    dirs, e.g. /etc or docs).
+        if kind in ("read", "search") \
+                or (kind in ("", "other") and name in _READ_NAMES):
+            return self._pick(options, True, "read-only access")
 
-        # 4) path-scoped tools (edit/write/…) — check every declared path.
-        paths = [
-            str(raw[k]) for k in ("file_path", "filePath", "path", "notebook_path")
-            if raw.get(k)
-        ]
-        if paths:
+        # 4) path-scoped writes — allowed only if **every** declared path
+        #    (rawInput keys + locations + content blocks) is inside
+        #    workdir + /tmp.
+        paths = [str(raw[k]) for k in _PATH_KEYS if raw.get(k)]
+        locs = tool.get("locations")
+        locs = locs if isinstance(locs, list) else []
+        for loc in locs:
+            if isinstance(loc, dict) and loc.get("path"):
+                paths.append(str(loc["path"]))
+        content = tool.get("content")
+        content = content if isinstance(content, list) else []
+        for c in content:
+            if isinstance(c, dict) and c.get("path"):
+                paths.append(str(c["path"]))
+        if kind in _WRITE_KINDS \
+                or (kind in ("", "other") and name in _WRITE_NAMES) \
+                or paths:
+            if not paths:
+                # a write-class tool that declares no path cannot be
+                # verified → fail closed.
+                return self._pick(options, False,
+                                 "write tool with no declared path (fail closed)")
             if all(self._path_allowed(p) for p in paths):
                 return self._pick(options, True, "paths inside allowed dirs")
             return self._pick(options, False, "paths outside allowed dirs")
@@ -225,11 +372,52 @@ class SwebenchPolicy(PermissionPolicy):
 
     # -- internals -------------------------------------------------------
 
+    @staticmethod
+    def _normalize(path: str) -> str:
+        """``~``/``$VAR`` expansion + absolutization. Expansion uses the
+        **client process** env (``os.environ``) — child env overrides
+        (``AcpSession(env=…``) are not visible to the policy. Lexical:
+        symlinks are **not** resolved (the allow dirs are real dirs in
+        the sweb.eval images; resolving a symlinked workdir would
+        false-deny)."""
+        return os.path.abspath(
+            os.path.expandvars(os.path.expanduser(path))
+        )
+
     def _path_allowed(self, path: str) -> bool:
-        p = os.path.abspath(path)
+        # expand ``~``/``$VAR`` **first**, then a still-relative path
+        # resolves against the session cwd — the policy's workdir (the
+        # adapter creates the session with cwd=/testbed), not the client
+        # process cwd.
+        p = os.path.expandvars(os.path.expanduser(str(path)))
+        if not os.path.isabs(p):
+            p = os.path.join(self._allowed[0], p)
+        p = self._normalize(p)
         return any(p == d or p.startswith(d + os.sep) for d in self._allowed)
 
+    def _exec_cwd_allowed(self, cwd: str) -> bool:
+        """An *absolute* declared cwd must be inside the allowed dirs;
+        a relative cwd resolves against the session cwd (the workdir).
+        ``~``/``$VAR`` are expanded **before** the absoluteness check,
+        so ``cwd="~"`` cannot slip through as a literal relative path."""
+        cwd = os.path.expandvars(os.path.expanduser(str(cwd)))
+        if not os.path.isabs(cwd):
+            cwd = os.path.join(self._allowed[0], cwd)
+        return self._path_allowed(cwd)
+
     def _pick(self, options: list, allow: bool, reason: str) -> PermissionDecision:
+        # 1st pass: the ACP-spec PermissionOptionKind values, matched
+        # exactly — a substring in an option id/name ("ok" in "token")
+        # can never mis-select a real option.
+        wanted = _ACP_OPTION_KINDS[allow]
+        for opt in options:
+            if str(opt.get("kind") or "").lower() in wanted:
+                return PermissionDecision(
+                    allow=allow,
+                    option_id=opt.get("optionId") or opt.get("id"),
+                    reason=reason,
+                )
+        # 2nd pass: substring markers for non-spec option shapes.
         markers = _PROCEED_MARKERS if allow else _DENY_MARKERS
         for opt in options:
             oid = str(opt.get("optionId") or opt.get("id") or "").lower()
@@ -859,7 +1047,8 @@ class AcpSession:
         return True
 
     def _on_update(self, frame: dict) -> None:
-        params = frame.get("params") or {}
+        params = frame.get("params")
+        params = params if isinstance(params, dict) else {}
         update = params.get("update")
         update = update if isinstance(update, dict) else {}
         kind = update.get("sessionUpdate") or "unknown"
@@ -870,11 +1059,14 @@ class AcpSession:
         )
 
     def _answer_permission(self, frame: dict) -> None:
-        params = frame.get("params") or {}
+        params = frame.get("params")
+        params = params if isinstance(params, dict) else {}
+        tool = params.get("toolCall")
+        tool = tool if isinstance(tool, dict) else {}
         decision = self._policy.decide(params)
         self.transcript.append(SessionEvent(
             time.time(), "permission",
-            str((params.get("toolCall") or {}).get("name") or "?"),
+            _tool_name(tool) or "?",
             {"allow": decision.allow, "reason": decision.reason,
              "option_id": decision.option_id},
         ))
