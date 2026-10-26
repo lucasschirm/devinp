@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "devinp-bench"
+version = "0.0.1"
+description = "SWE-bench Verified benchmark adapter for devin acp (recon + harness; see bench/PLAN.md)"
+requires-python = ">=3.11"
+# WP0 pin (issue #10): latest stable swebench at recon time; input format of
+# swebench.harness.run_evaluation verified against this version's source.
+dependencies = [
+    "swebench==5.0.2",
+    "pytest>=8",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "probes"]
