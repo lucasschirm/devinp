@@ -356,6 +356,27 @@ def test_transport_send_bounded_deadline_and_typed_errors():
         tx.send_request("initialize", {})
 
 
+def test_large_write_to_non_draining_server_is_bounded():
+    """Round-4 B-1: a single blocking os.write() larger than the pipe's
+    free space used to block inside the syscall and defeat the deadline.
+    With the non-blocking write + EAGAIN-via-select fix, a 100 KB frame
+    to a server that never reads stdin must hit the deadline, not hang."""
+    r_fd, w_fd = os.pipe()  # nobody reads r_fd
+    stdin = type("_In", (), {"fileno": lambda self: w_fd})()
+    proc = type("_Proc", (), {"stdin": stdin})()
+    tx = ac._Ndjrpc(proc)
+    t0 = time.monotonic()
+    with pytest.raises(ac.AcpTimeoutError):
+        tx.send_request(
+            "session/prompt",
+            {"prompt": [{"type": "text", "text": "X" * 100000}]},
+            deadline=time.monotonic() + 1.0,
+        )
+    assert time.monotonic() - t0 < 10  # bounded — never hangs
+    os.close(r_fd)
+    os.close(w_fd)
+
+
 # ---------------------------------------------------------------------------
 # 7. review round 1 (Devin/swe-2) follow-ups
 # ---------------------------------------------------------------------------

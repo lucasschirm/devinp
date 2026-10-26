@@ -348,6 +348,10 @@ class _Ndjrpc:
             deadline = time.monotonic() + self._FALLBACK_WRITE_CAP_S
         try:
             fd = self._proc.stdin.fileno()
+            # non-blocking: a single blocking os.write() larger than the
+            # pipe's free space would block inside the syscall and defeat
+            # every deadline; EAGAIN is retried through select instead.
+            os.set_blocking(fd, False)
             while view:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -356,7 +360,10 @@ class _Ndjrpc:
                                              min(remaining, self._SLICE))
                 if not writable:
                     continue
-                n = os.write(fd, view)
+                try:
+                    n = os.write(fd, view)
+                except BlockingIOError:
+                    continue  # pipe momentarily full — re-select
                 view = view[n:]
         except (OSError, ValueError) as exc:
             raise AcpTransportError(f"agent stdin write failed: {exc}") from exc
@@ -482,7 +489,11 @@ class AcpSession:
         self._closed = False
         self._stderr_chunks: list = []
         self._stderr_lock = threading.Lock()
+        self._stderr_thread: Optional[threading.Thread] = None
         self._stderr_max_bytes = 1 << 20  # keep at most ~1 MB for diagnostics
+        #: join cap for the stderr drain thread in close() — bounded, and a
+        # leaked fd + lingering daemon thread beats a hung close().
+        self._drain_join_timeout_s = 1.0
 
         self.session_id: Optional[str] = None
         self.agent_info: dict = {}
@@ -708,9 +719,12 @@ class AcpSession:
                 self._proc.wait(timeout=self._close_grace)
             except subprocess.TimeoutExpired:
                 pass
-            self._kill_group()
         finally:
             self._state = "closed"
+            # group kill on ALL paths — including a BaseException mid-close
+            # (e.g. KeyboardInterrupt in the grace wait) that skips the try
+            # body; idempotent via the _killed guard
+            self._kill_group()
             # Join the stderr drain thread (bounded) BEFORE touching the
             # stderr pipe: while the thread is inside read1(), close()
             # blocks on the buffer's lock — and a detached grandchild
@@ -718,9 +732,9 @@ class AcpSession:
             # the join can time out. A leaked fd + a lingering daemon
             # thread beats a hung close(). Joining first also lets
             # _capture_stderr() pick up the final drained bytes.
-            drain = getattr(self, "_stderr_thread", None)
+            drain = self._stderr_thread
             if drain is not None:
-                drain.join(timeout=1.0)
+                drain.join(timeout=self._drain_join_timeout_s)
             self._capture_stderr()
             self._close_stdin()
             if self._proc is not None:
@@ -889,9 +903,11 @@ class AcpSession:
                 chunk = self._proc.stderr.read1(65536)
             except (OSError, ValueError):
                 return
-            except Exception as exc:  # never let the daemon die silently:
-                log.warning("stderr drain thread exiting: %r", exc)  # a dead
-                return  # thread re-exposes the 64KB-pipe mid-session stall
+            except Exception as exc:
+                # a silently-dead drain thread re-exposes the 64 KB-pipe
+                # mid-session stall, so log before exiting
+                log.warning("stderr drain thread exiting: %r", exc)
+                return
             if not chunk:
                 return  # clean EOF
             with self._stderr_lock:
