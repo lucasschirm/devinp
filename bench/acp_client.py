@@ -242,8 +242,8 @@ def _tool_name(tool: dict) -> str:
             return n.lower()
     cid = tool.get("toolCallId")
     if isinstance(cid, str) and ":" in cid:
-        pre = cid.split(":", 1)[0]
-        if pre:  # an empty prefix ("…:") is not a name — fall through
+        pre = cid.split(":", 1)[0].strip()
+        if pre:  # an empty/blank prefix is not a name — fall through
             return pre.lower()
     n = tool.get("name")
     return str(n).lower() if n else ""
@@ -321,7 +321,7 @@ class SwebenchPolicy(PermissionPolicy):
 
         # 2) shell execution — allowed (the agent must run pytest). Every
         #    *declared* cwd outside the allowed dirs fails closed (both
-        #    keys checked — a divergent dual declaration cannot launders);
+        #    keys checked — a divergent dual declaration cannot launder);
         #    no declared cwd → the session cwd (workdir), which is in
         #    scope. (The cwd rawInput keys are unobserved live — WP0 §9.1;
         #    Pilot A confirms the real key set.)
@@ -1047,7 +1047,8 @@ class AcpSession:
         return True
 
     def _on_update(self, frame: dict) -> None:
-        params = frame.get("params") or {}
+        params = frame.get("params")
+        params = params if isinstance(params, dict) else {}
         update = params.get("update")
         update = update if isinstance(update, dict) else {}
         kind = update.get("sessionUpdate") or "unknown"
@@ -1058,7 +1059,8 @@ class AcpSession:
         )
 
     def _answer_permission(self, frame: dict) -> None:
-        params = frame.get("params") or {}
+        params = frame.get("params")
+        params = params if isinstance(params, dict) else {}
         tool = params.get("toolCall")
         tool = tool if isinstance(tool, dict) else {}
         decision = self._policy.decide(params)

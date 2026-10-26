@@ -283,6 +283,8 @@ def test_permission_policy_acceptance_matrix():
           "_meta": {"cognition.ai/inferenceToolName": "web_fetch"}}, False),
         # empty toolCallId prefix falls through to the spec name field
         ({"toolCallId": ":x", "name": "bash", "kind": ""}, True),
+        # whitespace prefix is not a name either — falls through to name
+        ({"toolCallId": " :x", "name": "bash", "kind": ""}, True),
         # non-list locations is type-guarded (no crash) — fail closed
         ({"kind": "edit", "rawInput": {}, "locations": 5}, False),
         ({"kind": "edit", "rawInput": {}, "content": 5}, False),
@@ -478,6 +480,27 @@ def test_refusal_fallback_cli_flag_refused(tmp_path):
         with pytest.raises(ac.AcpProtocolError):
             s.start()
         s.close()  # no process was spawned — close must be a safe no-op
+
+
+def test_non_dict_params_does_not_crash_dispatch(tmp_path):
+    """Review round 3 (Devin/swe-2): a truthy non-dict ``params`` on the
+    wire path must not crash ``_dispatch`` before ``decide()`` runs —
+    it is normalized to ``{}`` (permission → graceful default-deny
+    "cancelled"; update → recorded as unknown), not an uncaught
+    AttributeError."""
+    s, state = _session(tmp_path, "ok")
+    try:
+        s.initialize()
+        s.create_session(cwd="/testbed")
+        s._dispatch({"jsonrpc": "2.0", "id": 900,
+                    "method": "session/request_permission",
+                    "params": [1, 2, 3]})
+        s._dispatch({"jsonrpc": "2.0", "method": "session/update",
+                    "params": [1, 2, 3]})
+        s.close()
+    finally:
+        s.close()
+    _assert_no_orphans(s)
 
 
 # ---------------------------------------------------------------------------
