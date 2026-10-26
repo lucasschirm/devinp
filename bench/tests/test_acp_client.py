@@ -210,8 +210,11 @@ def test_stall_timeout_cancel_kill_no_orphans(tmp_path):
     finally:
         s.close()
 
-    # the client sent session/cancel before killing the group
-    assert any(e["event"] == "cancel" for e in read_state(state))
+    # the client sent session/cancel AND session/close (best-effort) before
+    # killing the group
+    evs = read_state(state)
+    assert any(e["event"] == "cancel" for e in evs)
+    assert any(e["event"] == "close" for e in evs)
     # bounded — never hangs
     assert elapsed < 15
     # no orphan devin process on the timeout exit path

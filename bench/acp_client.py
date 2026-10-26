@@ -341,8 +341,8 @@ class _Ndjrpc:
                 "NDJSON frame must not contain raw newline/CR characters"
             )
         view = memoryview(line.encode("utf-8") + b"\n")
-        fd = self._proc.stdin.fileno()
         try:
+            fd = self._proc.stdin.fileno()
             while view:
                 if deadline is not None:
                     remaining = deadline - time.monotonic()
@@ -378,11 +378,16 @@ class _Ndjrpc:
                 raise AcpTimeoutError(
                     f"no frame by deadline (buffer={len(self._buf)}B)"
                 )
-            ready, _, _ = select.select([stdout], [], [],
-                                       min(remaining, self._SLICE))
-            if not ready:
-                continue
-            chunk = os.read(stdout.fileno(), self._CHUNK)
+            try:
+                ready, _, _ = select.select([stdout], [], [],
+                                           min(remaining, self._SLICE))
+                if not ready:
+                    continue
+                chunk = os.read(stdout.fileno(), self._CHUNK)
+            except (OSError, ValueError) as exc:
+                raise AcpTransportError(
+                    f"agent stdout read failed: {exc}"
+                ) from exc
             if not chunk:
                 # EOF: a pending partial line is a short read, not a frame.
                 if self._buf.strip():
@@ -472,6 +477,7 @@ class AcpSession:
         self._killed = False
         self._closed = False
         self._stderr_chunks: list = []
+        self._stderr_lock = threading.Lock()
         self._stderr_max_bytes = 1 << 20  # keep at most ~1 MB for diagnostics
 
         self.session_id: Optional[str] = None
@@ -545,14 +551,21 @@ class AcpSession:
     def initialize(self) -> dict:
         """Handshake (``initialize``); returns the agent info verbatim."""
         self._require_state("running")
+        # one shared budget for the send and the wait — worst-case wall
+        # clock is the configured timeout, not 2x it.
         deadline = time.monotonic() + self._init_timeout
         rid = self._tx.send_request(
             WIRE["INITIALIZE"],
             {"protocolVersion": ACP_PROTOCOL_VERSION, "clientCapabilities": {}},
             deadline=deadline,
         )
-        frame = self._wait_for_response(rid, self._init_timeout)
-        self.agent_info = frame["result"]
+        frame = self._wait_for_response(rid, deadline - time.monotonic())
+        result = frame["result"]
+        if not isinstance(result, dict):
+            raise AcpProtocolError(
+                f"initialize result not an object: {result!r}"
+            )
+        self.agent_info = result
         self._state = "initialized"
         return self.agent_info
 
@@ -567,7 +580,7 @@ class AcpSession:
              "mcpServers": mcp_servers if mcp_servers is not None else []},
             deadline=deadline,
         )
-        frame = self._wait_for_response(rid, self._session_timeout)
+        frame = self._wait_for_response(rid, deadline - time.monotonic())
         result = frame["result"]
         sid = result.get("sessionId") if isinstance(result, dict) else None
         if not sid:
@@ -598,13 +611,14 @@ class AcpSession:
                     else (self._prompt_timeout or DEFAULT_PROMPT_TIMEOUT_S))
         t0 = time.monotonic()
         updates_at_start = sum(1 for e in self.transcript if e.kind == "update")
+        deadline = t0 + timeout_s  # shared budget for send + wait
         try:
             rid = self._tx.send_request(
                 WIRE["SESSION_PROMPT"],
                 {"sessionId": self.session_id, "prompt": blocks},
-                deadline=t0 + timeout_s,
+                deadline=deadline,
             )
-            frame = self._wait_for_response(rid, timeout_s)
+            frame = self._wait_for_response(rid, deadline - time.monotonic())
         except AcpTimeoutError:
             # Stalled session: cancel, best-effort close, grace, kill the
             # group (PLAN §5 WP1). The close is sent *before* the kill so
@@ -619,6 +633,9 @@ class AcpSession:
                     )
                 except (OSError, ValueError, AcpError):
                     pass  # best-effort — the group kill follows
+                # brief grace so the server can process the close before
+                # the group kill (deterministic for the wire contract)
+                time.sleep(self._cancel_grace)
             self._kill_group()
             raise
         except (AcpTransportError, AcpMalformedFrameError):
@@ -692,6 +709,12 @@ class AcpSession:
             self._state = "closed"
             self._capture_stderr()
             self._close_stdin()
+            # close the read pipes too — unblocks the stderr drain thread
+            # (OSError out of read1) and stops dead sessions accumulating
+            # fds in a long sequential harness.
+            if self._proc is not None:
+                self._close_pipe(self._proc.stdout)
+                self._close_pipe(self._proc.stderr)
 
     # -- introspection ---------------------------------------------------
 
@@ -759,7 +782,7 @@ class AcpSession:
                         "jsonrpc": "2.0", "id": frame["id"],
                         "error": {"code": -32601,
                                  "message": f"Method not found: {method}"},
-                    })
+                    }, deadline=time.monotonic() + 2.0)
                 except (OSError, ValueError, AcpError):
                     pass
             return
@@ -816,7 +839,8 @@ class AcpSession:
             result = {"outcome": {"outcome": "cancelled"}}
         try:
             self._tx.send_response(
-                {"jsonrpc": "2.0", "id": frame["id"], "result": result}
+                {"jsonrpc": "2.0", "id": frame["id"], "result": result},
+                deadline=time.monotonic() + 2.0,
             )
         except (OSError, ValueError, AcpError):
             pass  # process dying — kill path covers it
@@ -853,18 +877,27 @@ class AcpSession:
                 return
             if not chunk:
                 return  # clean EOF
-            self._stderr_chunks.append(chunk)
-            total = sum(map(len, self._stderr_chunks))
-            while total > self._stderr_max_bytes and len(self._stderr_chunks) > 1:
-                total -= len(self._stderr_chunks.pop(0))
+            with self._stderr_lock:
+                self._stderr_chunks.append(chunk)
+                total = sum(map(len, self._stderr_chunks))
+                while total > self._stderr_max_bytes \
+                        and len(self._stderr_chunks) > 1:
+                    total -= len(self._stderr_chunks.pop(0))
 
     def _capture_stderr(self) -> None:
-        data = b"".join(self._stderr_chunks)
+        with self._stderr_lock:
+            data = b"".join(self._stderr_chunks)
         self.stderr_tail = data[-4000:].decode("utf-8", "replace")
 
     def _close_stdin(self) -> None:
-        if self._proc is not None and self._proc.stdin is not None:
-            try:
-                self._proc.stdin.close()
-            except (OSError, ValueError):
-                pass
+        self._close_pipe(self._proc.stdin if self._proc is not None else None)
+
+    @staticmethod
+    def _close_pipe(stream) -> None:
+        """Close one pipe; unblocks any daemon thread blocked on it."""
+        if stream is None:
+            return
+        try:
+            stream.close()
+        except (OSError, ValueError):
+            pass
