@@ -242,7 +242,9 @@ def _tool_name(tool: dict) -> str:
             return n.lower()
     cid = tool.get("toolCallId")
     if isinstance(cid, str) and ":" in cid:
-        return cid.split(":", 1)[0].lower()
+        pre = cid.split(":", 1)[0]
+        if pre:  # an empty prefix ("…:") is not a name — fall through
+            return pre.lower()
     n = tool.get("name")
     return str(n).lower() if n else ""
 
@@ -297,6 +299,8 @@ class SwebenchPolicy(PermissionPolicy):
     # -- public ----------------------------------------------------------
 
     def decide(self, params: dict) -> PermissionDecision:
+        if not isinstance(params, dict):
+            params = {}
         tool = params.get("toolCall") or {}
         if not isinstance(tool, dict):
             tool = {}
@@ -315,15 +319,17 @@ class SwebenchPolicy(PermissionPolicy):
         if kind in ("web", "fetch") or name in _WEB_TOOL_NAMES:
             return self._pick(options, False, "web tools are denied")
 
-        # 2) shell execution — allowed (the agent must run pytest). A
-        #    *declared* cwd outside the allowed dirs fails closed; no
-        #    declared cwd → the session cwd (workdir), which is in scope.
-        #    (The cwd rawInput key is unobserved live — WP0 §9.1; Pilot A
-        #    confirms the real key set.)
+        # 2) shell execution — allowed (the agent must run pytest). Every
+        #    *declared* cwd outside the allowed dirs fails closed (both
+        #    keys checked — a divergent dual declaration cannot launders);
+        #    no declared cwd → the session cwd (workdir), which is in
+        #    scope. (The cwd rawInput keys are unobserved live — WP0 §9.1;
+        #    Pilot A confirms the real key set.)
         if kind in ("execute", "shell") \
                 or (kind in ("", "other") and name in _EXEC_NAMES):
-            cwd = raw.get("cwd") or raw.get("workingDirectory")
-            if cwd and not self._exec_cwd_allowed(str(cwd)):
+            cwds = [str(raw[k]) for k in ("cwd", "workingDirectory")
+                    if raw.get(k)]
+            if any(not self._exec_cwd_allowed(c) for c in cwds):
                 return self._pick(options, False,
                                  "exec cwd outside allowed dirs")
             return self._pick(options, True,
@@ -339,10 +345,14 @@ class SwebenchPolicy(PermissionPolicy):
         #    (rawInput keys + locations + content blocks) is inside
         #    workdir + /tmp.
         paths = [str(raw[k]) for k in _PATH_KEYS if raw.get(k)]
-        for loc in (tool.get("locations") or []):
+        locs = tool.get("locations")
+        locs = locs if isinstance(locs, list) else []
+        for loc in locs:
             if isinstance(loc, dict) and loc.get("path"):
                 paths.append(str(loc["path"]))
-        for c in (tool.get("content") or []):
+        content = tool.get("content")
+        content = content if isinstance(content, list) else []
+        for c in content:
             if isinstance(c, dict) and c.get("path"):
                 paths.append(str(c["path"]))
         if kind in _WRITE_KINDS \
@@ -364,10 +374,12 @@ class SwebenchPolicy(PermissionPolicy):
 
     @staticmethod
     def _normalize(path: str) -> str:
-        """``~``/``$VAR`` expansion + absolutization. Lexical: symlinks
-        are **not** resolved (the allow dirs are real dirs in the
-        sweb.eval images; resolving a symlinked workdir would false-deny).
-        """
+        """``~``/``$VAR`` expansion + absolutization. Expansion uses the
+        **client process** env (``os.environ``) — child env overrides
+        (``AcpSession(env=…``) are not visible to the policy. Lexical:
+        symlinks are **not** resolved (the allow dirs are real dirs in
+        the sweb.eval images; resolving a symlinked workdir would
+        false-deny)."""
         return os.path.abspath(
             os.path.expandvars(os.path.expanduser(path))
         )

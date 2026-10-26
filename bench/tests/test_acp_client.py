@@ -238,6 +238,9 @@ def test_permission_policy_acceptance_matrix():
         ("bash", "execute", {"command": "ls", "cwd": "../../etc"}, False),
         ("bash", "execute", {"command": "ls", "cwd": "src"}, True),  # rel -> workdir
         ("bash", "execute", {"command": "ls", "workingDirectory": "/etc"}, False),
+        ("bash", "execute", {"command": "ls",
+                             "cwd": "/testbed", "workingDirectory": "/etc"},
+         False),  # dual declaration: the out-of-scope key is checked too
         ("bash", "execute", {"command": "ls", "cwd": "~"}, False),  # ~ expands
         ("bash", "execute", {"command": "ls", "cwd": "$HOME"}, False),  # $VAR expands
         # AC2 — deny web-search/fetch tools (name markers)
@@ -275,6 +278,14 @@ def test_permission_policy_acceptance_matrix():
         # name via _meta (real devin wire), kind "other"
         ({"toolCallId": "web_fetch:0#x", "kind": "other", "rawInput": {},
           "_meta": {"cognition.ai/inferenceToolName": "web_fetch"}}, False),
+        # contradicting sources: _meta wins over the toolCallId prefix
+        ({"toolCallId": "search:0#x", "kind": "other", "rawInput": {},
+          "_meta": {"cognition.ai/inferenceToolName": "web_fetch"}}, False),
+        # empty toolCallId prefix falls through to the spec name field
+        ({"toolCallId": ":x", "name": "bash", "kind": ""}, True),
+        # non-list locations is type-guarded (no crash) — fail closed
+        ({"kind": "edit", "rawInput": {}, "locations": 5}, False),
+        ({"kind": "edit", "rawInput": {}, "content": 5}, False),
         # name via toolCallId prefix (write class, no kind → name fallback)
         ({"toolCallId": "write:0#x", "kind": "",
           "rawInput": {"file_path": "/testbed/a"}}, True),
