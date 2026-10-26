@@ -144,3 +144,10 @@ vite.config.ts.timestamp-*
 
 # generated bundle (npm run build)
 bin/
+
+# bench/ python (WP0)
+bench/.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+bench/notes/raw-frames.jsonl

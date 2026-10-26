@@ -1,0 +1,26 @@
+Logged in (via Devin).
+
+Credentials:
+  File:              /home/lucas/.devin-xdg-data/devin/credentials.toml
+  API server:        https://server.codeium.com
+  Devin webapp:      https://app.devin.ai
+  Devin API:         https://api.devin.ai
+
+User:
+  Name:              Lucas Schirm
+  Email:             lucasschirm@gmail.com
+  User ID:           user-d16dbf3e61fd4643afc70e9e1245e10b
+
+Account:
+  Tier:              Devin Pro
+  Plan:              Pro
+  Team ID:           devin-team$account-6e0fec182a4b48c588b689629703dd42
+  Team membership:   Approved
+  Enterprise:        no
+  Telemetry:         enabled
+
+Team settings:
+  Allowed models:    836 explicitly allowed
+  MCP servers:       allowed (no restrictions)
+  Sandbox:           optional
+  Fetched at:        2026-10-26 16:46:50 UTC

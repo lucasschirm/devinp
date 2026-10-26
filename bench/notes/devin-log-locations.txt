@@ -1,0 +1,15 @@
+total 20
+drwxr-xr-x 9 lucas lucas 4096 Oct 26 16:51 cli
+drwxrwxr-x 7 lucas lucas 4096 Sep 29 00:02 ..
+drwxrwxr-x 4 lucas lucas 4096 Sep  1 02:21 .
+drwxr-xr-x 3 lucas lucas 4096 Sep  1 02:21 mcp
+-rw------- 1 lucas lucas  331 Sep  1 02:21 credentials.toml
+/home/lucas/.devin-xdg-data/devin/cli/logs/devin_20261026-171048_3129942.log
+/home/lucas/.devin-xdg-data/devin/cli/logs/devin_20261026-170738_3011842.log
+/home/lucas/.devin-xdg-data/devin/cli/logs/devin_20261026-164724_2654079.log
+/home/lucas/.devin-xdg-data/devin/cli/logs/devin_20261026-164650_2645903.log
+/home/lucas/.devin-xdg-data/devin/cli/logs/devin_20261026-164650_2645979.log
+/home/lucas/.devin-xdg-data/devin/cli/logs/devin_20261026-164648_2644278.log
+/home/lucas/.devin-xdg-data/devin/cli/logs/devin_20261026-170655_2976381.log
+/home/lucas/.devin-xdg-data/devin/cli/logs/devin_20261026-152806_1843872.log
+/home/lucas/.devin-xdg-data/devin/cli/logs/devin_20261026-164721_2653452.log

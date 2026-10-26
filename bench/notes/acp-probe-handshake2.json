@@ -1,0 +1,2107 @@
+{
+  "mode": "handshake",
+  "devin_bin": "/home/lucas/.local/bin/devin",
+  "model": "swe-2-high",
+  "duration_s": 19.813,
+  "method_names": [
+    "_cognition.ai/mcp/serversChanged",
+    "_cognition.ai/thinking_complete",
+    "_cognition.ai/turn_stats",
+    "session/update"
+  ],
+  "sent_methods": [
+    "initialize",
+    "session/close",
+    "session/new",
+    "session/prompt"
+  ],
+  "expected_methods_present": [
+    "initialize",
+    "session/close",
+    "session/new",
+    "session/prompt"
+  ],
+  "startup_notifications": [],
+  "responses": {
+    "null": {
+      "jsonrpc": "2.0",
+      "id": null,
+      "error": {
+        "code": -32700,
+        "message": "Parse error",
+        "data": {
+          "line": "Content-Length: 89"
+        }
+      }
+    },
+    "9000": {
+      "jsonrpc": "2.0",
+      "id": 9000,
+      "error": {
+        "code": -32601,
+        "message": "Method not found"
+      }
+    },
+    "1": {
+      "jsonrpc": "2.0",
+      "id": 1,
+      "result": {
+        "protocolVersion": 1,
+        "agentCapabilities": {
+          "loadSession": true,
+          "promptCapabilities": {
+            "image": true,
+            "audio": false,
+            "embeddedContext": true
+          },
+          "mcpCapabilities": {
+            "http": true,
+            "sse": true
+          },
+          "sessionCapabilities": {
+            "list": {},
+            "delete": {},
+            "additionalDirectories": {},
+            "close": {
+              "_meta": {
+                "cognition.ai/force": true
+              }
+            }
+          },
+          "auth": {},
+          "_meta": {
+            "cognition.ai/multiRootWorkspace": true,
+            "cognition.ai/sessionListContentSearch": true,
+            "cognition.ai/sessionListOrderBy": [
+              "updated_at",
+              "created_at"
+            ],
+            "cognition.ai/sessionRename": true,
+            "cognition.ai/persistOnCreate": true,
+            "cognition.ai/sessionShare": true,
+            "cognition.ai/documentLifecycle": true,
+            "cognition.ai/userEdits": true,
+            "cognition.ai/terminalLifecycle": true,
+            "cognition.ai/userConfig": true,
+            "cognition.ai/userShellCommand": true,
+            "cognition.ai/editableCommands": true,
+            "cognition.ai/commandRevision": true,
+            "cognition.ai/chains": true,
+            "cognition.ai/megaplan": true,
+            "cognition.ai/ruleMentions": true,
+            "cognition.ai/midTurnPrompts": true
+          }
+        },
+        "authMethods": [
+          {
+            "id": "devin-browser",
+            "name": "Log in with browser",
+            "description": "Sign in via your browser"
+          }
+        ],
+        "agentInfo": {
+          "name": "affogato",
+          "title": "Devin Agent",
+          "version": "0.0.0-dev"
+        },
+        "_meta": {
+          "mcpConfigPath": "/home/lucas/.config/devin/mcp_config.json"
+        }
+      }
+    },
+    "initialize": {
+      "jsonrpc": "2.0",
+      "id": 1,
+      "result": {
+        "protocolVersion": 1,
+        "agentCapabilities": {
+          "loadSession": true,
+          "promptCapabilities": {
+            "image": true,
+            "audio": false,
+            "embeddedContext": true
+          },
+          "mcpCapabilities": {
+            "http": true,
+            "sse": true
+          },
+          "sessionCapabilities": {
+            "list": {},
+            "delete": {},
+            "additionalDirectories": {},
+            "close": {
+              "_meta": {
+                "cognition.ai/force": true
+              }
+            }
+          },
+          "auth": {},
+          "_meta": {
+            "cognition.ai/multiRootWorkspace": true,
+            "cognition.ai/sessionListContentSearch": true,
+            "cognition.ai/sessionListOrderBy": [
+              "updated_at",
+              "created_at"
+            ],
+            "cognition.ai/sessionRename": true,
+            "cognition.ai/persistOnCreate": true,
+            "cognition.ai/sessionShare": true,
+            "cognition.ai/documentLifecycle": true,
+            "cognition.ai/userEdits": true,
+            "cognition.ai/terminalLifecycle": true,
+            "cognition.ai/userConfig": true,
+            "cognition.ai/userShellCommand": true,
+            "cognition.ai/editableCommands": true,
+            "cognition.ai/commandRevision": true,
+            "cognition.ai/chains": true,
+            "cognition.ai/megaplan": true,
+            "cognition.ai/ruleMentions": true,
+            "cognition.ai/midTurnPrompts": true
+          }
+        },
+        "authMethods": [
+          {
+            "id": "devin-browser",
+            "name": "Log in with browser",
+            "description": "Sign in via your browser"
+          }
+        ],
+        "agentInfo": {
+          "name": "affogato",
+          "title": "Devin Agent",
+          "version": "0.0.0-dev"
+        },
+        "_meta": {
+          "mcpConfigPath": "/home/lucas/.config/devin/mcp_config.json"
+        }
+      }
+    },
+    "2": {
+      "jsonrpc": "2.0",
+      "id": 2,
+      "result": {
+        "sessionId": "snow-henley",
+        "modes": {
+          "currentModeId": "accept-edits",
+          "availableModes": [
+            {
+              "id": "accept-edits",
+              "name": "Code"
+            },
+            {
+              "id": "smart",
+              "name": "Smart"
+            },
+            {
+              "id": "ask",
+              "name": "Ask"
+            },
+            {
+              "id": "plan",
+              "name": "Plan"
+            },
+            {
+              "id": "bypass",
+              "name": "Bypass Permissions"
+            }
+          ]
+        },
+        "configOptions": [
+          {
+            "id": "mode",
+            "name": "Session Mode",
+            "category": "mode",
+            "type": "select",
+            "currentValue": "accept-edits",
+            "options": [
+              {
+                "value": "accept-edits",
+                "name": "Code",
+                "description": "Write and edit code",
+                "_meta": {
+                  "cognition.ai/icon": "code"
+                }
+              },
+              {
+                "value": "smart",
+                "name": "Smart",
+                "description": "Auto-approve actions the model judges safe",
+                "_meta": {
+                  "cognition.ai/icon": "sparkles"
+                }
+              },
+              {
+                "value": "ask",
+                "name": "Ask",
+                "description": "Answer questions without code changes",
+                "_meta": {
+                  "cognition.ai/icon": "message-circle"
+                }
+              },
+              {
+                "value": "plan",
+                "name": "Plan",
+                "description": "Plan changes before implementing",
+                "_meta": {
+                  "cognition.ai/icon": "file-text"
+                }
+              },
+              {
+                "value": "bypass",
+                "name": "Bypass Permissions",
+                "description": "Auto-approve all tool calls unless your organization's policy requires approval",
+                "_meta": {
+                  "cognition.ai/icon": "shield-off"
+                }
+              }
+            ]
+          },
+          {
+            "id": "model",
+            "name": "Model",
+            "description": "AI model to use",
+            "category": "model",
+            "type": "select",
+            "currentValue": "swe-2-high",
+            "options": [
+              {
+                "value": "adaptive",
+                "name": "Adaptive",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "swe-2-high",
+                "name": "SWE-2",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "claude-fable-5-1-medium",
+                "name": "Claude Fable 5.1",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "claude-opus-5-5-medium",
+                "name": "Claude Opus 5.5",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "gpt-6-astra-medium",
+                "name": "GPT-6 Astra",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "gpt-6-sol-medium",
+                "name": "GPT-6 Sol",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "gpt-6-luna-medium",
+                "name": "GPT-6 Luna",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "gemini-4-argon-medium",
+                "name": "Gemini 4 Argon",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "kimi-k3-high",
+                "name": "Kimi K3",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "glm-5-2",
+                "name": "GLM-5.2 High",
+                "_meta": {
+                  "cognition.ai/supportsImages": false
+                }
+              },
+              {
+                "value": "glm-5-2-1m",
+                "name": "GLM-5.2 High 1M",
+                "_meta": {
+                  "cognition.ai/supportsImages": false
+                }
+              },
+              {
+                "value": "glm-5-3-max",
+                "name": "GLM-5.3",
+                "_meta": {
+                  "cognition.ai/supportsImages": false
+                }
+              },
+              {
+                "value": "claude-sonnet-5-5-medium",
+                "name": "Claude Sonnet 5.5",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "gemini-3-8-flash-medium",
+                "name": "Gemini 3.8 Flash",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "claude-opus-4-7-medium",
+                "name": "Claude Opus 4.7",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "claude-opus-4-8-medium",
+                "name": "Claude Opus 4.8",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "claude-opus-5-medium",
+                "name": "Claude Opus 5",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "claude-5-fable-medium",
+                "name": "Claude Fable 5",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "claude-sonnet-5-medium",
+                "name": "Claude Sonnet 5",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "claude-haiku-5-5-medium",
+                "name": "Claude Haiku 5.5",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "gemini-3-5-flash-medium",
+                "name": "Gemini 3.5 Flash",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "gemini-3-6-flash-medium",
+                "name": "Gemini 3.6 Flash",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "gemini-3-7-flash-medium",
+                "name": "Gemini 3.7 Flash",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "gpt-5-6-sol-medium",
+                "name": "GPT-5.6 Sol",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "gpt-5-6-terra-medium",
+                "name": "GPT-5.6 Terra",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "gpt-5-6-luna-medium",
+                "name": "GPT-5.6 Luna",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "gpt-6-1-sol-medium",
+                "name": "GPT-6.1 Sol",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "grok-4-6-medium",
+                "name": "Grok 4.6",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "grok-4-7-medium",
+                "name": "Grok 4.7",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "muse-wonder-1-0-high",
+                "name": "Muse Wonder",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "glm-5-3-flash-max",
+                "name": "GLM-5.3 Flash",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "deepseek-v4-flash-high",
+                "name": "DeepSeek V4 Flash",
+                "_meta": {
+                  "cognition.ai/supportsImages": false
+                }
+              },
+              {
+                "value": "deepseek-v4-1-flash-1017-high",
+                "name": "DeepSeek V4.1 Flash",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "swe-1-7-medium",
+                "name": "SWE-1.7",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-opus-5-5-medium-sidekick-swe-2-medium",
+                "name": "Fusion (Claude Opus 5.5 Medium + SWE-2 Medium)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-fable-5-1-medium-sidekick-swe-2-medium",
+                "name": "Fusion (Claude Fable 5.1 Medium + SWE-2 Medium)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-5-6-sol-high-sidekick-swe-2-medium",
+                "name": "Fusion (GPT-5.6 Sol High Thinking + SWE-2 Medium)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-opus-5-high-sidekick-swe-2-medium",
+                "name": "Fusion (Claude Opus 5 High + SWE-2 Medium)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-sonnet-5-5-high-sidekick-swe-2-medium",
+                "name": "Fusion (Claude Sonnet 5.5 High + SWE-2 Medium)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-astra-high-sidekick-swe-2-medium",
+                "name": "Fusion (GPT-6 Astra High Thinking + SWE-2 Medium)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-sol-high-sidekick-swe-2-medium",
+                "name": "Fusion (GPT-6 Sol High Thinking + SWE-2 Medium)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-1-sol-high-sidekick-swe-2-medium",
+                "name": "Fusion (GPT-6.1 Sol High Thinking + SWE-2 Medium)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-opus-5-5-medium-sidekick-gpt-5-6-luna-high",
+                "name": "Fusion (Claude Opus 5.5 Medium + GPT-5.6 Luna High Thinking)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-fable-5-1-medium-sidekick-gpt-5-6-luna-high",
+                "name": "Fusion (Claude Fable 5.1 Medium + GPT-5.6 Luna High Thinking)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-5-6-sol-high-sidekick-gpt-5-6-luna-high",
+                "name": "Fusion (GPT-5.6 Sol High Thinking + GPT-5.6 Luna High Thinking)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-opus-5-high-sidekick-gpt-5-6-luna-high",
+                "name": "Fusion (Claude Opus 5 High + GPT-5.6 Luna High Thinking)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-sonnet-5-5-high-sidekick-gpt-5-6-luna-high",
+                "name": "Fusion (Claude Sonnet 5.5 High + GPT-5.6 Luna High Thinking)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-astra-high-sidekick-gpt-5-6-luna-high",
+                "name": "Fusion (GPT-6 Astra High Thinking + GPT-5.6 Luna High Thinking)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-sol-high-sidekick-gpt-5-6-luna-high",
+                "name": "Fusion (GPT-6 Sol High Thinking + GPT-5.6 Luna High Thinking)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-1-sol-high-sidekick-gpt-5-6-luna-high",
+                "name": "Fusion (GPT-6.1 Sol High Thinking + GPT-5.6 Luna High Thinking)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-opus-5-5-medium-sidekick-gpt-6-luna-high",
+                "name": "Fusion (Claude Opus 5.5 Medium + GPT-6 Luna High Thinking)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-fable-5-1-medium-sidekick-gpt-6-luna-high",
+                "name": "Fusion (Claude Fable 5.1 Medium + GPT-6 Luna High Thinking)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-5-6-sol-high-sidekick-gpt-6-luna-high",
+                "name": "Fusion (GPT-5.6 Sol High Thinking + GPT-6 Luna High Thinking)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-opus-5-high-sidekick-gpt-6-luna-high",
+                "name": "Fusion (Claude Opus 5 High + GPT-6 Luna High Thinking)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-sonnet-5-5-high-sidekick-gpt-6-luna-high",
+                "name": "Fusion (Claude Sonnet 5.5 High + GPT-6 Luna High Thinking)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-astra-high-sidekick-gpt-6-luna-high",
+                "name": "Fusion (GPT-6 Astra High Thinking + GPT-6 Luna High Thinking)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-sol-high-sidekick-gpt-6-luna-high",
+                "name": "Fusion (GPT-6 Sol High Thinking + GPT-6 Luna High Thinking)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-1-sol-high-sidekick-gpt-6-luna-high",
+                "name": "Fusion (GPT-6.1 Sol High Thinking + GPT-6 Luna High Thinking)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-opus-5-5-medium-sidekick-glm-5-2",
+                "name": "Fusion (Claude Opus 5.5 Medium + GLM-5.2 High)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-fable-5-1-medium-sidekick-glm-5-2",
+                "name": "Fusion (Claude Fable 5.1 Medium + GLM-5.2 High)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-5-6-sol-high-sidekick-glm-5-2",
+                "name": "Fusion (GPT-5.6 Sol High Thinking + GLM-5.2 High)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-opus-5-high-sidekick-glm-5-2",
+                "name": "Fusion (Claude Opus 5 High + GLM-5.2 High)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-sonnet-5-5-high-sidekick-glm-5-2",
+                "name": "Fusion (Claude Sonnet 5.5 High + GLM-5.2 High)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-astra-high-sidekick-glm-5-2",
+                "name": "Fusion (GPT-6 Astra High Thinking + GLM-5.2 High)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-sol-high-sidekick-glm-5-2",
+                "name": "Fusion (GPT-6 Sol High Thinking + GLM-5.2 High)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-1-sol-high-sidekick-glm-5-2",
+                "name": "Fusion (GPT-6.1 Sol High Thinking + GLM-5.2 High)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-opus-5-5-medium-sidekick-gpt-5-6-sol-high",
+                "name": "Fusion (Claude Opus 5.5 Medium + GPT-5.6 Sol High Thinking)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-fable-5-1-medium-sidekick-gpt-5-6-sol-high",
+                "name": "Fusion (Claude Fable 5.1 Medium + GPT-5.6 Sol High Thinking)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-opus-5-high-sidekick-gpt-5-6-sol-high",
+                "name": "Fusion (Claude Opus 5 High + GPT-5.6 Sol High Thinking)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-sonnet-5-5-high-sidekick-gpt-5-6-sol-high",
+                "name": "Fusion (Claude Sonnet 5.5 High + GPT-5.6 Sol High Thinking)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-astra-high-sidekick-gpt-5-6-sol-high",
+                "name": "Fusion (GPT-6 Astra High Thinking + GPT-5.6 Sol High Thinking)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-sol-high-sidekick-gpt-5-6-sol-high",
+                "name": "Fusion (GPT-6 Sol High Thinking + GPT-5.6 Sol High Thinking)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-1-sol-high-sidekick-gpt-5-6-sol-high",
+                "name": "Fusion (GPT-6.1 Sol High Thinking + GPT-5.6 Sol High Thinking)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-opus-5-5-medium-sidekick-swe-2-high",
+                "name": "Fusion (Claude Opus 5.5 Medium + SWE-2 High)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-fable-5-1-medium-sidekick-swe-2-high",
+                "name": "Fusion (Claude Fable 5.1 Medium + SWE-2 High)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-5-6-sol-high-sidekick-swe-2-high",
+                "name": "Fusion (GPT-5.6 Sol High Thinking + SWE-2 High)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-opus-5-high-sidekick-swe-2-high",
+                "name": "Fusion (Claude Opus 5 High + SWE-2 High)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-sonnet-5-5-high-sidekick-swe-2-high",
+                "name": "Fusion (Claude Sonnet 5.5 High + SWE-2 High)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-astra-high-sidekick-swe-2-high",
+                "name": "Fusion (GPT-6 Astra High Thinking + SWE-2 High)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-sol-high-sidekick-swe-2-high",
+                "name": "Fusion (GPT-6 Sol High Thinking + SWE-2 High)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-1-sol-high-sidekick-swe-2-high",
+                "name": "Fusion (GPT-6.1 Sol High Thinking + SWE-2 High)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-opus-5-5-medium-sidekick-claude-sonnet-5-5-medium",
+                "name": "Fusion (Claude Opus 5.5 Medium + Claude Sonnet 5.5 Medium)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-fable-5-1-medium-sidekick-claude-sonnet-5-5-medium",
+                "name": "Fusion (Claude Fable 5.1 Medium + Claude Sonnet 5.5 Medium)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-5-6-sol-high-sidekick-claude-sonnet-5-5-medium",
+                "name": "Fusion (GPT-5.6 Sol High Thinking + Claude Sonnet 5.5 Medium)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-opus-5-high-sidekick-claude-sonnet-5-5-medium",
+                "name": "Fusion (Claude Opus 5 High + Claude Sonnet 5.5 Medium)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-astra-high-sidekick-claude-sonnet-5-5-medium",
+                "name": "Fusion (GPT-6 Astra High Thinking + Claude Sonnet 5.5 Medium)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-sol-high-sidekick-claude-sonnet-5-5-medium",
+                "name": "Fusion (GPT-6 Sol High Thinking + Claude Sonnet 5.5 Medium)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-1-sol-high-sidekick-claude-sonnet-5-5-medium",
+                "name": "Fusion (GPT-6.1 Sol High Thinking + Claude Sonnet 5.5 Medium)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-opus-5-5-medium-sidekick-claude-haiku-5-5-medium",
+                "name": "Fusion (Claude Opus 5.5 Medium + Claude Haiku 5.5 Medium)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-fable-5-1-medium-sidekick-claude-haiku-5-5-medium",
+                "name": "Fusion (Claude Fable 5.1 Medium + Claude Haiku 5.5 Medium)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-5-6-sol-high-sidekick-claude-haiku-5-5-medium",
+                "name": "Fusion (GPT-5.6 Sol High Thinking + Claude Haiku 5.5 Medium)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-opus-5-high-sidekick-claude-haiku-5-5-medium",
+                "name": "Fusion (Claude Opus 5 High + Claude Haiku 5.5 Medium)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-sonnet-5-5-high-sidekick-claude-haiku-5-5-medium",
+                "name": "Fusion (Claude Sonnet 5.5 High + Claude Haiku 5.5 Medium)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-astra-high-sidekick-claude-haiku-5-5-medium",
+                "name": "Fusion (GPT-6 Astra High Thinking + Claude Haiku 5.5 Medium)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-sol-high-sidekick-claude-haiku-5-5-medium",
+                "name": "Fusion (GPT-6 Sol High Thinking + Claude Haiku 5.5 Medium)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-1-sol-high-sidekick-claude-haiku-5-5-medium",
+                "name": "Fusion (GPT-6.1 Sol High Thinking + Claude Haiku 5.5 Medium)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "claude-opus-4-6",
+                "name": "Claude Opus 4.6",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "claude-opus-4-6-thinking",
+                "name": "Claude Opus 4.6 Thinking",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "claude-opus-4-6-1m",
+                "name": "Claude Opus 4.6 1M",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "claude-opus-4-6-thinking-1m",
+                "name": "Claude Opus 4.6 Thinking 1M",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "gpt-5-4-none",
+                "name": "GPT-5.4",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "gpt-5-5-low",
+                "name": "GPT-5.5",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "gpt-5-4-mini-low",
+                "name": "GPT-5.4 Mini",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "claude-sonnet-4-6",
+                "name": "Claude Sonnet 4.6",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "claude-sonnet-4-6-thinking",
+                "name": "Claude Sonnet 4.6 Thinking",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "claude-sonnet-4-6-1m",
+                "name": "Claude Sonnet 4.6 1M",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "claude-sonnet-4-6-thinking-1m",
+                "name": "Claude Sonnet 4.6 Thinking 1M",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "kimi-k2-6",
+                "name": "Kimi K2.6",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "kimi-k2-7",
+                "name": "Kimi K2.7",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "nemotron-3-ultra-high",
+                "name": "Nemotron 3 Ultra",
+                "_meta": {
+                  "cognition.ai/supportsImages": false
+                }
+              },
+              {
+                "value": "swe-1-6",
+                "name": "SWE-1.6",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "deepseek-v4-pro-high",
+                "name": "DeepSeek V4 Pro",
+                "_meta": {
+                  "cognition.ai/supportsImages": false
+                }
+              }
+            ]
+          },
+          {
+            "id": "thought_level",
+            "name": "Thinking",
+            "category": "thought_level",
+            "type": "select",
+            "currentValue": "high",
+            "options": [
+              {
+                "value": "medium",
+                "name": "Medium"
+              },
+              {
+                "value": "high",
+                "name": "High"
+              },
+              {
+                "value": "max",
+                "name": "Max"
+              }
+            ]
+          },
+          {
+            "id": "speed",
+            "name": "Speed",
+            "category": "model_config",
+            "type": "select",
+            "currentValue": "standard",
+            "options": [
+              {
+                "value": "standard",
+                "name": "Standard"
+              },
+              {
+                "value": "fast",
+                "name": "Fast"
+              }
+            ]
+          }
+        ],
+        "_meta": {
+          "cognition.ai/isLocked": false,
+          "cognition.ai/lockHolderPid": null
+        }
+      }
+    },
+    "session_new": {
+      "jsonrpc": "2.0",
+      "id": 2,
+      "result": {
+        "sessionId": "snow-henley",
+        "modes": {
+          "currentModeId": "accept-edits",
+          "availableModes": [
+            {
+              "id": "accept-edits",
+              "name": "Code"
+            },
+            {
+              "id": "smart",
+              "name": "Smart"
+            },
+            {
+              "id": "ask",
+              "name": "Ask"
+            },
+            {
+              "id": "plan",
+              "name": "Plan"
+            },
+            {
+              "id": "bypass",
+              "name": "Bypass Permissions"
+            }
+          ]
+        },
+        "configOptions": [
+          {
+            "id": "mode",
+            "name": "Session Mode",
+            "category": "mode",
+            "type": "select",
+            "currentValue": "accept-edits",
+            "options": [
+              {
+                "value": "accept-edits",
+                "name": "Code",
+                "description": "Write and edit code",
+                "_meta": {
+                  "cognition.ai/icon": "code"
+                }
+              },
+              {
+                "value": "smart",
+                "name": "Smart",
+                "description": "Auto-approve actions the model judges safe",
+                "_meta": {
+                  "cognition.ai/icon": "sparkles"
+                }
+              },
+              {
+                "value": "ask",
+                "name": "Ask",
+                "description": "Answer questions without code changes",
+                "_meta": {
+                  "cognition.ai/icon": "message-circle"
+                }
+              },
+              {
+                "value": "plan",
+                "name": "Plan",
+                "description": "Plan changes before implementing",
+                "_meta": {
+                  "cognition.ai/icon": "file-text"
+                }
+              },
+              {
+                "value": "bypass",
+                "name": "Bypass Permissions",
+                "description": "Auto-approve all tool calls unless your organization's policy requires approval",
+                "_meta": {
+                  "cognition.ai/icon": "shield-off"
+                }
+              }
+            ]
+          },
+          {
+            "id": "model",
+            "name": "Model",
+            "description": "AI model to use",
+            "category": "model",
+            "type": "select",
+            "currentValue": "swe-2-high",
+            "options": [
+              {
+                "value": "adaptive",
+                "name": "Adaptive",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "swe-2-high",
+                "name": "SWE-2",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "claude-fable-5-1-medium",
+                "name": "Claude Fable 5.1",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "claude-opus-5-5-medium",
+                "name": "Claude Opus 5.5",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "gpt-6-astra-medium",
+                "name": "GPT-6 Astra",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "gpt-6-sol-medium",
+                "name": "GPT-6 Sol",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "gpt-6-luna-medium",
+                "name": "GPT-6 Luna",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "gemini-4-argon-medium",
+                "name": "Gemini 4 Argon",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "kimi-k3-high",
+                "name": "Kimi K3",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "glm-5-2",
+                "name": "GLM-5.2 High",
+                "_meta": {
+                  "cognition.ai/supportsImages": false
+                }
+              },
+              {
+                "value": "glm-5-2-1m",
+                "name": "GLM-5.2 High 1M",
+                "_meta": {
+                  "cognition.ai/supportsImages": false
+                }
+              },
+              {
+                "value": "glm-5-3-max",
+                "name": "GLM-5.3",
+                "_meta": {
+                  "cognition.ai/supportsImages": false
+                }
+              },
+              {
+                "value": "claude-sonnet-5-5-medium",
+                "name": "Claude Sonnet 5.5",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "gemini-3-8-flash-medium",
+                "name": "Gemini 3.8 Flash",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "claude-opus-4-7-medium",
+                "name": "Claude Opus 4.7",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "claude-opus-4-8-medium",
+                "name": "Claude Opus 4.8",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "claude-opus-5-medium",
+                "name": "Claude Opus 5",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "claude-5-fable-medium",
+                "name": "Claude Fable 5",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "claude-sonnet-5-medium",
+                "name": "Claude Sonnet 5",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "claude-haiku-5-5-medium",
+                "name": "Claude Haiku 5.5",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "gemini-3-5-flash-medium",
+                "name": "Gemini 3.5 Flash",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "gemini-3-6-flash-medium",
+                "name": "Gemini 3.6 Flash",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "gemini-3-7-flash-medium",
+                "name": "Gemini 3.7 Flash",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "gpt-5-6-sol-medium",
+                "name": "GPT-5.6 Sol",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "gpt-5-6-terra-medium",
+                "name": "GPT-5.6 Terra",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "gpt-5-6-luna-medium",
+                "name": "GPT-5.6 Luna",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "gpt-6-1-sol-medium",
+                "name": "GPT-6.1 Sol",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "grok-4-6-medium",
+                "name": "Grok 4.6",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "grok-4-7-medium",
+                "name": "Grok 4.7",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "muse-wonder-1-0-high",
+                "name": "Muse Wonder",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "glm-5-3-flash-max",
+                "name": "GLM-5.3 Flash",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "deepseek-v4-flash-high",
+                "name": "DeepSeek V4 Flash",
+                "_meta": {
+                  "cognition.ai/supportsImages": false
+                }
+              },
+              {
+                "value": "deepseek-v4-1-flash-1017-high",
+                "name": "DeepSeek V4.1 Flash",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "swe-1-7-medium",
+                "name": "SWE-1.7",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-opus-5-5-medium-sidekick-swe-2-medium",
+                "name": "Fusion (Claude Opus 5.5 Medium + SWE-2 Medium)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-fable-5-1-medium-sidekick-swe-2-medium",
+                "name": "Fusion (Claude Fable 5.1 Medium + SWE-2 Medium)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-5-6-sol-high-sidekick-swe-2-medium",
+                "name": "Fusion (GPT-5.6 Sol High Thinking + SWE-2 Medium)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-opus-5-high-sidekick-swe-2-medium",
+                "name": "Fusion (Claude Opus 5 High + SWE-2 Medium)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-sonnet-5-5-high-sidekick-swe-2-medium",
+                "name": "Fusion (Claude Sonnet 5.5 High + SWE-2 Medium)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-astra-high-sidekick-swe-2-medium",
+                "name": "Fusion (GPT-6 Astra High Thinking + SWE-2 Medium)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-sol-high-sidekick-swe-2-medium",
+                "name": "Fusion (GPT-6 Sol High Thinking + SWE-2 Medium)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-1-sol-high-sidekick-swe-2-medium",
+                "name": "Fusion (GPT-6.1 Sol High Thinking + SWE-2 Medium)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-opus-5-5-medium-sidekick-gpt-5-6-luna-high",
+                "name": "Fusion (Claude Opus 5.5 Medium + GPT-5.6 Luna High Thinking)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-fable-5-1-medium-sidekick-gpt-5-6-luna-high",
+                "name": "Fusion (Claude Fable 5.1 Medium + GPT-5.6 Luna High Thinking)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-5-6-sol-high-sidekick-gpt-5-6-luna-high",
+                "name": "Fusion (GPT-5.6 Sol High Thinking + GPT-5.6 Luna High Thinking)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-opus-5-high-sidekick-gpt-5-6-luna-high",
+                "name": "Fusion (Claude Opus 5 High + GPT-5.6 Luna High Thinking)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-sonnet-5-5-high-sidekick-gpt-5-6-luna-high",
+                "name": "Fusion (Claude Sonnet 5.5 High + GPT-5.6 Luna High Thinking)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-astra-high-sidekick-gpt-5-6-luna-high",
+                "name": "Fusion (GPT-6 Astra High Thinking + GPT-5.6 Luna High Thinking)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-sol-high-sidekick-gpt-5-6-luna-high",
+                "name": "Fusion (GPT-6 Sol High Thinking + GPT-5.6 Luna High Thinking)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-1-sol-high-sidekick-gpt-5-6-luna-high",
+                "name": "Fusion (GPT-6.1 Sol High Thinking + GPT-5.6 Luna High Thinking)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-opus-5-5-medium-sidekick-gpt-6-luna-high",
+                "name": "Fusion (Claude Opus 5.5 Medium + GPT-6 Luna High Thinking)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-fable-5-1-medium-sidekick-gpt-6-luna-high",
+                "name": "Fusion (Claude Fable 5.1 Medium + GPT-6 Luna High Thinking)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-5-6-sol-high-sidekick-gpt-6-luna-high",
+                "name": "Fusion (GPT-5.6 Sol High Thinking + GPT-6 Luna High Thinking)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-opus-5-high-sidekick-gpt-6-luna-high",
+                "name": "Fusion (Claude Opus 5 High + GPT-6 Luna High Thinking)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-sonnet-5-5-high-sidekick-gpt-6-luna-high",
+                "name": "Fusion (Claude Sonnet 5.5 High + GPT-6 Luna High Thinking)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-astra-high-sidekick-gpt-6-luna-high",
+                "name": "Fusion (GPT-6 Astra High Thinking + GPT-6 Luna High Thinking)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-sol-high-sidekick-gpt-6-luna-high",
+                "name": "Fusion (GPT-6 Sol High Thinking + GPT-6 Luna High Thinking)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-1-sol-high-sidekick-gpt-6-luna-high",
+                "name": "Fusion (GPT-6.1 Sol High Thinking + GPT-6 Luna High Thinking)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-opus-5-5-medium-sidekick-glm-5-2",
+                "name": "Fusion (Claude Opus 5.5 Medium + GLM-5.2 High)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-fable-5-1-medium-sidekick-glm-5-2",
+                "name": "Fusion (Claude Fable 5.1 Medium + GLM-5.2 High)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-5-6-sol-high-sidekick-glm-5-2",
+                "name": "Fusion (GPT-5.6 Sol High Thinking + GLM-5.2 High)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-opus-5-high-sidekick-glm-5-2",
+                "name": "Fusion (Claude Opus 5 High + GLM-5.2 High)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-sonnet-5-5-high-sidekick-glm-5-2",
+                "name": "Fusion (Claude Sonnet 5.5 High + GLM-5.2 High)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-astra-high-sidekick-glm-5-2",
+                "name": "Fusion (GPT-6 Astra High Thinking + GLM-5.2 High)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-sol-high-sidekick-glm-5-2",
+                "name": "Fusion (GPT-6 Sol High Thinking + GLM-5.2 High)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-1-sol-high-sidekick-glm-5-2",
+                "name": "Fusion (GPT-6.1 Sol High Thinking + GLM-5.2 High)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-opus-5-5-medium-sidekick-gpt-5-6-sol-high",
+                "name": "Fusion (Claude Opus 5.5 Medium + GPT-5.6 Sol High Thinking)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-fable-5-1-medium-sidekick-gpt-5-6-sol-high",
+                "name": "Fusion (Claude Fable 5.1 Medium + GPT-5.6 Sol High Thinking)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-opus-5-high-sidekick-gpt-5-6-sol-high",
+                "name": "Fusion (Claude Opus 5 High + GPT-5.6 Sol High Thinking)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-sonnet-5-5-high-sidekick-gpt-5-6-sol-high",
+                "name": "Fusion (Claude Sonnet 5.5 High + GPT-5.6 Sol High Thinking)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-astra-high-sidekick-gpt-5-6-sol-high",
+                "name": "Fusion (GPT-6 Astra High Thinking + GPT-5.6 Sol High Thinking)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-sol-high-sidekick-gpt-5-6-sol-high",
+                "name": "Fusion (GPT-6 Sol High Thinking + GPT-5.6 Sol High Thinking)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-1-sol-high-sidekick-gpt-5-6-sol-high",
+                "name": "Fusion (GPT-6.1 Sol High Thinking + GPT-5.6 Sol High Thinking)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-opus-5-5-medium-sidekick-swe-2-high",
+                "name": "Fusion (Claude Opus 5.5 Medium + SWE-2 High)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-fable-5-1-medium-sidekick-swe-2-high",
+                "name": "Fusion (Claude Fable 5.1 Medium + SWE-2 High)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-5-6-sol-high-sidekick-swe-2-high",
+                "name": "Fusion (GPT-5.6 Sol High Thinking + SWE-2 High)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-opus-5-high-sidekick-swe-2-high",
+                "name": "Fusion (Claude Opus 5 High + SWE-2 High)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-sonnet-5-5-high-sidekick-swe-2-high",
+                "name": "Fusion (Claude Sonnet 5.5 High + SWE-2 High)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-astra-high-sidekick-swe-2-high",
+                "name": "Fusion (GPT-6 Astra High Thinking + SWE-2 High)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-sol-high-sidekick-swe-2-high",
+                "name": "Fusion (GPT-6 Sol High Thinking + SWE-2 High)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-1-sol-high-sidekick-swe-2-high",
+                "name": "Fusion (GPT-6.1 Sol High Thinking + SWE-2 High)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-opus-5-5-medium-sidekick-claude-sonnet-5-5-medium",
+                "name": "Fusion (Claude Opus 5.5 Medium + Claude Sonnet 5.5 Medium)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-fable-5-1-medium-sidekick-claude-sonnet-5-5-medium",
+                "name": "Fusion (Claude Fable 5.1 Medium + Claude Sonnet 5.5 Medium)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-5-6-sol-high-sidekick-claude-sonnet-5-5-medium",
+                "name": "Fusion (GPT-5.6 Sol High Thinking + Claude Sonnet 5.5 Medium)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-opus-5-high-sidekick-claude-sonnet-5-5-medium",
+                "name": "Fusion (Claude Opus 5 High + Claude Sonnet 5.5 Medium)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-astra-high-sidekick-claude-sonnet-5-5-medium",
+                "name": "Fusion (GPT-6 Astra High Thinking + Claude Sonnet 5.5 Medium)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-sol-high-sidekick-claude-sonnet-5-5-medium",
+                "name": "Fusion (GPT-6 Sol High Thinking + Claude Sonnet 5.5 Medium)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-1-sol-high-sidekick-claude-sonnet-5-5-medium",
+                "name": "Fusion (GPT-6.1 Sol High Thinking + Claude Sonnet 5.5 Medium)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-opus-5-5-medium-sidekick-claude-haiku-5-5-medium",
+                "name": "Fusion (Claude Opus 5.5 Medium + Claude Haiku 5.5 Medium)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-fable-5-1-medium-sidekick-claude-haiku-5-5-medium",
+                "name": "Fusion (Claude Fable 5.1 Medium + Claude Haiku 5.5 Medium)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-5-6-sol-high-sidekick-claude-haiku-5-5-medium",
+                "name": "Fusion (GPT-5.6 Sol High Thinking + Claude Haiku 5.5 Medium)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-opus-5-high-sidekick-claude-haiku-5-5-medium",
+                "name": "Fusion (Claude Opus 5 High + Claude Haiku 5.5 Medium)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-claude-sonnet-5-5-high-sidekick-claude-haiku-5-5-medium",
+                "name": "Fusion (Claude Sonnet 5.5 High + Claude Haiku 5.5 Medium)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-astra-high-sidekick-claude-haiku-5-5-medium",
+                "name": "Fusion (GPT-6 Astra High Thinking + Claude Haiku 5.5 Medium)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-sol-high-sidekick-claude-haiku-5-5-medium",
+                "name": "Fusion (GPT-6 Sol High Thinking + Claude Haiku 5.5 Medium)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "fusion-gpt-6-1-sol-high-sidekick-claude-haiku-5-5-medium",
+                "name": "Fusion (GPT-6.1 Sol High Thinking + Claude Haiku 5.5 Medium)",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "claude-opus-4-6",
+                "name": "Claude Opus 4.6",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "claude-opus-4-6-thinking",
+                "name": "Claude Opus 4.6 Thinking",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "claude-opus-4-6-1m",
+                "name": "Claude Opus 4.6 1M",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "claude-opus-4-6-thinking-1m",
+                "name": "Claude Opus 4.6 Thinking 1M",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "gpt-5-4-none",
+                "name": "GPT-5.4",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "gpt-5-5-low",
+                "name": "GPT-5.5",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "gpt-5-4-mini-low",
+                "name": "GPT-5.4 Mini",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "claude-sonnet-4-6",
+                "name": "Claude Sonnet 4.6",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "claude-sonnet-4-6-thinking",
+                "name": "Claude Sonnet 4.6 Thinking",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "claude-sonnet-4-6-1m",
+                "name": "Claude Sonnet 4.6 1M",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "claude-sonnet-4-6-thinking-1m",
+                "name": "Claude Sonnet 4.6 Thinking 1M",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "kimi-k2-6",
+                "name": "Kimi K2.6",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "kimi-k2-7",
+                "name": "Kimi K2.7",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "nemotron-3-ultra-high",
+                "name": "Nemotron 3 Ultra",
+                "_meta": {
+                  "cognition.ai/supportsImages": false
+                }
+              },
+              {
+                "value": "swe-1-6",
+                "name": "SWE-1.6",
+                "_meta": {
+                  "cognition.ai/supportsImages": true
+                }
+              },
+              {
+                "value": "deepseek-v4-pro-high",
+                "name": "DeepSeek V4 Pro",
+                "_meta": {
+                  "cognition.ai/supportsImages": false
+                }
+              }
+            ]
+          },
+          {
+            "id": "thought_level",
+            "name": "Thinking",
+            "category": "thought_level",
+            "type": "select",
+            "currentValue": "high",
+            "options": [
+              {
+                "value": "medium",
+                "name": "Medium"
+              },
+              {
+                "value": "high",
+                "name": "High"
+              },
+              {
+                "value": "max",
+                "name": "Max"
+              }
+            ]
+          },
+          {
+            "id": "speed",
+            "name": "Speed",
+            "category": "model_config",
+            "type": "select",
+            "currentValue": "standard",
+            "options": [
+              {
+                "value": "standard",
+                "name": "Standard"
+              },
+              {
+                "value": "fast",
+                "name": "Fast"
+              }
+            ]
+          }
+        ],
+        "_meta": {
+          "cognition.ai/isLocked": false,
+          "cognition.ai/lockHolderPid": null
+        }
+      }
+    },
+    "3": {
+      "jsonrpc": "2.0",
+      "id": 3,
+      "result": {
+        "stopReason": "end_turn",
+        "usage": {
+          "totalTokens": 12026,
+          "inputTokens": 11996,
+          "outputTokens": 30,
+          "cachedReadTokens": 128
+        },
+        "_meta": {
+          "cognition.ai/userMessageId": "2c84acb2-1964-453e-962e-b4f4c6004614"
+        }
+      }
+    },
+    "session_prompt": {
+      "jsonrpc": "2.0",
+      "id": 3,
+      "result": {
+        "stopReason": "end_turn",
+        "usage": {
+          "totalTokens": 12026,
+          "inputTokens": 11996,
+          "outputTokens": 30,
+          "cachedReadTokens": 128
+        },
+        "_meta": {
+          "cognition.ai/userMessageId": "2c84acb2-1964-453e-962e-b4f4c6004614"
+        }
+      }
+    }
+  },
+  "permission_request_count": 0,
+  "permission_request_sample": [],
+  "update_notifications": [
+    "_cognition.ai/mcp/serversChanged",
+    "_cognition.ai/mcp/serversChanged",
+    "session/update",
+    "session/update",
+    "session/update",
+    "session/update",
+    "session/update",
+    "session/update",
+    "session/update",
+    "_cognition.ai/mcp/serversChanged",
+    "session/update",
+    "_cognition.ai/thinking_complete",
+    "session/update",
+    "session/update",
+    "session/update",
+    "session/update",
+    "session/update",
+    "session/update",
+    "session/update",
+    "session/update",
+    "session/update",
+    "session/update",
+    "session/update",
+    "session/update",
+    "session/update",
+    "session/update",
+    "_cognition.ai/turn_stats"
+  ],
+  "usage_fields": [
+    "usage",
+    "usage.cachedReadTokens",
+    "usage.inputTokens",
+    "usage.outputTokens",
+    "usage.totalTokens"
+  ],
+  "stop_reason": "end_turn",
+  "framing": {
+    "canary_id": 9000,
+    "initialize_replied": true,
+    "canary_replied": true,
+    "verdict": "NDJSON confirmed (bare-NDJSON initialize answered)"
+  },
+  "timing": {
+    "initialize_s": 0.051,
+    "session_new_s": 0.116,
+    "prompt_s": 4.33,
+    "orphan_check": "clean",
+    "stderr_tail": "\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\"agent_client_protocol_schema::v1::agent::InitializeRequest\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\"
+  },
+  "errors": [
+    {
+      "error": "process_survived_close"
+    }
+  ]
+}

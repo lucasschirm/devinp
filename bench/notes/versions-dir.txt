@@ -1,0 +1,7 @@
+total 16
+drwxr-xr-x 4 lucas lucas 4096 Oct 19 15:54 .
+drwxr-xr-x 4 lucas lucas 4096 Oct 19 15:54 ..
+drwxr-xr-x 4 lucas lucas 4096 Oct 19 15:54 3000.11.92
+drwxr-xr-x 2 lucas lucas 4096 Oct 19 15:54 _download
+lrwxrwxrwx 1 lucas lucas   10 Oct 19 15:54 current -> 3000.11.92
+CURRENT_BIN_EXISTS

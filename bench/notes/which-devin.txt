@@ -1,0 +1,2 @@
+/home/lucas/.local/bin/devin
+/home/lucas/.local/bin/devin: POSIX shell script, Unicode text, UTF-8 text executable
