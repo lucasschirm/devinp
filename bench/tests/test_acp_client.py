@@ -497,6 +497,15 @@ def test_non_dict_params_does_not_crash_dispatch(tmp_path):
                     "params": [1, 2, 3]})
         s._dispatch({"jsonrpc": "2.0", "method": "session/update",
                     "params": [1, 2, 3]})
+        # side effects (round-4 NIT): the permission frame got a
+        # default-deny ("cancelled" — no option id, so a regression
+        # that skipped _answer_permission would show option_id present),
+        # and the update was recorded as "unknown".
+        perm = [e for e in s.transcript if e.kind == "permission"]
+        assert perm and perm[0].payload["allow"] is False
+        assert perm[0].payload["option_id"] is None
+        assert any(e.kind == "update" and e.method == "unknown"
+                   for e in s.transcript)
         s.close()
     finally:
         s.close()
