@@ -16,3 +16,10 @@ dependencies = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "probes"]
+
+[tool.setuptools]
+# Explicit flat-layout declaration: the only importable module is
+# acp_client (conftest.py / probes / tests are dev-only, notes/ is recon
+# data). Without this, setuptools flat-layout discovery fails on the
+# multiple top-level directories.
+py-modules = ["acp_client"]
