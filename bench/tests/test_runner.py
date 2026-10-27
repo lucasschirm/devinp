@@ -39,18 +39,26 @@ All tests are unit-level against instrumented fake sessions
   :func:`test_rate_limit_stops_batch_no_starts_after_signal` (incl. the
   checkpoint-before-sleep ordering, the exact state chain, the sleep
   landing on the window boundary, and the no-retry assertion),
-  :func:`test_quota_limited_breaks_agent_error_chain`
+  :func:`test_quota_limited_breaks_agent_error_chain`,
+  :func:`test_quota_limited_last_item_done_without_sleep`,
+  :func:`test_n_gt1_single_checkpoint_for_double_quota_stop` (one
+  checkpoint per backoff — a double quota stop is one stop)
 * AC5 — abort on 2 consecutive ``agent_error`` (environment drift
   suspicion) → :func:`test_abort_on_two_consecutive_agent_errors`,
-  :func:`test_consecutive_agent_error_counter_resets`
+  :func:`test_consecutive_agent_error_counter_resets`,
+  :func:`test_window_reset_breaks_agent_error_chain` (the deliberate
+  window-reset deviation, pinned)
 
 Plus the contract edges: :func:`test_unknown_status_is_typed`,
 :func:`test_factory_failure_releases_claim`,
 :func:`test_start_failure_releases_claim_and_closes`,
+:func:`test_close_failure_stands_claim_and_propagates`,
 :func:`test_single_instance_no_sleep_when_done`,
 :func:`test_empty_queue_ends_immediately`,
 :func:`test_n_gt1_exhausted_drains_without_sleep`,
 :func:`test_n_gt1_multiple_windows`, :func:`test_run_is_one_shot`,
+:func:`test_run_finished_fires_on_clean_done`,
+:func:`test_process_lock_busy_is_retryable`,
 :func:`test_budget_config_validation`.
 """
 
@@ -449,6 +457,30 @@ class _RaisingRunSession(r.AgentSession):
         self.registry.exit()
 
 
+class _RaisingCloseSession(r.AgentSession):
+    """A session whose ``close()`` fails mid-teardown (PLAN §1: close
+    must kill the process group; a failed close is best-effort and
+    idempotent) — the live window still closes."""
+
+    def __init__(self, registry: Registry) -> None:
+        self.registry = registry
+        self.close_calls = 0
+        self._window_closed = False
+
+    def start(self) -> None:
+        self.registry.enter()
+
+    def run(self) -> str:
+        return "resolved"
+
+    def close(self) -> None:
+        self.close_calls += 1
+        if not self._window_closed:  # idempotent: the window closes once
+            self._window_closed = True
+            self.registry.exit()
+        raise RuntimeError("teardown failed")
+
+
 def test_guard_and_claim_released_when_session_raises():
     """A partial session (PLAN §2.5 host-crash class): the exception
     propagates, the guard slot is released (no leak), the budget claim
@@ -501,6 +533,23 @@ def test_start_failure_releases_claim_and_closes():
     assert e.registry.active == 0
 
 
+def test_close_failure_stands_claim_and_propagates():
+    """A failed ``close()`` on a *completed* session: the claim stands
+    (the work was consumed), the guard slot releases, the live window
+    closes (the idempotent close killed the process group), the
+    exception propagates, and ``run_finished`` is *not* reported."""
+    e = Env()
+    runner = e.make(["i0"], {"i0": "resolved"},
+                   factory=lambda inst: _RaisingCloseSession(e.registry))
+    with pytest.raises(RuntimeError, match="teardown failed"):
+        runner.run()
+    assert runner.budget.sessions_used == 1  # the claim stands
+    assert runner.guard.active == 0  # the slot never leaked
+    assert e.registry.active == 0  # the live window closed
+    assert not any(ev[0] == "run_finished"
+                   for ev in e.reporter.events)
+
+
 # ---------------------------------------------------------------------------
 # AC5 — abort on 2 consecutive agent_error
 # ---------------------------------------------------------------------------
@@ -545,6 +594,25 @@ def test_quota_limited_breaks_agent_error_chain():
     assert result.final_state == "done"
     assert result.aborted_reason is None
     assert result.backoffs == 1
+
+
+def test_window_reset_breaks_agent_error_chain():
+    """The deliberate AC5 deviation, pinned: the drift-suspicion counter
+    resets on the window boundary (a new day is a fresh suspicion —
+    the drift evidence is window-scoped), so agent_error →
+    local-budget sleep → agent_error ends ``done``, not ``aborted``.
+    (The reset by *any other terminal status* still holds —
+    see ``test_consecutive_agent_error_counter_resets``.)"""
+    e = Env()
+    runner = e.make(["i0", "i1"],
+                   {"i0": "agent_error", "i1": "agent_error"},
+                   config=r.BudgetConfig(max_sessions_per_day=1))
+    result = runner.run()
+    assert result.final_state == "done"
+    assert result.aborted_reason is None
+    assert result.backoffs == 1
+    assert [s for _, s in result.results] == ["agent_error",
+                                            "agent_error"]
 
 
 # ---------------------------------------------------------------------------
@@ -625,6 +693,15 @@ def test_local_budget_exhaustion_sleeps_to_window_and_resumes():
     wake_t = r.next_quota_window(t0)
     assert e.sleeper.calls[0] > 0
     assert e.clock() == wake_t  # slept to the boundary, no earlier
+    # the checkpoint (AC4) fired before the sleep, with the local-cap
+    # stop reason (the external signal's is "rate_limited")
+    cks = [i for i, ev in enumerate(e.reporter.events)
+          if ev[0] == "checkpoint"]
+    sls = [i for i, ev in enumerate(e.reporter.events)
+          if ev[0] == "sleep"]
+    assert len(cks) == 1
+    assert e.reporter.events[cks[0]][1] == "budget_exhausted"
+    assert sls and cks[0] < sls[0]
 
 
 def test_wall_budget_exhaustion():
@@ -642,6 +719,10 @@ def test_wall_budget_exhaustion():
     assert result.final_state == "done"
     assert result.backoffs == 1  # the wall budget (100 s) exhausted after i0
     assert [s for _, s in result.results] == ["resolved", "resolved"]
+    # every backoff sleep is checkpointed (AC4), with the stop reason
+    cks = [ev for ev in e.reporter.events if ev[0] == "checkpoint"]
+    assert len(cks) == 1
+    assert cks[0][1] == "budget_exhausted"
 
 
 def test_single_instance_no_sleep_when_done():
@@ -663,6 +744,23 @@ def test_empty_queue_ends_immediately():
     assert result.backoffs == 0
     assert chain(result) == [
         ("running", r.EVENT_QUEUE_EMPTY, "done")]
+
+
+def test_quota_limited_last_item_done_without_sleep():
+    """The queue-empty check *inside* the exhausted branch (the N>1
+    race's sequential form): the last instance is ``quota_limited`` —
+    the batch stops, but there is nothing left to run, so the run ends
+    ``done`` without a pointless sleep-to-window (the instance is
+    marked in the results; its re-run is WP3b's checkpoint-resume)."""
+    e = Env()
+    runner = e.make(["i0"], {"i0": "quota_limited"})
+    result = runner.run()
+    assert result.final_state == "done"
+    assert result.backoffs == 0
+    assert [s for _, s in result.results] == ["quota_limited"]
+    assert "sleep" not in [ev[0] for ev in e.reporter.events]
+    assert chain(result)[-1] == ("budget_exhausted",
+                                r.EVENT_QUEUE_EMPTY, "done")
 
 
 # ---------------------------------------------------------------------------
@@ -714,6 +812,34 @@ def test_n_gt1_multiple_windows():
     assert result.sessions_completed == 3
 
 
+def test_n_gt1_single_checkpoint_for_double_quota_stop():
+    """Two workers both finishing ``quota_limited`` in flight (N>1)
+    stop the batch *once*: exactly one checkpoint per backoff (the
+    drain is single-threaded — the pool has joined), not one per
+    worker. The barrier forces both claims to be in flight (cap 2), so
+    the double stop is the same stop — one backoff, one checkpoint."""
+    e = Env()
+    barrier = threading.Barrier(2, timeout=10)
+
+    def factory(inst):
+        if inst in ("i0", "i1"):  # both held in flight until both start
+            return FakeSession(e.registry, "quota_limited", barrier=barrier)
+        return FakeSession(e.registry, "resolved")
+
+    runner = e.make(["i0", "i1", "i2"],
+                   {"i0": "quota_limited", "i1": "quota_limited",
+                    "i2": "resolved"},
+                   config=r.BudgetConfig(max_sessions_per_day=2),
+                   concurrency=2, i_know_about_quota=True, factory=factory)
+    result = runner.run()
+    cks = [ev for ev in e.reporter.events if ev[0] == "checkpoint"]
+    assert len(cks) == 1  # the double stop yields one checkpoint
+    assert cks[0][1] == "rate_limited"
+    assert result.backoffs == 1
+    assert result.final_state == "done"
+    assert sorted(i for i, _ in result.results) == ["i0", "i1", "i2"]
+
+
 # ---------------------------------------------------------------------------
 # lifecycle edges
 # ---------------------------------------------------------------------------
@@ -727,13 +853,57 @@ def test_run_is_one_shot():
         runner.run()
 
 
+def test_run_finished_fires_on_clean_done():
+    """The ``run_finished`` hook fires on normal completion (and only
+    then — the propagated-failure absence assertions in the error-path
+    tests are no longer vacuous): exactly once, last, after every
+    instance mark, carrying the final state."""
+    e = Env()
+    runner = e.make(["i0", "i1"],
+                   {"i0": "resolved", "i1": "no_patch"})
+    runner.run()
+    events = e.reporter.events
+    fins = [i for i, ev in enumerate(events) if ev[0] == "run_finished"]
+    marks = [i for i, ev in enumerate(events)
+            if ev[0] == "instance"]
+    assert fins == [len(events) - 1]  # exactly once, last
+    assert events[fins[0]] == ("run_finished", "done")
+    assert marks and fins[0] > max(marks)
+
+
+def test_process_lock_busy_is_retryable(tmp_path):
+    """A ``ProcessLockBusy`` failure does not consume the one-shot: the
+    runner may retry once the sibling releases (the cross-process lock
+    is acquired before ``_running`` flips)."""
+    lock = tmp_path / "devinp-runner.lock"
+    e = Env()
+    r1 = e.make(["i0"], {"i0": "resolved"}, lock_file=str(lock))
+    fd = open(lock, "a")
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        with pytest.raises(r.ProcessLockBusy):
+            r1.run()
+        with pytest.raises(r.ProcessLockBusy):  # still busy, still retryable
+            r1.run()
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        fd.close()
+    assert r1.run().final_state == "done"  # the retry works
+
+
 def test_budget_config_validation():
     with pytest.raises(r.RunnerConfigError):
         r.BudgetConfig(max_sessions_per_day=0)
     with pytest.raises(r.RunnerConfigError):
+        r.BudgetConfig(max_sessions_per_day=True)  # bool refused uniformly
+    with pytest.raises(r.RunnerConfigError):
         r.BudgetConfig(max_wall_per_session=0.0)
     with pytest.raises(r.RunnerConfigError):
+        r.BudgetConfig(max_wall_per_session=True)  # bool refused uniformly
+    with pytest.raises(r.RunnerConfigError):
         r.BudgetConfig(daily_pause=-1.0)
+    with pytest.raises(r.RunnerConfigError):
+        r.BudgetConfig(daily_pause=True)  # bool refused uniformly
     with pytest.raises(r.RunnerConfigError):
         r.OverlapGuard(max_concurrency=0)
 

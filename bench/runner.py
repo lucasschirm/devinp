@@ -37,20 +37,26 @@ Acceptance criteria (issue #14) and where they live:
    starts), the *checkpoint* hook fires (WP3b's JSONL flush; the in-memory
    recorder by default), the runner *sleeps to the next quota reset
    window* (next UTC midnight — the "calendar basis" reset's fine-grained
-   leg, WP0 §4; ``daily_pause``'s default 12 h is the nominal pause the
-   window alignment realizes), and the run *resumes* in the new window
-   with the budget reset. **The ``quota_limited`` instance is not
+   leg, WP0 §4; the sleep's *duration* is the remainder of the current
+   window — the nominal 12 h ``daily_pause`` is the default config, not
+   a guarantee of the realized pause), and the run *resumes* in the new
+   window with the budget reset. **The ``quota_limited`` instance is not
    re-queued in this run** — its re-run is the checkpoint-resume retry
    class (PLAN §2.5), applied by WP3b's resume logic on the next process
    start. The remaining queue continues in the new window (the 500 run is
    one process spanning days across windows, PLAN §6 WP6.3).
 5. **Abort on 2 consecutive ``agent_error`` (environment-drift
    suspicion).** "Consecutive" = in completion order, reset by *any* other
-   terminal status. Under a granted N>1 it is the same counter in
-   completion order — environment drift is a *global* suspicion, so two
-   agent errors with no clean completion in between abort the run either
-   way. The run ends in ``aborted`` with a reason; no further instance
-   starts; in-flight sessions (N>1) finish.
+   terminal status **and by the window reset** (a new day is a fresh
+   suspicion — the drift evidence is window-scoped; a deliberate deviation
+   from AC5's literal reset rule, pinned by
+   ``test_window_reset_breaks_agent_error_chain``). Under a granted N>1
+   it is the same counter in completion order — environment drift is a
+   *global* suspicion, so two agent errors with no clean completion in
+   between abort the run either way (a late-arriving trigger preempts the
+   backoff sleep via the (budget_exhausted, abort) transition). The run
+   ends in ``aborted`` with a reason; no further instance starts;
+   in-flight sessions (N>1) finish.
 
 Session contract (the pluggable seam WP3b's adapter fills):
 
@@ -282,12 +288,15 @@ class BudgetConfig:
       runner-level daily wall budget is this × the session cap (the
       per-*instance* wall cap is enforced by the adapter/``AcpSession``,
       WP1).
-    * ``daily_pause`` — default **12 h** between run batches, aligned to
-      the quota reset (PLAN §2.2). The *actual* sleep is aligned to the
-      quota reset boundary (next UTC midnight — WP0 §4 "calendar basis"
-      reset, the fine-grained leg); the 12 h nominal pause is what that
-      alignment realizes. The weekly budget is a hard outer cap that
-      stays config/operational (not a state-machine leg in WP3a).
+    * ``daily_pause`` — default **12 h** between run batches (PLAN
+      §2.2). The *actual* sleep is **not 12 h verbatim**: it aligns to
+      the quota reset boundary (next UTC midnight — WP0 §4 "calendar
+      basis" reset, the fine-grained leg), so its duration is the
+      remainder of the current window — a signal at 23:00 UTC sleeps ~1
+      h, one at 00:01 ~24 h. The 12 h nominal is the default config, not
+      a guarantee of the realized pause. The weekly budget is a hard
+      outer cap that stays config/operational (not a state-machine leg in
+      WP3a).
     """
 
     max_sessions_per_day: int = 10
@@ -302,16 +311,19 @@ class BudgetConfig:
                 f"max_sessions_per_day must be an int >= 1, "
                 f"got {self.max_sessions_per_day!r}"
             )
-        if not (isinstance(self.max_wall_per_session, (int, float))
-                and self.max_wall_per_session > 0):
+        if isinstance(self.max_wall_per_session, bool) \
+                or not (isinstance(self.max_wall_per_session, (int, float))
+                       and self.max_wall_per_session > 0):
             raise RunnerConfigError(
-                f"max_wall_per_session must be > 0, "
+                f"max_wall_per_session must be a number > 0, "
                 f"got {self.max_wall_per_session!r}"
             )
-        if not (isinstance(self.daily_pause, (int, float))
-                and self.daily_pause > 0):
+        if isinstance(self.daily_pause, bool) \
+                or not (isinstance(self.daily_pause, (int, float))
+                       and self.daily_pause > 0):
             raise RunnerConfigError(
-                f"daily_pause must be > 0, got {self.daily_pause!r}"
+                f"daily_pause must be a number > 0, "
+                f"got {self.daily_pause!r}"
             )
 
 
@@ -663,6 +675,7 @@ class Runner:
         self._proc_lock = ProcessLock(lock_file) if lock_file else None
         self._state = BackoffState.RUNNING
         self._stop_new = False
+        self._stop_reason: "str | None" = None
         self._consecutive_errors = 0
         self._abort_reason: "str | None" = None
         self._backoffs = 0
@@ -707,16 +720,19 @@ class Runner:
 
         Returns a :class:`RunResult`; re-raises a propagated session
         failure (host-crash class). The cross-process lock is held for
-        the whole call (released in a finally).
+        the whole call (released in a finally). The ``run_finished``
+        hook fires on normal completion — *not* on a propagated failure
+        (the run did not finish). A ``ProcessLockBusy`` failure does not
+        consume the one-shot: the runner may retry once the lock frees.
         """
         if self._running:
             raise RunnerError(
                 "runner is already running — one run() per instance"
             )
-        self._running = True
         t0 = self._clock()
         if self._proc_lock is not None:
             self._proc_lock.acquire()
+        self._running = True
         try:
             self._reporter.run_started({
                 "concurrency": self._concurrency,
@@ -744,7 +760,9 @@ class Runner:
                     raise self._fatal  # host-crash class (PLAN §2.5)
                 if self._drain_state_machine():
                     break
-            return self._make_result(t0)
+            result = self._make_result(t0)
+            self._reporter.run_finished(result)
+            return result
         finally:
             if self._proc_lock is not None:
                 self._proc_lock.release()
@@ -798,6 +816,7 @@ class Runner:
                 if not self._queue:
                     self._emit(EVENT_QUEUE_EMPTY)
                 else:
+                    self._stop_reason = "budget_exhausted"
                     self._emit(EVENT_BUDGET_EXHAUSTED)
                 return None
             if not self._queue:
@@ -808,6 +827,7 @@ class Runner:
             # claim succeeds; try_claim re-checks for defense in depth.
             if not self._budget.try_claim():
                 self._queue.appendleft(inst)
+                self._stop_reason = "budget_exhausted"
                 self._emit(EVENT_BUDGET_EXHAUSTED)
                 return None
             return inst
@@ -856,7 +876,10 @@ class Runner:
                 if not started:
                     # No session ever started: give the budget claim
                     # back — it must not consume the daily budget.
-                    self._budget.release_claim()
+                    # Under the lock: a granted N>1 can race this
+                    # against a concurrent worker's try_claim/record.
+                    with self._lock:
+                        self._budget.release_claim()
                 raise
         finally:
             if guard_held:
@@ -869,13 +892,15 @@ class Runner:
     def _handle(self, inst: str, status: str, wall_s: float) -> None:
         """Record the terminal status and apply its state effects.
 
-        Reporter callbacks run *outside* the internal lock (user code);
-        state changes run inside it.
+        The ``record_instance`` hook runs under the runner lock together
+        with the state changes (the hook must be fast — WP3b's JSONL
+        append is a single write); the ``checkpoint`` hook (AC4) runs
+        outside the lock in the single-threaded drain, before the
+        sleep-to-window.
         """
-        self._reporter.record_instance(inst, status, {"wall_s": wall_s})
-        ckpt_meta = None
         with self._lock:
             self._results.append((inst, status))
+            self._reporter.record_instance(inst, status, {"wall_s": wall_s})
             self._sessions_completed += 1
             self._budget.record_wall(wall_s)
             if status == AGENT_ERROR:
@@ -894,23 +919,17 @@ class Runner:
                 self._consecutive_errors = 0
             if status == QUOTA_LIMITED:
                 # "stop the batch" (issue #14 AC4): no further instance
-                # starts; in-flight sessions (N>1) finish.
+                # starts; in-flight sessions (N>1) finish. Only the
+                # worker whose status actually stopped the run (the
+                # fresh RUNNING -> budget_exhausted transition) records
+                # the stop reason — a late-arriving quota_limited
+                # status (N>1) does not re-stop. The checkpoint fires
+                # exactly once per backoff, in the single-threaded
+                # drain, before the sleep.
                 self._stop_new = True
                 if self._state is BackoffState.RUNNING:
                     self._emit(EVENT_RATE_LIMITED)
-            # "checkpoint" (AC4) — before the sleep-to-window, which the
-            # state-machine drain performs next. Meta is captured under
-            # the lock (worker callbacks may interleave under a granted
-            # N>1). Skipped once the run is already terminal (aborted /
-            # done) — a late arrival there is noise, not a stop.
-            if status == QUOTA_LIMITED and self._state in (
-                    BackoffState.RUNNING, BackoffState.BUDGET_EXHAUSTED):
-                ckpt_meta = {
-                    "sessions_used": self._budget.sessions_used,
-                    "queue_remaining": len(self._queue),
-                }
-        if ckpt_meta is not None:
-            self._reporter.checkpoint("rate_limited", ckpt_meta)
+                    self._stop_reason = "rate_limited"
 
     # -- state machine -----------------------------------------------------
 
@@ -932,6 +951,7 @@ class Runner:
                     self._emit(EVENT_QUEUE_EMPTY)  # -> done
                 return True
             if state is BackoffState.BUDGET_EXHAUSTED:
+                ckpt = None
                 with self._lock:
                     if not self._queue:
                         # The N>1 race: the queue drained between a
@@ -939,10 +959,22 @@ class Runner:
                         # done, without a pointless sleep.
                         self._emit(EVENT_QUEUE_EMPTY)
                         return True
+                    # "checkpoint" (AC4) — before the sleep-to-window.
+                    # Exactly once per backoff: the drain is
+                    # single-threaded (a granted N>1 can no longer
+                    # interleave — the pool has joined), so two
+                    # quota_limited completions yield one checkpoint.
+                    ckpt = (
+                        self._stop_reason or "budget_exhausted",
+                        {"sessions_used": self._budget.sessions_used,
+                         "queue_remaining": len(self._queue)},
+                    )
                     self._emit(EVENT_SLEEP_START)  # -> sleeping
-                # Sleep to the next quota reset window (outside the
-                # lock — a sleeper callback must not re-enter the
-                # runner's internals).
+                # Outside the lock — the hooks must not re-enter the
+                # runner's internals; the order is checkpoint *then*
+                # sleep (AC4).
+                if ckpt is not None:
+                    self._reporter.checkpoint(*ckpt)
                 target = self._next_window(self._clock())
                 self._sleeper(max(target - self._clock(), 0.0))
                 with self._lock:
@@ -952,10 +984,13 @@ class Runner:
                 with self._lock:
                     # A new window is a fresh budget (PLAN §2.2/§2.5):
                     # the daily counters, the drift-suspicion counter
-                    # and the batch stop all reset.
+                    # (a deliberate, documented deviation from AC5's
+                    # literal reset rule — a new day is a fresh
+                    # suspicion) and the batch stop all reset.
                     self._budget.reset()
                     self._consecutive_errors = 0
                     self._stop_new = False
+                    self._stop_reason = None
                     self._emit(EVENT_RESET)  # -> running
                 return False  # a new window round
             raise RunnerProtocolError(f"unhandled state {state!r} in drain")
@@ -1040,8 +1075,9 @@ def main(argv: "Sequence[str] | None" = None) -> int:
           f"default 1 = sequential)")
     print(f"  max_sessions_per_day: {cfg.max_sessions_per_day}")
     print(f"  max_wall_per_session: {cfg.max_wall_per_session:.1f} s")
-    print(f"  daily_pause: {cfg.daily_pause:.0f} s (realized by alignment "
-          f"to the quota reset window — next UTC midnight, WP0 §4)")
+    print(f"  daily_pause: {cfg.daily_pause:.0f} s (nominal — the "
+          f"backoff sleep aligns to the quota reset window: the next "
+          f"UTC midnight, WP0 §4)")
     print(f"  lock_file: {args.lock_file or 'none (in-process guard only)'}")
     print("WP3a: the queue/budget/flag machinery is validated; the adapter + "
           "checkpoint JSONL wiring is WP3b (issue #15).")

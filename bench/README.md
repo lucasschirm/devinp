@@ -162,20 +162,29 @@ python -m pytest tests/test_runner.py    # zero-cost, fake sessions only
   PLAN §2.3) converge on `budget_exhausted`.
 - **Rate-limit → stop the batch:** the instance is marked
   `quota_limited`, no further instance starts, the checkpoint hook
-  fires, the run sleeps to the next quota reset window (next UTC
-  midnight — WP0 §4 "calendar basis" reset), resumes with the budget
-  reset, and the `quota_limited` instance is **not** re-queued in this
-  run (its re-run is the WP3b checkpoint-resume retry class, PLAN §2.5).
+  fires (exactly once per backoff — a double quota stop under a
+  granted N>1 is one stop; the checkpoint carries the stop reason,
+  `rate_limited` or `budget_exhausted`), the run sleeps to the next
+  quota reset window (next UTC midnight — WP0 §4 "calendar basis"
+  reset; the sleep's *duration* is the remainder of the current
+  window — the nominal 12 h `daily_pause` is the default config, not a
+  guarantee of the realized pause), resumes with the budget reset, and
+  the `quota_limited` instance is **not** re-queued in this run (its
+  re-run is the WP3b checkpoint-resume retry class, PLAN §2.5).
 - **Abort on 2 consecutive `agent_error`** (environment-drift
   suspicion; "consecutive" = completion order, reset by any other
-  terminal status).
+  terminal status **or a window reset** — a new day is a fresh
+  suspicion, a deliberate, documented deviation from AC5's literal
+  reset rule, pinned by
+  `test_window_reset_breaks_agent_error_chain`).
 - **Session contract** (the WP3b adapter seam): `factory(id) ->
   session.start() -> session.run() -> status` (a terminal status from
   the WP5 taxonomy — unknown statuses fail loud) `-> session.close()`;
   a factory/`start()` failure releases the budget claim, a
   `run()`/`close()` failure stands (partial session — PLAN §2.5
-  host-crash class, the exception propagates, `run_finished` is not
-  reported).
+  host-crash class, the exception propagates); the `run_finished` hook
+  fires on normal completion and is *not* reported on a propagated
+  failure.
 
 ## SWE-bench pin (WP0 result)
 
