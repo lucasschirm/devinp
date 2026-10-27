@@ -861,21 +861,28 @@ def resume_queue(instances: Sequence[str],
     return to_run, skipped
 
 
-def _scan_checkpoint_lines(raw: str) -> "tuple[list, bool]":
+def _scan_checkpoint_lines(raw_b: bytes) -> "tuple[list, bool]":
     """The shared line scan (:func:`load_checkpoint` + the write-side
-    repair). Returns ``(records, dropped_last)``. A non-record line
-    *anywhere but the last* raises :class:`RunnerProtocolError`
-    (fail-loud: a mid-file line was fsync'd complete by the writer —
-    garbage there is not a kill artifact); a non-record line at EOF is
-    a torn write → dropped (not fatal)."""
-    lines = raw.split("\n")
-    if lines and lines[-1] == "":
+    repair), done on the **raw bytes**. Each line is decoded with a
+    **strict** UTF-8 decode: a *non-last* line that fails to decode
+    (or is blank / not JSON / not a record) is fsync'd corruption →
+    :class:`RunnerProtocolError` (fail-loud; ``errors="replace"`` would
+    instead mask an invalid byte *inside a string field* as a U+FFFD
+    character — a valid-but-unknown record that the resume logic
+    treats as stale, so the finished instance silently re-runs: a
+    pass@1 violation where the strict decode at least crashed loud —
+    the round-4 finding). A non-record / undecodable line **at EOF**
+    (torn or not — a kill can tear a multibyte sequence at EOF) is a
+    torn write → dropped, not fatal.
+    """
+    lines = raw_b.split(b"\n")
+    if lines and lines[-1] == b"":
         lines = lines[:-1]  # the final newline is not a line
     records: list = []
     dropped = False
     for i, line in enumerate(lines):
         is_last = i == len(lines) - 1
-        if line.strip() == "":
+        if line.strip() == b"":
             if is_last:
                 continue  # a degenerate empty EOF — not a torn record
             raise RunnerProtocolError(
@@ -883,7 +890,17 @@ def _scan_checkpoint_lines(raw: str) -> "tuple[list, bool]":
                 f"artifact; fail-loud"
             )
         try:
-            obj = json.loads(line)
+            text = line.decode("utf-8")  # strict — no replacement masking
+        except UnicodeDecodeError:
+            if is_last:
+                dropped = True  # a torn tail can cut a multibyte sequence
+                continue
+            raise RunnerProtocolError(
+                f"corrupted checkpoint line {i + 1} (invalid UTF-8) — not "
+                f"a kill artifact; fail-loud"
+            )
+        try:
+            obj = json.loads(text)
         except json.JSONDecodeError:
             if is_last:
                 dropped = True
@@ -923,9 +940,9 @@ def load_checkpoint(path: str) -> "tuple[list, bool]":
     """
     if not os.path.exists(path):
         return [], False
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        raw = f.read()
-    return _scan_checkpoint_lines(raw)
+    with open(path, "rb") as f:
+        raw_b = f.read()
+    return _scan_checkpoint_lines(raw_b)
 
 
 def _is_checkpoint_record(obj: object) -> bool:
@@ -973,54 +990,48 @@ def _repair_checkpoint_file(path: str) -> None:
     the preserved prefix: a kill (or a write error, e.g. ENOSPC) can
     no longer destroy previously-fsync'd durable records (the round-1
     ``open("w")`` rewrite truncated to 0 on open — a silent pass@1
-    violation; the round-2 fix).
+    violation; the round-2 fix). The boundary is computed **on the raw
+    bytes** (``rfind(b"\\n")``): the file is read in binary, so the
+    truncation point is byte-exact regardless of what a decoder would
+    replace or how many bytes a character occupies — a re-encoded
+    (``errors="replace"`` → U+FFFD → 3 bytes) prefix length would
+    overshoot and keep the head of the torn tail, which the first
+    append glues onto (round-4 finding).
     """
     if not os.path.exists(path):
         return
-    # ``errors="replace"``: a foreign torn tail ending mid-multibyte
-    # sequence must be a droppable tail (or a typed mid-file
-    # corruption), not a bare UnicodeDecodeError — an undecodable
-    # byte becomes U+FFFD, which fails the record shape and takes the
-    # normal drop/fail-loud path.
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        raw = f.read()
-    if raw == "":
+    with open(path, "rb") as f:
+        raw_b = f.read()
+    if raw_b == b"":
         return  # nothing to repair
     # Fail-loud on a mid-file corruption before touching the file —
     # even when the tail is clean (a corrupted line anywhere else was
     # fsync'd complete; garbage there is not a kill artifact).
-    _scan_checkpoint_lines(raw)
+    _scan_checkpoint_lines(raw_b)
     # The kill zone is the **last line** — whether or not it is
     # newline-terminated (see the docstring; a newline-terminated
     # non-record last line is droppable per the reader's contract and
     # must not survive the repair).
-    body = raw[:-1] if raw.endswith("\n") else raw
-    last_line = body.rsplit("\n", 1)[-1]
-    boundary = len(raw) - len(last_line) - (1 if raw.endswith("\n") else 0)
+    body_b = raw_b[:-1] if raw_b.endswith(b"\n") else raw_b
+    last_b = body_b.rsplit(b"\n", 1)[-1]
+    boundary_b = len(raw_b) - len(last_b) - (1 if raw_b.endswith(b"\n") else 0)
     complete = False
-    if last_line.strip():
+    if last_b.strip():
         try:
-            complete = _is_checkpoint_record(json.loads(last_line))
-        except json.JSONDecodeError:
+            # strict decode: an undecodable (torn multibyte) last line
+            # is a torn tail → drop zone, not a complete record
+            complete = _is_checkpoint_record(json.loads(last_b.decode("utf-8")))
+        except (json.JSONDecodeError, UnicodeDecodeError):
             pass
     if complete:
-        if raw.endswith("\n"):
+        if raw_b.endswith(b"\n"):
             return  # clean — a complete record, newline-terminated
-        with open(path, "a", encoding="utf-8") as f:
-            f.write("\n")  # complete the record — it survives the resume
+        with open(path, "ab") as f:
+            f.write(b"\n")  # complete the record — it survives the resume
         return
-    # A non-record last line — truncate to the last clean boundary.
-    # ``boundary`` is a *character* offset (``raw`` was read in text
-    # mode); ``f.truncate`` takes *bytes* — the truncation point is the
-    # encoded length of the preserved prefix (a non-ASCII record in the
-    # prefix has more bytes than characters; truncating at the character
-    # offset would cut inside the last clean record, which the next
-    # open then drops → a finished instance re-runs, a pass@1
-    # violation). The writer's own records are ASCII (``ensure_ascii``
-    # is the ``json.dumps`` default), but the reader's contract accepts
-    # a foreign/hand-edited file with literal non-ASCII records.
+    # A non-record last line — truncate at the byte-exact boundary.
     with open(path, "r+b") as f:
-        f.truncate(len(raw[:boundary].encode("utf-8")))
+        f.truncate(boundary_b)  # ftruncate — the preserved prefix is intact
         f.flush()
         os.fsync(f.fileno())
 
@@ -1268,8 +1279,18 @@ class Preflight:
         # PLAN §7: the pre-flight disk check is sized against the
         # largest expected image × 2.
         self.min_free_bytes = 2.0 * largest_image_bytes
+        # The shipped default matches the project's own WP0 pin
+        # (README: ``swebench/sweb.eval.x86_64.<owner>_1776_<repo>-<PR>:
+        # latest``): the ``swebench/`` namespace and the Docker-Hub
+        # escape of ``__`` (→ ``_1776_``) — without them ``docker image
+        # inspect`` resolves to ``docker.io/library/sweb.eval.…`` and
+        # never matches the pulled image, so the ``docker_image`` leg
+        # fails on every instance (round-4 finding). A reference
+        # without a tag resolves to ``:latest`` by default. The seam
+        # stays injectable (the adapter can supply its own format).
         self._image_for = image_for if image_for is not None \
-            else (lambda iid: f"sweb.eval.x86_64.{iid}")
+            else (lambda iid: "swebench/sweb.eval.x86_64."
+                  + iid.replace("__", "_1776_"))
         self._run = run if run is not None else self._default_run
         self._disk_usage = disk_usage_fn if disk_usage_fn is not None \
             else shutil.disk_usage

@@ -94,6 +94,8 @@ WP3b acceptance mapping (issue #15, PLAN §2.4–§2.7):
   :func:`test_checkpoint_resume_blank_last_line_repaired`,
   :func:`test_checkpoint_resume_non_ascii_prefix_byte_boundary`,
   :func:`test_checkpoint_resume_torn_tail_mid_multibyte_sequence_dropped`,
+  :func:`test_checkpoint_resume_mid_file_invalid_utf8_in_string_is_typed`,
+  :func:`test_checkpoint_resume_torn_tail_invalid_utf8_newline_terminated`,
   :func:`test_resume_queue_non_dict_record_is_typed`
 * AC2 — pass@1 retry classes → :func:
   `test_resume_never_rerun_agent_outcomes`, :func:
@@ -128,6 +130,7 @@ WP3b acceptance mapping (issue #15, PLAN §2.4–§2.7):
   :func:`test_preflight_checks_all_ok`, :func:
   `test_preflight_checks_wraps_foreign_exceptions`, :func:
   `test_preflight_all_ok_with_stubs`, :func:
+  `test_preflight_default_image_for_matches_wp0_pin`, :func:
   `test_preflight_stub_failure_legs`, :func:
   `test_preflight_hung_daemon_is_a_failure`, :func:
   `test_preflight_config_validation`, :func:
@@ -1710,8 +1713,8 @@ def test_preflight_all_ok_with_stubs():
                           # disk leg uses disk_usage_fn, not run
     assert any("FAKEDEVIN auth status" in s for s in seen)
     assert any("FAKEDOCKER info" in s for s in seen)
-    assert any("FAKEDOCKER image inspect sweb.eval.x86_64.swe-bench__x-1"
-               in s for s in seen)
+    assert any("FAKEDOCKER image inspect swebench/sweb.eval.x86_64."
+               "swe-bench_1776_x-1" in s for s in seen)  # the WP0 pin
 
 
 def test_preflight_stub_failure_legs():
@@ -2351,3 +2354,71 @@ def test_fetch_models_list_missing_returncode_fail_closed():
         return types.SimpleNamespace(stdout="[]")  # no .returncode / .stderr
     with pytest.raises(r.ModelGateError, match="fail-closed.*1"):
         r.fetch_models_list("whatever", run=run)
+
+
+# ---------------------------------------------------------------------------
+# WP3b review round 4 (PR #30, commit 99de3bf) — review-finding regressions
+# ---------------------------------------------------------------------------
+
+
+def test_preflight_default_image_for_matches_wp0_pin():
+    """The shipped default ``image_for`` matches the project's own WP0
+    pin (README: ``swebench/sweb.eval.x86_64.<owner>_1776_<repo>-<PR>:
+    latest``) — the ``swebench/`` namespace and the Docker-Hub escape
+    of ``__`` (→ ``_1776_``) — or ``docker image inspect`` resolves to
+    ``docker.io/library/sweb.eval.…`` and the leg fails on every
+    instance (the round-4 finding)."""
+    seen = []
+    pf = r.Preflight("FAKEDEVIN", "FAKEDOCKER", disk_path="/",
+                    largest_image_bytes=1024,
+                    run=_fake_run(None, 0, seen),
+                    disk_usage_fn=lambda p: _ok_disk())
+    pf("django__django-12345")
+    inspect_cmds = [s for s in seen if "image inspect" in s]
+    assert len(inspect_cmds) == 1
+    assert inspect_cmds[0] == (
+        "FAKEDOCKER image inspect "
+        "swebench/sweb.eval.x86_64.django_1776_django-12345"
+    ), inspect_cmds
+
+
+def test_checkpoint_resume_mid_file_invalid_utf8_in_string_is_typed(tmp_path):
+    """Review round 4 [minor]: an invalid UTF-8 byte *inside a string
+    field of a mid-file (fsync'd) line* must fail loud with a typed
+    error — the round-3 ``errors="replace"`` decode masked it as a
+    U+FFFD character, a valid-but-unknown record the resume logic
+    treats as stale → the finished instance silently re-runs (a
+    pass@1 violation where the strict decode at least crashed loud)."""
+    p = str(tmp_path / "run-1.jsonl")
+    with open(p, "wb") as f:
+        f.write(b'{"instance_id": "i0", "status": "resolved", '
+                b'"meta": {"reason": "a\xffb"}, "ts": 1.0}\n')
+        f.write(b'{"instance_id": "i2", "status": "timeout", "meta": {}, "ts": 3.0}\n')
+    with pytest.raises(r.RunnerProtocolError, match="invalid UTF-8"):
+        r.load_checkpoint(p)
+    # the writer-side repair fails loud too (before touching the file)
+    with pytest.raises(r.RunnerProtocolError, match="invalid UTF-8"):
+        r.JsonlCheckpoint(p)
+
+
+def test_checkpoint_resume_torn_tail_invalid_utf8_newline_terminated(tmp_path):
+    """A torn *last* line containing an invalid UTF-8 byte (even
+    newline-terminated) is a droppable tail for the reader and is
+    truncated by the write-side repair — the byte-exact (binary)
+    boundary keeps the clean prefix intact."""
+    p = str(tmp_path / "run-1.jsonl")
+    with open(p, "wb") as f:
+        f.write(b'{"instance_id": "i0", "status": "resolved", "meta": {}, "ts": 1.0}\n')
+        f.write(b'{"instance_id": "i1", "status": "quo\xff\n')
+    records, dropped = r.load_checkpoint(p)
+    assert dropped is True
+    assert [rec["instance_id"] for rec in records] == ["i0"]
+    e = Env()
+    ckpt = r.JsonlCheckpoint(p, clock=e.clock)
+    r.Runner(["i1"], lambda inst: FakeSession(e.registry, "resolved",
+                                             clock=e.clock),
+             clock=e.clock, sleeper=e.sleeper, reporter=ckpt).run()
+    ckpt.close()
+    recs2, dropped2 = r.load_checkpoint(p)
+    assert dropped2 is False
+    assert [rec["instance_id"] for rec in recs2] == ["i0", "i1"]

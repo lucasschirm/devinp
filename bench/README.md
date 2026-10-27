@@ -209,17 +209,21 @@ WP3b (issue #15, PLAN §2.4–2.7):
   a droppable torn tail too) — if a complete record missing only its
   trailing newline is *completed* (newline written), otherwise
   *truncated* via `ftruncate` (atomic w.r.t. the preserved prefix — a
-  kill mid-repair cannot destroy fsync'd records; the truncation
-  point is the *encoded byte length* of the prefix — the reader's
-  contract accepts a foreign/hand-edited file with literal non-ASCII
-  records, and a character-offset truncation would cut inside the
-  last clean record; both reader and repair decode with
-  `errors="replace"`, so a foreign torn tail ending
-  mid-multibyte-sequence is a droppable tail, not a bare
-  UnicodeDecodeError) — so a resumed run never glues its first
-  record onto the tail (mid-file corruption on the next load, or a
-  silently dropped *completed* record — a re-run of a finished
-  instance, a pass@1 violation). `resume_queue` (pure)
+  kill mid-repair cannot destroy fsync'd records; the boundary is
+  computed **on the raw bytes** — `rfind(b"\n")` on the binary read —
+  so the truncation point is byte-exact regardless of what a decoder
+  would replace or how many bytes a character occupies; both reader
+  and repair decode each line with a **strict** UTF-8 decode — a
+  non-last line that fails to decode is a typed
+  `RunnerProtocolError` (a replacement decode would mask an invalid
+  byte inside a string field as a U+FFFD character, a valid-but-
+  unknown record the resume logic treats as stale → a silent re-run
+  of a finished instance), while a torn *last* line with an invalid
+  byte (a kill can tear a multibyte sequence at EOF) is a droppable
+  tail) — so a resumed run never glues its first record onto the
+  tail (mid-file corruption on the next load, or a silently dropped
+  *completed* record — a re-run of a finished instance, a pass@1
+  violation). `resume_queue` (pure)
   splits the full instance list into `to_run` / `skipped`:
   `resolved` / `failed_test` / `timeout` / `no_patch` (and
   `agent_error` — a terminal agent outcome) are **never re-run**;
@@ -256,7 +260,13 @@ WP3b (issue #15, PLAN §2.4–2.7):
 - **Zero-quota pre-flight** (PLAN §2.7): `Preflight` runs the ordered,
   short-circuiting legs — `devin auth status` ok → Docker daemon
   responsive (bounded — a hung daemon is a failure, not a wait) →
-  instance image present (per instance) → free disk ≥ **2 × the
+  instance image present (per instance — the shipped default
+  `image_for` matches the WP0 pin
+  `swebench/sweb.eval.x86_64.<owner>_1776_<repo>-<PR>:latest`, with
+  the `swebench/` namespace and the Docker-Hub escape of `__`;
+  without them `docker image inspect` never matches the pulled
+  image and the leg fails on every instance; the seam stays
+  injectable) → free disk ≥ **2 × the
   largest expected image** — before **every batch** (a new quota
   window is a new batch) and **before each instance**; a failure
   raises `PreflightFailed` naming the leg, the runner marks the
