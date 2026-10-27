@@ -889,10 +889,12 @@ def test_auth_status_canned_stub(tmp_path):
     assert r.returncode == 0, r.stderr
     assert "Logged in" in r.stdout
     # an unknown 'auth' subargument is rejected like other strict-CLI
-    # mistakes
+    # mistakes — round 5 [nit]: pin the message too, so a regression
+    # to "requires a subcommand" for the auth half is visible
     r = subprocess.run([w, "auth", "bogus"],
                       capture_output=True, text=True, timeout=30)
     assert r.returncode == 2
+    assert "unknown subcommand" in r.stderr and "'bogus'" in r.stderr
 
 
 def test_env_mode_empty_rejected_and_devin_model_respected(tmp_path):

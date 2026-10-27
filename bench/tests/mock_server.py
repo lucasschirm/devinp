@@ -215,6 +215,16 @@ def handle(obj):
                                       "used": 12026, "size": 262000}}})
             finish_prompt()
         return
+    if m is not None and rid is not None:
+        # Unknown method with an id: the real server answers with a
+        # JSON-RPC error, it does not crash / drop the request (WP0
+        # negative control; parity with the WP2 mock — round 5 [minor]).
+        send({"jsonrpc": "2.0", "id": rid,
+              "error": {"code": -32601,
+                        "message": f"Method not found: {m}"}})
+        return
+    # Unknown notification (no id): ignore — vendor/unknown
+    # notifications never block (WP0 contract).
 
 buf = b""
 while True:
