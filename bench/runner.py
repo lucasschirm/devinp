@@ -726,7 +726,12 @@ class Runner:
         consume the one-shot: the runner may retry once the lock frees.
         The one-shot check-and-set is atomic under the runner lock (a
         concurrent ``run()`` on the same instance is refused, not
-        double-scheduled).
+        double-scheduled). With a ``lock_file``, a *concurrent*
+        second ``run()`` on the same instance is refused as
+        :class:`ProcessLockBusy` (a ``RunnerError`` subclass — the
+        cross-process lock is checked first, which is what keeps a
+        lock-busy failure retryable); a *sequential* post-completion
+        retry reports "already running".
         """
         t0 = self._clock()
         if self._proc_lock is not None:

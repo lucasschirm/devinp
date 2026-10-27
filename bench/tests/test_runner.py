@@ -62,6 +62,7 @@ Plus the contract edges: :func:`test_unknown_status_is_typed`,
 :func:`test_n_gt1_exhausted_drains_without_sleep`,
 :func:`test_n_gt1_multiple_windows`, :func:`test_run_is_one_shot`,
 :func:`test_concurrent_run_calls_reject_second`,
+:func:`test_concurrent_run_with_lock_file_refuses_busy`,
 :func:`test_run_finished_fires_on_clean_done`,
 :func:`test_process_lock_busy_is_retryable`,
 :func:`test_budget_config_validation`.
@@ -985,6 +986,36 @@ def test_concurrent_run_calls_reject_second():
     for t in threads:
         t.join(timeout=15)
     assert sorted(k for k, _ in outcomes) == ["ok", "refused"]
+
+
+def test_concurrent_run_with_lock_file_refuses_busy(tmp_path):
+    """The documented lock_file corner: a *concurrent* second run() on
+    the same instance is refused as ProcessLockBusy (the cross-process
+    lock is checked first — what keeps a lock-busy failure
+    retryable), not "already running"."""
+    lock = tmp_path / "devinp-runner.lock"
+    e = Env()
+    runner = e.make(["i0"], {"i0": "resolved"}, lock_file=str(lock),
+                    factory=lambda inst: _HoldingSession())
+    barrier = threading.Barrier(2, timeout=10)
+    outcomes = []
+
+    def go():
+        barrier.wait()
+        try:
+            runner.run()
+            outcomes.append("ok")
+        except r.ProcessLockBusy:
+            outcomes.append("busy")
+        except r.RunnerError:
+            outcomes.append("refused")
+
+    threads = [threading.Thread(target=go) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15)
+    assert sorted(outcomes) == ["busy", "ok"]
 
 
 def test_run_finished_fires_on_clean_done():
