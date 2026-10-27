@@ -247,7 +247,7 @@ def make_mock(root, mode: str):
     wrapper = root / f"mock-devin-{mode}"
     mock.write_text(MOCK_SOURCE)
     wrapper.write_text(
-        f"#!/bin/sh\nexec \"{sys.executable}\" \"{mock}\" {mode} {state}\n"
+        f"#!/bin/sh\nexec \"{sys.executable}\" \"{mock}\" {mode} \"{state}\"\n"
     )
     wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP
                   | stat.S_IXOTH)

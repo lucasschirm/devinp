@@ -81,8 +81,8 @@ def _wrapper(root, mode: str) -> tuple[str, str]:
     w = root / f"mock-devin-{mode}"
     w.write_text(
         f"#!/bin/sh\n"
-        f"export MOCK_DEVIN_MODE={mode}\n"
-        f"export MOCK_DEVIN_STATE={state}\n"
+        f"export MOCK_DEVIN_MODE=\"{mode}\"\n"
+        f"export MOCK_DEVIN_STATE=\"{state}\"\n"
         f"exec \"{sys.executable}\" \"{mock}\" \"$@\"\n"
     )
     w.chmod(w.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
@@ -479,8 +479,8 @@ def test_models_list_fixture(tmp_path):
                 "swe-2-max-lightning"):
         assert by_uid[uid]["cost_tier"] == "High cost"
     # Round 1 [minor]: the non-SWE family is a verbatim copy of a real
-    # captured family (not fabricated), and the Med cost tier (the most
-    # common paid tier in the real capture) is present.
+    # captured family (not fabricated), and the Med cost tier (179
+    # variants in the real capture) is present.
     assert by_uid["claude-opus-4-6"]["cost_tier"] == "High cost"
     assert by_uid["claude-opus-4-6"]["cost_summary"] == \
         "$5 / 1M Input \u00b7 $0.5 / 1M Cached input \u00b7 $25 / 1M Output"
@@ -833,7 +833,7 @@ def test_env_mode_empty_rejected_and_devin_model_respected(tmp_path):
     w.write_text(
         f"#!/bin/sh\n"
         f"export MOCK_DEVIN_MODE=ok\n"
-        f"export MOCK_DEVIN_STATE={state}\n"
+        f"export MOCK_DEVIN_STATE=\"{state}\"\n"
         f"export DEVIN_MODEL=env-model\n"
         f"exec \"{sys.executable}\" \"{MOCK_PATH}\" acp\n"
     )

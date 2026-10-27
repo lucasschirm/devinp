@@ -317,8 +317,9 @@ MODELS_LIST_FIXTURE = {
             ],
         },
         # Verbatim from the WP0 capture (family "gpt-6-sol") — the
-        # ``Med cost`` tier (179 variants in the real capture, the most
-        # common paid tier) must be present, not just Low/High.
+        # ``Med cost`` tier (179 variants in the real capture; the most
+        # common *paid* tier is High cost) must be present, not just
+        # Low/High.
         {
             "family_label": "GPT-6 Sol",
             "family_uid": "gpt-6-sol",
@@ -801,10 +802,15 @@ def _acp(argv: list) -> int:
                 sys.exit(0)
             return
 
-        if rid == perm_rid and pending_permission:
+        if m is None and rid == perm_rid and pending_permission:
             # The client's answer to our permission request (WP2 AC1:
             # the canned agent answers its own permission flow — the
             # outcome decides whether the canned patch is applied).
+            # ``m is None``: a response, not a request — a client
+            # request whose id collides with the outstanding perm_rid
+            # is legal (independent id namespaces per direction) and
+            # must get its own answer, not be consumed as the
+            # permission answer.
             pending_permission = False
             res = obj.get("result") or {}
             outcome = res.get("outcome") or {}
@@ -937,10 +943,14 @@ def main(argv: list) -> int:
     if cmd == "models":
         if len(rest) >= 1 and rest[0] == "list":
             return _models_list(rest[1:])
+        if rest:
+            return _cli_error(f"unknown subcommand {rest[0]!r} for 'models'")
         return _cli_error("models requires a subcommand (list)")
     if cmd == "auth":
         if len(rest) >= 1 and rest[0] == "status":
             return _auth_status(rest[1:])
+        if rest:
+            return _cli_error(f"unknown subcommand {rest[0]!r} for 'auth'")
         return _cli_error("auth requires a subcommand (status)")
     if cmd == "--version":
         print(f"mock-devin {MOCK_VERSION}")
