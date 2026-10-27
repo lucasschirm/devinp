@@ -12,6 +12,15 @@ fixture) + integration tests driven through the real WP1 client
 (sequential queue, quota-budget state machine, overlap guard +
 concurrency flag contract, abort on 2 consecutive `agent_error`)
 + unit tests against instrumented fake sessions (zero quota, CI).
+**WP3b (issue #15) complete** — `runner.py` (checkpoint/resume with
+pass@1-correct retry semantics: `JsonlCheckpoint` + `resume_queue`, a
+torn EOF line drops not fatal, only `quota_limited`/`eval_error`/
+host-crash/preflight states retry; the dynamic cost-tier model gate
+(fail-closed — paid model refused, shape change refused, a paid
+override needs an explicit config + a token budget); the zero-quota
+pre-flight (auth → daemon → image → disk ≥ 2 × largest image, before
+every batch and every instance → `preflight_failed`)) + unit tests
+against fixtures + stub-failure legs (zero quota, CI).
 
 ## Layout
 
@@ -26,8 +35,8 @@ concurrency flag contract, abort on 2 consecutive `agent_error`)
 | `probes/acp_probe.py` | NDJSON JSON-RPC probe for `devin acp` (4 modes) |
 | `acp_client.py` | **WP1** — NDJSON JSON-RPC 2.0 client core (pure stdlib) |
 | `mock_devin.py` | **WP2** — `mock_devin` test double: a fake `devin` binary (canned ACP agent, modes `ok`/`no_patch`/`hang`/`quota`/`crash`, canned `models list` fixture) |
-| `runner.py` | **WP3a** — sequential queue (concurrency 1 by default), quota-budget state machine (`running → budget_exhausted → sleeping → resume`), overlap guard + concurrency flag contract, abort on 2 consecutive `agent_error` (pure stdlib) |
-| `tests/` | **WP1** — unit tests + in-process mock `devin` server; **WP2** — `mock_devin` integration tests (driven through the real WP1 client); **WP3a** — `runner` unit tests (instrumented fake sessions) |
+| `runner.py` | **WP3a + WP3b** — sequential queue (concurrency 1 by default), quota-budget state machine (`running → budget_exhausted → sleeping → resume`), overlap guard + concurrency flag contract, abort on 2 consecutive `agent_error`; checkpoint/resume with pass@1-correct retry semantics (`JsonlCheckpoint`, `resume_queue`), the dynamic cost-tier model gate (fail-closed, `gate_cost_tier`/`parse_models_list`/`fetch_models_list`), the zero-quota pre-flight (`Preflight`, before every batch + every instance) (pure stdlib) |
+| `tests/` | **WP1** — unit tests + in-process mock `devin` server; **WP2** — `mock_devin` integration tests (driven through the real WP1 client); **WP3a** — `runner` unit tests (instrumented fake sessions); **WP3b** — resume fixtures (incl. EOF corruption + retry-class rules), cost-tier gate fixtures (paid model, shape change, paid override), pre-flight stub-failure tests |
 | `conftest.py` | pytest path shim for the flat layout |
 | `pyproject.toml` / `requirements.lock` | Python ≥3.11; `swebench==5.0.2` pinned |
 
@@ -131,18 +140,18 @@ python -m pytest tests/          # zero-cost, mock only, no quota
   parse errors for non-JSON lines — the server keeps serving, never
   crashes (the WP0 negative-control behavior).
 
-## The runner (WP3a, issue #14)
+## The runner (WP3a + WP3b, issues #14 + #15)
 
 `runner.py` — the sequential queue, quota-budget state machine and
-overlap guard (PLAN.md §2.1–2.3, §5 WP3; checkpoint/JSONL + cost-tier
-gate + pre-flight are WP3b, issue #15; pruning is WP3c, issue #16):
+overlap guard (PLAN.md §2.1–2.3, §5 WP3; pruning is WP3c, issue #16):
 
 ```bash
 cd bench
 python3 runner.py                        # validates the flag contract (exit 0)
 python3 runner.py --concurrency 3        # exit 2 — refused by default
 python3 runner.py --concurrency 3 --i-know-about-quota
-python -m pytest tests/test_runner.py    # zero-cost, fake sessions only
+python3 runner.py --model swe-2-high --models-json notes/models-list.json
+python -m pytest tests/test_runner.py    # zero-cost, fake sessions + fixtures
 ```
 
 - **Sequential by default** (concurrency 1): a FIFO of instance ids is
@@ -177,7 +186,7 @@ python -m pytest tests/test_runner.py    # zero-cost, fake sessions only
   suspicion, a deliberate, documented deviation from AC5's literal
   reset rule, pinned by
   `test_window_reset_breaks_agent_error_chain`).
-- **Session contract** (the WP3b adapter seam): `factory(id) ->
+- **Session contract** (the adapter seam): `factory(id) ->
   session.start() -> session.run() -> status` (a terminal status from
   the WP5 taxonomy — unknown statuses fail loud) `-> session.close()`;
   a factory/`start()` failure releases the budget claim, a
@@ -185,6 +194,87 @@ python -m pytest tests/test_runner.py    # zero-cost, fake sessions only
   host-crash class, the exception propagates); the `run_finished` hook
   fires on normal completion and is *not* reported on a propagated
   failure.
+
+WP3b (issue #15, PLAN §2.4–2.7):
+
+- **Checkpoint / resume with pass@1-correct retry semantics** (PLAN
+  §2.5): `JsonlCheckpoint` is the `run-<id>.jsonl` progress file —
+  one fsync'd line per finished instance (status, artifact paths /
+  usage in `meta`, timestamp); a killed mid-write run leaves a torn
+  last line, which `load_checkpoint` **drops, not fatal** (a corrupted
+  mid-file line fails loud) and which `JsonlCheckpoint`'s open
+  **repairs on the write side** (`_repair_checkpoint_file`): the
+  **last line** — whether or not newline-terminated (the reader's
+  contract blesses a non-record *last* line with a trailing newline as
+  a droppable torn tail too) — if a complete record missing only its
+  trailing newline is *completed* (newline written), otherwise
+  *truncated* via `ftruncate` (atomic w.r.t. the preserved prefix — a
+  kill mid-repair cannot destroy fsync'd records; the boundary is
+  computed **on the raw bytes** — `rfind(b"\n")` on the binary read —
+  so the truncation point is byte-exact regardless of what a decoder
+  would replace or how many bytes a character occupies; both reader
+  and repair decode each line with a **strict** UTF-8 decode — a
+  non-last line that fails to decode is a typed
+  `RunnerProtocolError` (a replacement decode would mask an invalid
+  byte inside a string field as a U+FFFD character, a valid-but-
+  unknown record the resume logic treats as stale → a silent re-run
+  of a finished instance), while a torn *last* line with an invalid
+  byte (a kill can tear a multibyte sequence at EOF) is a droppable
+  tail) — so a resumed run never glues its first record onto the
+  tail (mid-file corruption on the next load, or a silently dropped
+  *completed* record — a re-run of a finished instance, a pass@1
+  violation). `resume_queue` (pure)
+  splits the full instance list into `to_run` / `skipped`:
+  `resolved` / `failed_test` / `timeout` / `no_patch` (and
+  `agent_error` — a terminal agent outcome) are **never re-run**;
+  `quota_limited` / `eval_error` / `preflight_failed` and a
+  host-crash partial state (a missing line) **retry — the only retry
+  class**; a duplicated line resolves to the last line, so no instance
+  runs twice.
+- **Startup cost-tier model gate** (PLAN §2.4, fail-closed):
+  `gate_cost_tier` / `parse_models_list` allow only `cost_tier ==
+  "Free"` variants of `devin models list --format json` (the allowlist
+  is dynamic — recomputed every startup); a paid (or unverified /
+  absent-tier) model is refused, a model missing from the list is
+  refused, a JSON shape change is a typed `ModelGateError` refusal;
+  a paid override requires **both** an explicit `allow_paid` config
+  **and** a positive (finite) token budget (CLI: `--model`,
+  `--allow-paid`, `--token-budget`, `--models-json` / `--devin-bin`;
+  a refusal exits 2 before the batch starts; the gate flags without
+  `--model` exit 2 too — the gate is a no-op there, and a silent
+  no-op that "validated" nothing is a footgun; `--models-json` and
+  `--devin-bin` are mutually exclusive (the gate's input is the file
+  OR the live binary — a silently inert `--devin-bin` is the same
+  footgun class). The Runner's default clock is **wall time**
+  (`time.time`): the backoff target is the next *epoch* UTC midnight
+  (WP0 §4 "calendar basis"), so a monotonic (boot-relative) clock
+  would align the sleep ~24 h off the real quota reset (the WP3a
+  default, review finding — WP3b's per-window pre-flight makes the
+  phase alignment load-bearing); wall-clock step-backs (NTP / VM
+  snapshots) clamp to 0.0 at the measurement sites — a negative wall
+  would be subtracted from the budget's `wall_used_s`. The gate's
+  live fetch and the pre-flight's `devin`/Docker commands are
+  fail-closed end to end: a malformed `proc` (missing / non-
+  sliceable `stdout` / `stderr` / `returncode`) is a typed refusal,
+  not a leaked `AttributeError`/`TypeError`.
+- **Zero-quota pre-flight** (PLAN §2.7): `Preflight` runs the ordered,
+  short-circuiting legs — `devin auth status` ok → Docker daemon
+  responsive (bounded — a hung daemon is a failure, not a wait) →
+  instance image present (per instance — the shipped default
+  `image_for` matches the WP0 pin
+  `swebench/sweb.eval.x86_64.<owner>_1776_<repo>-<PR>:latest`, with
+  the `swebench/` namespace and the Docker-Hub escape of `__`;
+  without them `docker image inspect` never matches the pulled
+  image and the leg fails on every instance; the seam stays
+  injectable) → free disk ≥ **2 × the
+  largest expected image** — before **every batch** (a new quota
+  window is a new batch) and **before each instance**; a failure
+  raises `PreflightFailed` naming the leg, the runner marks the
+  instance `preflight_failed` (the reason lands in the JSONL meta;
+  a batch-phase failure records an `instance_id: null` marker line),
+  releases the budget claim (no session was ever started), and aborts
+  the run — the operator fixes the infra and resumes, where the
+  instance is retry-eligible.
 
 ## SWE-bench pin (WP0 result)
 

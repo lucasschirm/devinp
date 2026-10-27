@@ -1,9 +1,11 @@
-"""WP3a (issue #14) — ``runner.py``: sequential queue, quota-budget state
-machine, overlap guard.
+"""WP3a (issue #14) + WP3b (issue #15) — ``runner.py``: sequential
+queue, quota-budget state machine, overlap guard, checkpoint/resume
+with pass@1-correct retry semantics, the dynamic cost-tier model
+gate, and the zero-quota pre-flight.
 
 All tests are unit-level against instrumented fake sessions
-(:class:`FakeSession` + :class:`Registry`) — zero quota, no real
-``devin`` binary, CI safe. Acceptance mapping (issue #14):
+(:class:`FakeSession` + :class:`Registry`) and fixtures — zero quota,
+no real ``devin`` binary, CI safe. Acceptance mapping (issue #14):
 
 * AC1 — default concurrency = 1; the runner asserts no two agent
   sessions ever overlap → :func:`test_default_concurrency_is_one`,
@@ -66,17 +68,97 @@ Plus the contract edges: :func:`test_unknown_status_is_typed`,
 :func:`test_run_finished_fires_on_clean_done`,
 :func:`test_process_lock_busy_is_retryable`,
 :func:`test_budget_config_validation`.
+
+WP3b acceptance mapping (issue #15, PLAN §2.4–§2.7):
+
+* AC1 — resume from ``run-<id>.jsonl``: a partial line at EOF is
+  dropped, not fatal; no instance runs twice →
+  :func:`test_resume_never_rerun_agent_outcomes`,
+  :func:`test_resume_only_retry_classes_rerun`,
+  :func:`test_resume_no_instance_runs_twice`,
+  :func:`test_resume_null_and_stale_lines_ignored`,
+  :func:`test_resume_unknown_status_is_typed`,
+  :func:`test_load_checkpoint_eof_partial_line_dropped_not_fatal`,
+  :func:`test_load_checkpoint_mid_file_corruption_is_typed`,
+  :func:`test_load_checkpoint_last_line_valid_json_wrong_shape_dropped`,
+  :func:`test_load_checkpoint_missing_file_is_fresh_run`,
+  :func:`test_load_checkpoint_trailing_newline_not_dropped`,
+  :func:`test_jsonl_checkpoint_roundtrip`,
+  :func:`test_jsonl_checkpoint_refuses_unknown_status`,
+  :func:`test_resume_from_checkpoint_convenience`,
+  :func:`test_checkpoint_resume_e2e_host_crash_retry_class`,
+  :func:`test_checkpoint_resume_torn_tail_repaired`,
+  :func:`test_checkpoint_resume_torn_tail_complete_json_no_newline`,
+  :func:`test_checkpoint_resume_mid_file_corruption_refuses_repair`,
+  :func:`test_checkpoint_resume_newline_terminated_non_record_last_line_repaired`,
+  :func:`test_checkpoint_resume_blank_last_line_repaired`,
+  :func:`test_checkpoint_resume_non_ascii_prefix_byte_boundary`,
+  :func:`test_checkpoint_resume_torn_tail_mid_multibyte_sequence_dropped`,
+  :func:`test_checkpoint_resume_mid_file_invalid_utf8_in_string_is_typed`,
+  :func:`test_checkpoint_resume_torn_tail_invalid_utf8_newline_terminated`,
+  :func:`test_resume_queue_non_dict_record_is_typed`
+* AC2 — pass@1 retry classes → :func:
+  `test_resume_never_rerun_agent_outcomes`, :func:
+  `test_resume_only_retry_classes_rerun`, :func:
+  `test_preflight_failure_is_retry_eligible_on_resume`, :func:
+  `test_preflight_failure_resume_cycle`
+* AC3 — startup model gate (fail-closed) → :func:
+  `test_gate_free_model_passes`, :func:`test_gate_paid_model_refused`,
+  :func:`test_gate_absent_tier_refused_fail_closed`, :func:
+  `test_gate_unknown_model_refused_fail_closed`, :func:
+  `test_gate_paid_override_requires_explicit_config_and_budget`,
+  :func:`test_gate_shape_changes_refused_fail_closed`, :func:
+  `test_gate_shape_validator_direct`, :func:
+  `test_gate_live_shape_against_mock_devin`, :func:
+  `test_fetch_models_list_via_mock_devin`, :func:
+  `test_fetch_models_list_fail_closed`, :func:
+  `test_cli_gate_free_model_passes`, :func:
+  `test_cli_gate_paid_model_refused`, :func:
+  `test_cli_gate_shape_change_refused`, :func:
+  `test_cli_gate_paid_override`, :func:
+  `test_cli_gate_paid_override_without_budget`, :func:
+  `test_cli_gate_live_devin_bin`, :func:
+  `test_cli_gate_flags_without_model_refused`, :func:
+  `test_cli_models_json_and_devin_bin_mutually_exclusive`, :func:
+  `test_fetch_models_list_none_stdout_fail_closed`, :func:
+  `test_fetch_models_list_missing_stdout_attr_fail_closed`, :func:
+  `test_fetch_models_list_missing_returncode_fail_closed`, :func:
+  `test_gate_inf_token_budget_refused`, :func:
+  `test_next_quota_window_wall_clock_alignment`
+* AC4 — zero-quota pre-flight before every batch and each instance →
+  :func:`test_preflight_checks_short_circuit_at_first_failure`,
+  :func:`test_preflight_checks_all_ok`, :func:
+  `test_preflight_checks_wraps_foreign_exceptions`, :func:
+  `test_preflight_all_ok_with_stubs`, :func:
+  `test_preflight_default_image_for_matches_wp0_pin`, :func:
+  `test_preflight_stub_failure_legs`, :func:
+  `test_preflight_hung_daemon_is_a_failure`, :func:
+  `test_preflight_config_validation`, :func:
+  `test_preflight_batch_failure_aborts_before_any_session`, :func:
+  `test_preflight_instance_failure_marks_releases_claim_aborts`,
+  :func:`test_preflight_batch_reruns_each_window`, :func:
+  `test_preflight_failure_resume_cycle`, :func:
+  `test_preflight_wall_excluded_from_session_wall`, :func:
+  `test_wall_clock_step_back_clamps_to_zero`
 """
 
 from __future__ import annotations
 
 import fcntl
+import json
+import subprocess
+import sys
 import threading
 import time
+import types
+from pathlib import Path
 
 import pytest
 
 import runner as r
+
+#: The WP2 mock double — the gate's live-shape integration (zero quota).
+MOCK_PATH = str(Path(__file__).resolve().parent.parent / "mock_devin.py")
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +271,7 @@ class Env:
 
     def make(self, instances, statuses, **kw) -> r.Runner:
         custom = kw.pop("factory", None)
+        reporter = kw.pop("reporter", self.reporter)
 
         def factory(inst: str) -> r.AgentSession:
             self.calls.append((inst, self.clock()))
@@ -198,7 +281,7 @@ class Env:
 
         return r.Runner(
             instances, factory, clock=self.clock, sleeper=self.sleeper,
-            reporter=self.reporter, **kw
+            reporter=reporter, **kw
         )
 
 
@@ -1095,3 +1178,1250 @@ def test_process_lock_blocks_sibling_runner(tmp_path):
     assert r3.run().final_state == "done"
 
 
+
+
+# ---------------------------------------------------------------------------
+# WP3b (issue #15) — checkpoint / resume with pass@1-correct semantics
+# ---------------------------------------------------------------------------
+
+
+def _fixture_lines() -> list:
+    """One record per never-re-run status in the taxonomy (the resume
+    fixture)."""
+    return [
+        {"instance_id": "i0", "status": "resolved", "meta": {}, "ts": 1.0},
+        {"instance_id": "i1", "status": "failed_test", "meta": {}, "ts": 2.0},
+        {"instance_id": "i2", "status": "timeout", "meta": {}, "ts": 3.0},
+        {"instance_id": "i3", "status": "no_patch", "meta": {}, "ts": 4.0},
+        {"instance_id": "i4", "status": "agent_error", "meta": {}, "ts": 5.0},
+    ]
+
+
+def test_resume_never_rerun_agent_outcomes():
+    """AC2: ``resolved`` / ``failed_test`` / ``timeout`` / ``no_patch``
+    (and ``agent_error`` — a terminal agent outcome, PLAN §3.4) are
+    **never re-run**."""
+    to_run, skipped = r.resume_queue(["i0", "i1", "i2", "i3", "i4"],
+                                    _fixture_lines())
+    assert to_run == []
+    assert skipped == {
+        "i0": "resolved", "i1": "failed_test", "i2": "timeout",
+        "i3": "no_patch", "i4": "agent_error"}
+
+
+def test_resume_only_retry_classes_rerun():
+    """AC2: only ``quota_limited`` / ``eval_error`` /
+    ``preflight_failed`` (and the no-line host-crash state — i8)
+    re-run; never-re-run stays skipped; queue order is preserved."""
+    recs = _fixture_lines() + [
+        {"instance_id": "i5", "status": "quota_limited", "meta": {},
+         "ts": 6.0},
+        {"instance_id": "i6", "status": "eval_error", "meta": {}, "ts": 7.0},
+        {"instance_id": "i7", "status": "preflight_failed", "meta": {},
+         "ts": 8.0},
+    ]
+    to_run, skipped = r.resume_queue(
+        ["i0", "i5", "i7", "i8", "i6", "i3"], recs)
+    # i8: no line (a host-crash partial state / never ran) -> re-run
+    assert to_run == ["i5", "i7", "i8", "i6"]
+    assert skipped == {"i0": "resolved", "i3": "no_patch"}
+
+
+def test_resume_no_instance_runs_twice():
+    """AC1: a duplicated line (a double-write) resolves to the *last*
+    line; the instance appears at most once in the re-run queue."""
+    recs = [
+        {"instance_id": "i0", "status": "quota_limited", "meta": {},
+         "ts": 1.0},
+        {"instance_id": "i0", "status": "resolved", "meta": {}, "ts": 2.0},
+    ]
+    to_run, skipped = r.resume_queue(["i0", "i1"], recs)
+    assert to_run == ["i1"]
+    assert skipped == {"i0": "resolved"}  # the last line wins
+
+
+def test_resume_null_and_stale_lines_ignored():
+    recs = [
+        {"instance_id": None, "status": "preflight_failed", "meta": {},
+         "ts": 1.0},
+        {"instance_id": "stale", "status": "quota_limited", "meta": {},
+         "ts": 2.0},
+        {"instance_id": "i0", "status": "quota_limited", "meta": {},
+         "ts": 3.0},
+    ]
+    to_run, _ = r.resume_queue(["i0", "i1"], recs)
+    assert to_run == ["i0", "i1"]
+
+
+def test_resume_unknown_status_is_typed():
+    recs = [{"instance_id": "i0", "status": "mystery", "meta": {},
+             "ts": 1.0}]
+    with pytest.raises(r.RunnerProtocolError, match="mystery"):
+        r.resume_queue(["i0"], recs)
+
+
+def test_load_checkpoint_eof_partial_line_dropped_not_fatal(tmp_path):
+    """AC1: a kill mid-write leaves a partial line at EOF — it is
+    dropped (not fatal); the complete lines survive."""
+    p = tmp_path / "run-1.jsonl"
+    p.write_text(
+        '{"instance_id": "i0", "status": "resolved", "meta": {}, "ts": 1.0}\n'
+        '{"instance_id": "i1", "status": "quota_lim'  # the torn write
+    )
+    records, dropped = r.load_checkpoint(str(p))
+    assert dropped is True
+    assert len(records) == 1
+    assert records[0]["instance_id"] == "i0"
+    to_run, _ = r.resume_queue(["i0", "i1", "i2"], records)
+    assert to_run == ["i1", "i2"]  # i0 stands; the torn i1 line drops
+
+
+def test_load_checkpoint_mid_file_corruption_is_typed(tmp_path):
+    """A corrupted line *anywhere but the last* is fail-loud (a
+    mid-file line was fsync'd complete — garbage there is not a kill
+    artifact)."""
+    p = tmp_path / "run-1.jsonl"
+    p.write_text(
+        '{"instance_id": "i0", "status": "resolved", "meta": {}, "ts": 1.0}\n'
+        'GARBAGE-NOT-JSON\n'
+        '{"instance_id": "i2", "status": "timeout", "meta": {}, "ts": 3.0}\n'
+    )
+    with pytest.raises(r.RunnerProtocolError, match="line 2"):
+        r.load_checkpoint(str(p))
+
+
+def test_load_checkpoint_last_line_valid_json_wrong_shape_dropped(tmp_path):
+    """A complete JSON line with the wrong shape at EOF is a torn
+    write too (a kill can land after the JSON is complete but the
+    shape is indistinguishable) — dropped, not fatal."""
+    p = tmp_path / "run-1.jsonl"
+    p.write_text(
+        '{"instance_id": "i0", "status": "resolved", "meta": {}, "ts": 1.0}\n'
+        '{"instance_id": "i1", "oops": true}\n'
+    )
+    records, dropped = r.load_checkpoint(str(p))
+    assert dropped is True
+    assert len(records) == 1
+
+
+def test_load_checkpoint_missing_file_is_fresh_run(tmp_path):
+    records, dropped = r.load_checkpoint(str(tmp_path / "nope.jsonl"))
+    assert records == [] and dropped is False
+
+
+def test_load_checkpoint_trailing_newline_not_dropped(tmp_path):
+    p = tmp_path / "run-1.jsonl"
+    p.write_text(
+        '{"instance_id": "i0", "status": "resolved", "meta": {}, "ts": 1.0}\n'
+    )
+    records, dropped = r.load_checkpoint(str(p))
+    assert dropped is False
+    assert len(records) == 1
+
+
+def test_resume_from_checkpoint_convenience(tmp_path):
+    p = tmp_path / "run-1.jsonl"
+    p.write_text(
+        '{"instance_id": "i0", "status": "resolved", "meta": {}, "ts": 1.0}\n'
+        '{"instance_id": "i1", "status": "quota_limited", "meta": {}, '
+        '"ts": 2.0}\n'
+    )
+    to_run, skipped = r.resume_from_checkpoint(str(p), ["i0", "i1", "i2"])
+    assert to_run == ["i1", "i2"]
+    assert skipped == {"i0": "resolved"}
+
+
+def test_jsonl_checkpoint_roundtrip(tmp_path):
+    """A run through a :class:`~runner.JsonlCheckpoint` (the WP3a
+    ``checkpoint`` hook is a no-op — the per-line flush is the
+    checkpoint): one durable line per finished instance; the line
+    shape; the rate-limit stop checkpoint loses nothing; the resume
+    decision off the file (i0 skipped, i1 re-run, i2 fresh)."""
+    e = Env()
+    ckpt = r.JsonlCheckpoint(str(tmp_path / "run-1.jsonl"), clock=e.clock)
+    runner = e.make(["i0", "i1", "i2"],
+                   {"i0": "resolved", "i1": "quota_limited",
+                    "i2": "resolved"},
+                   reporter=ckpt)
+    result = runner.run()
+    ckpt.close()
+    assert result.final_state == "done"
+    records, dropped = r.load_checkpoint(str(tmp_path / "run-1.jsonl"))
+    assert dropped is False
+    assert [rec["instance_id"] for rec in records] == ["i0", "i1", "i2"]
+    assert [rec["status"] for rec in records] == [
+        "resolved", "quota_limited", "resolved"]
+    assert all(rec["ts"] >= 1_000_000.0 for rec in records)
+    assert all("meta" in rec for rec in records)
+    to_run, skipped = r.resume_queue(["i0", "i1", "i2"], records)
+    assert to_run == ["i1"]  # quota_limited is the only re-run
+    assert skipped == {"i0": "resolved", "i2": "resolved"}
+
+
+def test_jsonl_checkpoint_refuses_unknown_status(tmp_path):
+    ckpt = r.JsonlCheckpoint(str(tmp_path / "run-1.jsonl"),
+                            clock=lambda: 1.0)
+    with pytest.raises(r.RunnerProtocolError, match="mystery"):
+        ckpt.record_instance("i0", "mystery", {})
+    ckpt.close()
+
+
+def test_checkpoint_resume_e2e_host_crash_retry_class(tmp_path):
+    """The kill → resume story at the WP3b unit level (the WP2
+    acceptance criterion): run 1 ends in a host crash (a partial
+    session on i2 — *no* line for i2); the file has exactly the two
+    complete lines; the resume queue re-runs ``quota_limited`` (i1) +
+    the crash partial (i2), skips ``resolved`` (i0); run 2's factory
+    calls are exactly [i1, i2] — no instance runs twice; the final
+    file has four lines (i1 twice: ``quota_limited`` then
+    ``no_patch`` — the last line is the record of truth); a resume
+    *after* run 2 re-runs nothing (``no_patch`` is terminal)."""
+    p = str(tmp_path / "run-1.jsonl")
+    e = Env()
+    ckpt = r.JsonlCheckpoint(p, clock=e.clock)
+
+    def factory(inst):
+        e.calls.append((inst, e.clock()))
+        if inst == "i2":
+            raise OSError("host crash mid-session")  # the partial state
+        return FakeSession(e.registry,
+                          {"i0": "resolved", "i1": "quota_limited"}[inst],
+                          clock=e.clock)
+
+    r1 = r.Runner(["i0", "i1", "i2"], factory, clock=e.clock,
+                  sleeper=e.sleeper, reporter=ckpt)
+    with pytest.raises(OSError, match="host crash"):
+        r1.run()
+    ckpt.close()
+    records, dropped = r.load_checkpoint(p)
+    assert dropped is False
+    assert [(rec["instance_id"], rec["status"]) for rec in records] == [
+        ("i0", "resolved"), ("i1", "quota_limited")]
+    to_run, skipped = r.resume_queue(["i0", "i1", "i2"], records)
+    assert to_run == ["i1", "i2"]  # the crash partial + quota re-run
+    assert skipped == {"i0": "resolved"}
+    # run 2 (the crash is gone; i1 lands no_patch this time)
+    e2 = Env()
+    calls2 = []
+
+    def factory2(inst):
+        calls2.append(inst)
+        return FakeSession(e2.registry,
+                          {"i1": "no_patch", "i2": "resolved"}[inst],
+                          clock=e2.clock)
+
+    ckpt2 = r.JsonlCheckpoint(p, clock=e2.clock)
+    r2 = r.Runner(to_run, factory2, clock=e2.clock,
+                  sleeper=e2.sleeper, reporter=ckpt2)
+    result2 = r2.run()
+    ckpt2.close()
+    assert calls2 == ["i1", "i2"]  # no instance runs twice in the cycle
+    assert result2.final_state == "done"
+    recs2, _ = r.load_checkpoint(p)
+    assert len(recs2) == 4
+    assert [rec["instance_id"] for rec in recs2] == ["i0", "i1", "i1", "i2"]
+    assert [rec["status"] for rec in recs2] == [
+        "resolved", "quota_limited", "no_patch", "resolved"]
+    to_run3, _ = r.resume_queue(["i0", "i1", "i2"], recs2)
+    assert to_run3 == []  # no_patch is terminal — nothing re-runs
+
+
+# ---------------------------------------------------------------------------
+# WP3b (issue #15) — the startup cost-tier model gate (PLAN §2.4)
+# ---------------------------------------------------------------------------
+
+
+def _gate_fixture() -> dict:
+    """The WP0 shape (the ``notes/models-list.json`` capture) — Free,
+    paid (Low + High cost, incl. ``*-lightning``), a non-SWE family
+    (a gate keyed on the "swe" prefix would miss it), and the
+    absent-tier ``adaptive`` router."""
+    return {
+        "families": [
+            {"family_label": "SWE-2", "family_uid": "swe-2", "slug": "swe-2",
+             "aliases": ["swe"], "variants": [
+                {"model_uid": "swe-2-high", "label": "SWE-2 High",
+                 "cost_tier": "Free"},
+                {"model_uid": "swe-2-medium", "label": "SWE-2 Medium",
+                 "cost_tier": "Free"},
+                {"model_uid": "swe-2-max", "label": "SWE-2 Max",
+                 "cost_tier": "Free"},
+                {"model_uid": "swe-2-high-lightning",
+                 "label": "SWE-2 High Lightning", "cost_tier": "High cost"},
+            ]},
+            {"family_label": "SWE-1.7", "family_uid": "swe-1.7",
+             "slug": "swe-1.7", "aliases": [], "variants": [
+                {"model_uid": "swe-1-7", "label": "SWE-1.7 Max",
+                 "cost_tier": "Low cost"},
+                {"model_uid": "swe-1-6", "label": "SWE-1.6",
+                 "cost_tier": "Low cost"},
+            ]},
+            {"family_label": "Claude Opus 4.6",
+             "family_uid": "claude-opus-4.6", "slug": "claude-opus-4.6",
+             "aliases": [], "variants": [
+                {"model_uid": "claude-opus-4-6", "label": "Claude Opus 4.6",
+                 "cost_tier": "High cost"},
+            ]},
+            # the absent-tier router (WP0 §7) — an unverified tier is
+            # not Free
+            {"family_label": "Adaptive", "family_uid": "Adaptive",
+             "slug": "adaptive", "aliases": [], "variants": [
+                {"model_uid": "adaptive", "label": "Adaptive"},
+            ]},
+        ]
+    }
+
+
+def test_gate_free_model_passes():
+    g = r.gate_cost_tier(_gate_fixture(), "swe-2-high")
+    assert g.allowed
+    assert g.cost_tier == "Free"
+    assert g.reason is None
+    assert g.paid_override is False
+    assert g.free_models == ("swe-2-high", "swe-2-max", "swe-2-medium")
+
+
+def test_gate_paid_model_refused():
+    """Every paid tier in the fixture is refused — incl. the
+    ``*-lightning`` variants and the non-SWE family (the gate keys on
+    ``cost_tier``, never on names)."""
+    for uid in ("swe-1-7", "swe-1-6", "swe-2-high-lightning",
+               "claude-opus-4-6"):
+        g = r.gate_cost_tier(_gate_fixture(), uid)
+        assert not g.allowed, uid
+        assert "not Free" in g.reason
+        assert "refused" in g.reason
+
+
+def test_gate_absent_tier_refused_fail_closed():
+    g = r.gate_cost_tier(_gate_fixture(), "adaptive")
+    assert not g.allowed
+    assert g.cost_tier == "unknown"  # the absent tier is recorded as such
+    assert "not Free" in g.reason  # unverified ≠ free — fail-closed
+
+
+def test_gate_unknown_model_refused_fail_closed():
+    g = r.gate_cost_tier(_gate_fixture(), "gpt-who-dis")
+    assert not g.allowed
+    assert g.cost_tier is None
+    assert "cannot be verified" in g.reason
+
+
+def test_gate_paid_override_requires_explicit_config_and_budget():
+    """AC3: the paid override requires **both** an explicit config
+    override **and** a token budget — either leg alone leaves the
+    refusal."""
+    fx = _gate_fixture()
+    # explicit config, no budget -> refused
+    g = r.gate_cost_tier(fx, "swe-1-7", allow_paid=True)
+    assert not g.allowed
+    assert "token budget" in g.reason
+    # an invalid budget (0 / negative / bool) -> refused
+    for bad in (0, -5, True):
+        g = r.gate_cost_tier(fx, "swe-1-7", allow_paid=True,
+                            token_budget=bad)
+        assert not g.allowed, bad
+    # no explicit config + a budget -> refused (the budget alone is not
+    # the override)
+    g = r.gate_cost_tier(fx, "swe-1-7", token_budget=1000)
+    assert not g.allowed
+    # explicit config + a valid budget -> allowed, and marked as an
+    # override
+    g = r.gate_cost_tier(fx, "swe-1-7", allow_paid=True,
+                         token_budget=1000)
+    assert g.allowed
+    assert g.paid_override is True
+    # the override cannot bless a model missing from the list
+    # (fail-closed — its tier cannot be verified)
+    g = r.gate_cost_tier(fx, "gpt-who-dis", allow_paid=True,
+                         token_budget=1000)
+    assert not g.allowed
+
+
+def test_gate_shape_changes_refused_fail_closed():
+    """AC3: a JSON shape change is a *typed* refusal — the batch never
+    starts (PLAN §2.4). Each of these is a structural deviation from
+    the WP0 capture."""
+    shape_breaks = [
+        "not-a-dict",              # the top level
+        [],                       # the top level
+        {"families": "nope"},     # families not a list
+        {},                       # families missing
+        {"families": [{}]},       # a family without variants
+        {"families": [{"variants": "nope"}]},  # variants not a list
+        {"families": [{"variants": [{}]}]},    # a variant without model_uid
+        {"families": [{"variants": [{"model_uid": 42}]}]},
+        {"families": [{"variants":
+                      [{"model_uid": "x", "cost_tier": 3}]}]},
+        {"families": ["nope"]},   # a non-dict family
+        {"families": [{"variants": ["nope"]}]},  # a non-dict variant
+    ]
+    for bad in shape_breaks:
+        with pytest.raises(r.ModelGateError, match="shape change"):
+            r.gate_cost_tier(bad, "swe-2-high")
+    # an *empty* list is well-shaped — but nothing is verifiable, so
+    # the configured model is refused (a semantic refusal, not a
+    # shape one)
+    g = r.gate_cost_tier({"families": []}, "swe-2-high")
+    assert not g.allowed
+
+
+def test_gate_shape_validator_direct():
+    tiers = r.parse_models_list(_gate_fixture())
+    assert tiers["swe-2-high"] == "Free"
+    assert tiers["swe-1-7"] == "Low cost"
+    assert tiers["swe-2-high-lightning"] == "High cost"
+    assert tiers["adaptive"] == "unknown"  # the absent tier
+    # an empty variants list is well-shaped (nothing to gate on)
+    assert r.parse_models_list({"families": [{"variants": []}]}) == {}
+
+
+def test_gate_live_shape_against_mock_devin():
+    """The gate against the *real* WP2 fixture (the ``mock_devin
+    models list --format json`` subprocess) — the shape the WP0
+    capture recorded, end to end, zero quota: a Free model passes, a
+    paid one is refused with its tier in the reason, and the shape
+    validator accepts the live fixture (no shape change)."""
+    out = subprocess.run(
+        [sys.executable, MOCK_PATH, "models", "list", "--format", "json"],
+        capture_output=True, timeout=30)
+    assert out.returncode == 0
+    models_json = json.loads(out.stdout.decode())
+    assert r.gate_cost_tier(models_json, "swe-2-high").allowed
+    g = r.gate_cost_tier(models_json, "swe-1-7")
+    assert not g.allowed
+    assert "Low cost" in g.reason
+    tiers = r.parse_models_list(models_json)
+    assert "swe-2-max" in tiers
+    assert "claude-opus-4-6" in tiers
+    assert tiers["adaptive"] == "unknown"
+
+
+def _make_wrapper(tmp_path, target, name="fakebin") -> str:
+    """A bash wrapper that execs ``target "$@"`` — the devin_bin seam
+    (the mock is a .py script; a single-string binary can't carry an
+    interpreter)."""
+    d = tmp_path / "bin"
+    d.mkdir(exist_ok=True)
+    w = d / name
+    w.write_text(f"#!/bin/bash\nexec {target} \"$@\"\n")
+    w.chmod(0o755)
+    return str(w)
+
+
+def test_fetch_models_list_via_mock_devin(tmp_path):
+    w = _make_wrapper(tmp_path, f"\"{sys.executable}\" \"{MOCK_PATH}\"")
+    models_json = r.fetch_models_list(w)
+    assert isinstance(models_json, dict)
+    assert r.gate_cost_tier(models_json, "swe-2-high").allowed
+    assert not r.gate_cost_tier(models_json, "swe-1-7").allowed
+
+
+def test_fetch_models_list_fail_closed(tmp_path):
+    bad = tmp_path / "baddevin"
+    bad.write_text("#!/bin/bash\necho 'quota error' >&2\nexit 1\n")
+    bad.chmod(0o755)
+    with pytest.raises(r.ModelGateError, match="fail-closed"):
+        r.fetch_models_list(str(bad))
+    badjson = tmp_path / "badjson"
+    badjson.write_text("#!/bin/bash\necho 'not json'\nexit 0\n")
+    badjson.chmod(0o755)
+    with pytest.raises(r.ModelGateError, match="fail-closed"):
+        r.fetch_models_list(str(badjson))
+    with pytest.raises(r.ModelGateError, match="fail-closed"):
+        r.fetch_models_list(str(tmp_path / "nope-bin"))  # unrunnable
+    # a hung binary (timeout) is a refusal too
+    with pytest.raises(r.ModelGateError, match="fail-closed"):
+        r.fetch_models_list(str(bad), timeout_s=0.000001)
+
+
+# ---------------------------------------------------------------------------
+# WP3b (issue #15) — the zero-quota pre-flight (PLAN §2.7)
+# ---------------------------------------------------------------------------
+
+
+class _CheckSpy:
+    """A stub leg that records its calls and optionally fails (the
+    issue #15 "pre-flight stub-failure tests" lever)."""
+
+    def __init__(self, fail=None) -> None:
+        self.fail = fail
+        self.called = 0
+
+    def __call__(self) -> None:
+        self.called += 1
+        if self.fail is not None:
+            raise self.fail
+
+
+def test_preflight_checks_all_ok():
+    r.run_preflight_checks([("auth", _CheckSpy()), ("disk", _CheckSpy())])
+
+
+def test_preflight_checks_short_circuit_at_first_failure():
+    docker = _CheckSpy()
+    disk = _CheckSpy()
+    with pytest.raises(r.PreflightFailed, match="auth"):
+        r.run_preflight_checks([
+            ("auth", _CheckSpy(fail=r.PreflightFailed("auth",
+                                                    "not logged in"))),
+            ("docker_daemon", docker),
+            ("disk", disk),
+        ])
+    assert docker.called == 0 and disk.called == 0  # no later legs
+
+
+def test_preflight_checks_wraps_foreign_exceptions():
+    def boom() -> None:
+        raise OSError("boom")
+    with pytest.raises(r.PreflightFailed) as exc:
+        r.run_preflight_checks([("docker_daemon", boom)])
+    assert exc.value.check == "docker_daemon"
+    assert "OSError" in exc.value.detail
+
+
+def _fake_run(fail_sub, code, seen, raise_exc=None):
+    """A stub subprocess: records the joined command, fails on
+    ``fail_sub`` (a substring) with ``raise_exc`` (a hung leg) or a
+    non-zero exit, else exits 0."""
+    def run(cmd, timeout_s):
+        s = " ".join(cmd)
+        seen.append(s)
+        if fail_sub and fail_sub in s:
+            if raise_exc is not None:
+                raise raise_exc
+            return types.SimpleNamespace(returncode=code, stdout=b"",
+                                        stderr=b"detail-boom")
+        return types.SimpleNamespace(returncode=0, stdout=b"",
+                                    stderr=b"")
+    return run
+
+
+def _ok_disk() -> "types.SimpleNamespace":
+    return types.SimpleNamespace(free=10**9)
+
+
+def test_preflight_all_ok_with_stubs():
+    seen = []
+    pf = r.Preflight("FAKEDEVIN", "FAKEDOCKER", disk_path="/",
+                    largest_image_bytes=1024,
+                    run=_fake_run(None, 1, seen),
+                    disk_usage_fn=lambda p: _ok_disk())
+    pf(None)  # the batch phase (no image leg)
+    pf("swe-bench__x-1")  # the per-instance phase (the image leg)
+    assert len(seen) == 5  # 2 (batch: no image leg) + 3 (instance) — the
+                          # disk leg uses disk_usage_fn, not run
+    assert any("FAKEDEVIN auth status" in s for s in seen)
+    assert any("FAKEDOCKER info" in s for s in seen)
+    assert any("FAKEDOCKER image inspect swebench/sweb.eval.x86_64."
+               "swe-bench_1776_x-1" in s for s in seen)  # the WP0 pin
+
+
+def test_preflight_stub_failure_legs():
+    """The stub-failure matrix: each leg fails in turn (in the
+    short-circuit order auth → docker_daemon → docker_image → disk);
+    the failed leg is named in the exception and its detail carries
+    the stub's stderr tail."""
+    # (1) the auth failure — the daemon leg never runs
+    seen = []
+    pf = r.Preflight("FAKEDEVIN", "FAKEDOCKER", disk_path="/",
+                    largest_image_bytes=1024,
+                    run=_fake_run("auth status", 1, seen),
+                    disk_usage_fn=lambda p: _ok_disk())
+    with pytest.raises(r.PreflightFailed) as exc:
+        pf(None)
+    assert exc.value.check == "auth"
+    assert "detail-boom" in exc.value.detail
+    assert len(seen) == 1
+    # (2) the daemon failure — auth ran, the image leg never does
+    seen = []
+    pf = r.Preflight("FAKEDEVIN", "FAKEDOCKER", disk_path="/",
+                    largest_image_bytes=1024,
+                    run=_fake_run("FAKEDOCKER info", 1, seen),
+                    disk_usage_fn=lambda p: _ok_disk())
+    with pytest.raises(r.PreflightFailed) as exc:
+        pf("inst-1")
+    assert exc.value.check == "docker_daemon"
+    assert len(seen) == 2
+    # (3) the image failure (per instance only)
+    seen = []
+    pf = r.Preflight("FAKEDEVIN", "FAKEDOCKER", disk_path="/",
+                    largest_image_bytes=1024,
+                    run=_fake_run("inspect", 1, seen),
+                    disk_usage_fn=lambda p: _ok_disk())
+    with pytest.raises(r.PreflightFailed) as exc:
+        pf("inst-1")
+    assert exc.value.check == "docker_image"
+    assert "detail-boom" in exc.value.detail
+    assert len(seen) == 3
+    # the batch phase (None) skips the image leg: no failure there
+    seen = []
+    pf = r.Preflight("FAKEDEVIN", "FAKEDOCKER", disk_path="/",
+                    largest_image_bytes=1024,
+                    run=_fake_run("inspect", 1, seen),
+                    disk_usage_fn=lambda p: _ok_disk())
+    pf(None)
+    assert len(seen) == 2
+    # (4) the disk failure (free < 2 × largest expected image)
+    pf = r.Preflight("FAKEDEVIN", "FAKEDOCKER", disk_path="/",
+                    largest_image_bytes=1024,
+                    run=_fake_run(None, 1, []),
+                    disk_usage_fn=lambda p: types.SimpleNamespace(free=100))
+    with pytest.raises(r.PreflightFailed) as exc:
+        pf("inst-1")
+    assert exc.value.check == "disk"
+    # (5) the disk boundary: free == 2 × largest passes (≥, inclusive)
+    pf = r.Preflight("FAKEDEVIN", "FAKEDOCKER", disk_path="/",
+                    largest_image_bytes=1024,
+                    run=_fake_run(None, 1, []),
+                    disk_usage_fn=lambda p:
+                    types.SimpleNamespace(free=2 * 1024))
+    pf("inst-1")
+
+
+def test_preflight_hung_daemon_is_a_failure():
+    """The daemon must be *responsive*: a hung ``docker info`` (a
+    timeout) is a failure, not a wait (bounded by ``timeout_s``)."""
+    seen = []
+    pf = r.Preflight("FAKEDEVIN", "FAKEDOCKER", disk_path="/",
+                    largest_image_bytes=1024,
+                    run=_fake_run("FAKEDOCKER info", 1, seen,
+                                 raise_exc=TimeoutError("daemon hung")),
+                    disk_usage_fn=lambda p: _ok_disk())
+    with pytest.raises(r.PreflightFailed) as exc:
+        pf(None)
+    assert exc.value.check == "docker_daemon"
+
+
+def test_preflight_config_validation():
+    with pytest.raises(r.RunnerConfigError):
+        r.Preflight(largest_image_bytes=0)
+    with pytest.raises(r.RunnerConfigError):
+        r.Preflight(largest_image_bytes=True)  # bool refused uniformly
+    with pytest.raises(r.RunnerConfigError):
+        r.Preflight(largest_image_bytes=1, timeout_s=0)
+    with pytest.raises(r.RunnerConfigError):
+        r.Preflight(largest_image_bytes=1, timeout_s=True)
+
+
+def test_preflight_batch_failure_aborts_before_any_session():
+    """AC4 (the batch phase): a failed pre-flight before the first
+    instance → no session ever starts (the factory is never called,
+    the registry never goes live), the reason is recorded as a
+    ``preflight_failed`` line (``instance_id: None`` — the batch
+    marker), the run ends ``aborted`` (an infra failure is not a
+    quota window — no sleep-to-window), and ``run_finished`` still
+    fires (a clean, reported end)."""
+    e = Env()
+
+    def pf(inst):
+        raise r.PreflightFailed("auth", "not logged in")
+
+    runner = e.make(["i0", "i1"],
+                   {"i0": "resolved", "i1": "resolved"},
+                   preflight=pf)
+    result = runner.run()
+    assert result.final_state == "aborted"
+    assert "preflight_failed (batch)" in result.aborted_reason
+    assert e.calls == []  # no session was ever started
+    assert e.registry.max == 0
+    assert result.results == []  # the marker is not an instance result
+    assert chain(result) == [("running", r.EVENT_ABORT, "aborted")]
+    assert "sleep" not in [ev[0] for ev in e.reporter.events]
+    marks = [ev for ev in e.reporter.events
+            if ev[0] == "instance" and ev[1] is None]
+    assert len(marks) == 1
+    assert marks[0][2] == "preflight_failed"
+    assert "not logged in" in marks[0][3]["reason"]
+    assert marks[0][3]["phase"] == "batch"
+    fins = [ev for ev in e.reporter.events
+           if ev[0] == "run_finished"]
+    assert fins == [("run_finished", "aborted")]
+
+
+def test_preflight_instance_failure_marks_releases_claim_aborts():
+    """AC4 (the per-instance phase): i0 runs, i1's pre-flight fails →
+    i1 is marked ``preflight_failed`` (the reason + phase in the
+    meta), its budget claim is released (no session was ever started),
+    i2 never starts, and the run ends ``aborted`` with no sleep."""
+    e = Env()
+
+    def pf(inst):
+        if inst == "i1":
+            raise r.PreflightFailed(
+                "docker_image", "image sweb.eval.x86_64.i1 not present")
+
+    runner = e.make(["i0", "i1", "i2"],
+                   {"i0": "resolved", "i1": "resolved",
+                    "i2": "resolved"},
+                   preflight=pf)
+    result = runner.run()
+    assert result.final_state == "aborted"
+    assert [i for i, _ in result.results] == ["i0", "i1"]
+    assert [s for _, s in result.results] == ["resolved",
+                                            "preflight_failed"]
+    assert [c for c, _ in e.calls] == ["i0"]  # i1's pre-flight failed
+    # before its session was ever built; i2 never starts
+    marks = [ev for ev in e.reporter.events
+            if ev[0] == "instance" and ev[1] == "i1"]
+    assert len(marks) == 1
+    assert marks[0][3]["phase"] == "instance"
+    assert "not present" in marks[0][3]["reason"]
+    # i1's claim released — only i0's session stands
+    assert runner.budget.sessions_used == 1
+    assert chain(result) == [("running", r.EVENT_ABORT, "aborted")]
+    assert "sleep" not in [ev[0] for ev in e.reporter.events]
+
+
+def test_preflight_batch_reruns_each_window():
+    """AC4 ("before every batch"): a new quota window is a new batch —
+    the batch pre-flight (None) re-runs on the resume; the
+    per-instance leg (each id) runs before every session."""
+    e = Env()
+    calls = []
+
+    def pf(inst):
+        calls.append(inst)
+
+    runner = e.make(["i0", "i1"],
+                   {"i0": "resolved", "i1": "resolved"},
+                   preflight=pf,
+                   config=r.BudgetConfig(max_sessions_per_day=1))
+    result = runner.run()
+    assert result.final_state == "done"
+    assert result.backoffs == 1
+    # window 1: batch(None) + i0; window 2 (after the reset): batch(None)
+    # + i1
+    assert calls == [None, "i0", None, "i1"]
+
+
+def test_preflight_failure_is_retry_eligible_on_resume():
+    """AC2: ``preflight_failed`` is a retry-class state (an infra
+    state that burned no session — the re-run is free; the check
+    re-runs before every batch and every instance on resume)."""
+    recs = [{"instance_id": "i0", "status": "preflight_failed",
+             "meta": {}, "ts": 1.0}]
+    to_run, skipped = r.resume_queue(["i0", "i1"], recs)
+    assert to_run == ["i0", "i1"]
+    assert skipped == {}
+
+
+def test_preflight_failure_resume_cycle(tmp_path):
+    """The infra-blip story: run 1's *batch* pre-flight fails (the
+    daemon is down) → the file has only the batch marker (no session
+    ran — nothing burned); the resume re-runs *both* instances; run 2
+    (the infra is fixed — no pre-flight hook) completes; a resume
+    after run 2 re-runs nothing."""
+    p = str(tmp_path / "run-1.jsonl")
+    e = Env()
+    ckpt = r.JsonlCheckpoint(p, clock=e.clock)
+
+    def pf(inst):
+        raise r.PreflightFailed("docker_daemon", "daemon down")
+
+    runner = e.make(["i0", "i1"],
+                   {"i0": "resolved", "i1": "resolved"},
+                   reporter=ckpt, preflight=pf)
+    result = runner.run()
+    ckpt.close()
+    assert result.final_state == "aborted"
+    assert e.calls == []  # nothing burned
+    records, dropped = r.load_checkpoint(p)
+    assert dropped is False
+    assert [rec["instance_id"] for rec in records] == [None]
+    to_run, skipped = r.resume_queue(["i0", "i1"], records)
+    assert to_run == ["i0", "i1"]  # both re-run — the marker consumes
+    assert skipped == {}           # no queue slot
+    # run 2 (the infra is fixed — no pre-flight hook)
+    e2 = Env()
+    ckpt2 = r.JsonlCheckpoint(p, clock=e2.clock)
+    r2 = e2.make(to_run, {"i0": "resolved", "i1": "resolved"},
+                 reporter=ckpt2)
+    assert r2.run().final_state == "done"
+    ckpt2.close()
+    recs2, _ = r.load_checkpoint(p)
+    assert [rec["instance_id"] for rec in recs2] == [None, "i0", "i1"]
+    to_run3, _ = r.resume_queue(["i0", "i1"], recs2)
+    assert to_run3 == []
+
+
+# ---------------------------------------------------------------------------
+# WP3b (issue #15) — the CLI startup model gate
+# ---------------------------------------------------------------------------
+
+
+def _write_json(tmp_path, obj, name="models.json") -> str:
+    p = tmp_path / name
+    p.write_text(json.dumps(obj))
+    return str(p)
+
+
+def test_cli_gate_free_model_passes(tmp_path, capsys):
+    p = _write_json(tmp_path, _gate_fixture())
+    assert r.main(["--model", "swe-2-high", "--models-json", p]) == 0
+    out = capsys.readouterr().out
+    assert "model gate: swe-2-high = Free" in out
+    assert "swe-2-high, swe-2-max, swe-2-medium" in out
+
+
+def test_cli_gate_paid_model_refused(tmp_path, capsys):
+    p = _write_json(tmp_path, _gate_fixture())
+    assert r.main(["--model", "swe-1-7", "--models-json", p]) == 2
+    err = capsys.readouterr().err
+    assert "refused" in err and "swe-1-7" in err
+
+
+def test_cli_gate_shape_change_refused(tmp_path, capsys):
+    p = tmp_path / "bad.json"
+    p.write_text('{"families": "nope"}')
+    assert r.main(["--model", "swe-2-high", "--models-json", str(p)]) == 2
+    err = capsys.readouterr().err
+    assert "shape change" in err
+
+
+def test_cli_gate_paid_override(tmp_path, capsys):
+    p = _write_json(tmp_path, _gate_fixture())
+    assert r.main(["--model", "swe-1-7", "--allow-paid",
+                   "--token-budget", "1000", "--models-json", p]) == 0
+    out = capsys.readouterr().out
+    assert "model gate: swe-1-7 = Low cost" in out
+    assert "paid override" in out
+
+
+def test_cli_gate_paid_override_without_budget(tmp_path, capsys):
+    p = _write_json(tmp_path, _gate_fixture())
+    assert r.main(["--model", "swe-1-7", "--allow-paid",
+                   "--models-json", p]) == 2
+    assert "token budget" in capsys.readouterr().err
+
+
+def test_cli_gate_live_devin_bin(tmp_path, capsys):
+    """The live path: --devin-bin points at the WP2 mock (which
+    speaks `models list --format json`) — the gate runs the real
+    subprocess, zero quota."""
+    w = _make_wrapper(tmp_path, f"\"{sys.executable}\" \"{MOCK_PATH}\"")
+    assert r.main(["--model", "swe-2-high", "--devin-bin", w]) == 0
+    assert r.main(["--model", "swe-1-7", "--devin-bin", w]) == 2
+
+
+# ---------------------------------------------------------------------------
+# WP3b review round 1 (PR #30) — review-finding regressions
+# ---------------------------------------------------------------------------
+
+
+def test_checkpoint_resume_torn_tail_repaired(tmp_path):
+    """Review round 1 [blocker]: a resumed run must not append onto the
+    torn tail. The file has a complete line + a torn fragment (no
+    newline); the fresh :class:`~runner.JsonlCheckpoint` (the resume
+    writer) truncates the fragment on open, so two appended records
+    are clean *mid-file* lines on the next load (no
+    ``RunnerProtocolError``), and the resume decision respected the
+    torn ``quota_limited`` drop (i1 re-ran — exactly once)."""
+    p = str(tmp_path / "run-1.jsonl")
+    with open(p, "w", encoding="utf-8") as f:
+        f.write('{"instance_id": "i0", "status": "resolved", "meta": {}, "ts": 1.0}\n')
+        f.write('{"instance_id": "i1", "status": "quota_lim')  # the torn tail
+    # the resume decision (the reader half)
+    records, dropped = r.load_checkpoint(p)
+    assert dropped is True
+    assert [rec["instance_id"] for rec in records] == ["i0"]
+    to_run, skipped = r.resume_queue(["i0", "i1", "i2"], records)
+    assert to_run == ["i1", "i2"]
+    # the writer half: open (repair), append two records, close
+    e = Env()
+    ckpt = r.JsonlCheckpoint(p, clock=e.clock)
+    r.Runner(to_run, lambda inst: FakeSession(e.registry,
+                                             "resolved" if inst == "i2"
+                                             else "no_patch",
+                                             clock=e.clock),
+             clock=e.clock, sleeper=e.sleeper, reporter=ckpt).run()
+    ckpt.close()
+    # the next load is clean — no glued mid-file line, nothing dropped
+    recs2, dropped2 = r.load_checkpoint(p)
+    assert dropped2 is False
+    assert [(rec["instance_id"], rec["status"]) for rec in recs2] == [
+        ("i0", "resolved"), ("i1", "no_patch"), ("i2", "resolved")]
+    # and a resume after the resumed run re-runs nothing
+    to_run3, _ = r.resume_queue(["i0", "i1", "i2"], recs2)
+    assert to_run3 == []
+
+
+def test_checkpoint_resume_torn_tail_complete_json_no_newline(tmp_path):
+    """Review round 1 [blocker], the second shape: a kill after the
+    JSON is complete but before the ``"\\n"`` — the record is
+    *complete* (the reader keeps it) and the writer must complete it
+    (newline) rather than truncate it, so the appended record is a
+    clean line and the completed record is not silently lost (a lost
+    ``resolved`` record would re-run a finished instance — a pass@1
+    violation)."""
+    p = str(tmp_path / "run-1.jsonl")
+    with open(p, "w", encoding="utf-8") as f:
+        f.write('{"instance_id": "i0", "status": "resolved", "meta": {}, "ts": 1.0}\n')
+        f.write('{"instance_id": "i1", "status": "resolved", "meta": {}, "ts": 2.0}')
+    # the reader half keeps the complete (un-newlined) record
+    records, dropped = r.load_checkpoint(p)
+    assert dropped is False
+    assert [rec["instance_id"] for rec in records] == ["i0", "i1"]
+    to_run, _ = r.resume_queue(["i0", "i1", "i2"], records)
+    assert to_run == ["i2"]  # both resolved records stand — no re-run
+    # the writer half completes the record instead of truncating it
+    e = Env()
+    ckpt = r.JsonlCheckpoint(p, clock=e.clock)
+    r.Runner(["i2"], lambda inst: FakeSession(e.registry, "resolved",
+                                             clock=e.clock),
+             clock=e.clock, sleeper=e.sleeper, reporter=ckpt).run()
+    ckpt.close()
+    recs2, dropped2 = r.load_checkpoint(p)
+    assert dropped2 is False
+    assert [rec["instance_id"] for rec in recs2] == ["i0", "i1", "i2"]
+    assert [rec["status"] for rec in recs2] == ["resolved"] * 3
+    # the raw file is clean: three newline-terminated lines, no glue
+    raw = open(p, encoding="utf-8").read()
+    assert raw.endswith("\n") and raw.count("\n") == 3
+
+
+def test_checkpoint_resume_mid_file_corruption_refuses_repair(tmp_path):
+    """The repair is fail-loud like the reader: a mid-file corruption
+    (fsync'd — not a kill artifact) refuses the open, not a silent
+    truncation."""
+    p = str(tmp_path / "run-1.jsonl")
+    with open(p, "w", encoding="utf-8") as f:
+        f.write('{"instance_id": "i0", "status": "resolved", "meta": {}, "ts": 1.0}\n')
+        f.write("GARBAGE-NOT-JSON\n")
+        f.write('{"instance_id": "i2", "status": "timeout", "meta": {}, "ts": 3.0}\n')
+    with pytest.raises(r.RunnerProtocolError):
+        r.JsonlCheckpoint(p)
+
+
+def test_resume_queue_non_dict_record_is_typed():
+    """A non-dict record (a direct-API caller with a malformed list) is
+    a typed contract error, not a bare AttributeError."""
+    with pytest.raises(r.RunnerProtocolError, match="not a dict"):
+        r.resume_queue(["i0"], ["not-a-dict"])
+
+
+def test_gate_inf_token_budget_refused():
+    """The paid override's token budget must be finite: ``inf`` is not
+    a budget (an unbounded token budget is not a budget)."""
+    fx = _gate_fixture()
+    for bad in (float("inf"), float("nan")):
+        g = r.gate_cost_tier(fx, "swe-1-7", allow_paid=True,
+                            token_budget=bad)
+        assert not g.allowed, bad
+        assert "token budget" in g.reason
+    # a large (but finite) int budget is still valid
+    g = r.gate_cost_tier(fx, "swe-1-7", allow_paid=True,
+                         token_budget=10**12)
+    assert g.allowed
+
+
+def test_fetch_models_list_none_stdout_fail_closed(tmp_path):
+    """A stubbed ``run`` returning ``stdout=None`` (a non-str/bytes
+    seam value) is a fail-closed refusal, not a traceback. The stub
+    signature matches the call convention (``capture_output=`` /
+    ``timeout=`` as keywords — the round-3 finding: a positional
+    ``run(cmd, timeout_s)`` raised TypeError on the call itself, which
+    the outer wrap swallowed, and the test never reached the ``stdout``
+    handling it claimed to pin); ``match="not valid JSON"`` pins the
+    stdout path specifically."""
+    def run(cmd, capture_output=None, timeout=None):
+        return types.SimpleNamespace(returncode=0, stdout=None,
+                                    stderr=b"")
+    with pytest.raises(r.ModelGateError, match="not valid JSON"):
+        r.fetch_models_list("whatever", run=run)
+
+
+def test_cli_gate_flags_without_model_refused(capsys):
+    """The gate flags are inert without --model — the CLI refuses them
+    there (an explicit contract: a silent no-op that "validated"
+    nothing is a footgun)."""
+    for flags in (["--allow-paid"], ["--token-budget", "1000"],
+                 ["--devin-bin", "somedevin"]):
+        assert r.main(flags) == 2, flags
+        assert "--model" in capsys.readouterr().err
+    # --models-json alone is refused too (it names the gate's input)
+    assert r.main(["--models-json", "x.json"]) == 2
+
+
+def test_next_quota_window_wall_clock_alignment():
+    """The Runner's default clock is wall time (``time.time``): the
+    backoff target is a true UTC midnight in epoch seconds (review
+    finding — the WP3a default ``time.monotonic`` would align the
+    sleep to a boot-dependent phase, up to ~24 h off the real quota
+    reset; WP3b's per-window pre-flight makes the alignment
+    load-bearing)."""
+    import inspect
+    import time as _t
+    now = _t.time()
+    w = r.next_quota_window(now)
+    assert w > now and w % 86400 == 0 and w - now < 86400
+    sig = inspect.signature(r.Runner.__init__)
+    assert sig.parameters["clock"].default is _t.time
+
+
+def test_preflight_wall_excluded_from_session_wall():
+    """The *session* wall (the budget ``record_wall`` charge) excludes
+    the zero-quota pre-flight time (a pre-flight consumes no session
+    quota); the pre-flight wall is recorded in the failure mark's meta
+    only."""
+    e = Env()
+
+    def pf(inst):
+        e.clock.advance(5.0)  # the pre-flight consumes 5 s of wall
+
+    runner = e.make(["i0"], {"i0": "resolved"}, preflight=pf,
+                   factory=lambda inst: FakeSession(
+                       e.registry, "resolved", clock=e.clock, hold_s=2.0))
+    runner.run()
+    ev = [ev for ev in e.reporter.events if ev[0] == "instance"][0]
+    assert ev[3]["wall_s"] == 2.0  # the session wall, not 2.0 + 5.0
+    assert runner.budget.wall_used_s == 2.0
+
+
+# ---------------------------------------------------------------------------
+# WP3b review round 2 (PR #30, commit ab6a436) — review-finding regressions
+# ---------------------------------------------------------------------------
+
+
+def test_checkpoint_resume_newline_terminated_non_record_last_line_repaired(tmp_path):
+    """Review round 2 [minor]: a newline-terminated *non-record* last
+    line (the reader's contract blesses it as a droppable torn tail —
+    test-pinned by ``test_load_checkpoint_last_line_wrong_shape_dropped``)
+    must also be removed by the *write-side* repair, or the first
+    appended record glues it into a mid-file line →
+    ``RunnerProtocolError`` on the next load (the round-1 blocker's
+    failure signature, new input class)."""
+    p = str(tmp_path / "run-1.jsonl")
+    with open(p, "w", encoding="utf-8") as f:
+        f.write('{"instance_id": "i0", "status": "resolved", "meta": {}, "ts": 1.0}\n')
+        f.write("GARBAGE-NOT-JSON\n")  # newline-terminated non-record last line
+    # the reader half drops it
+    records, dropped = r.load_checkpoint(p)
+    assert dropped is True
+    assert [rec["instance_id"] for rec in records] == ["i0"]
+    # the writer half truncates it (no early return on the trailing \n)
+    e = Env()
+    ckpt = r.JsonlCheckpoint(p, clock=e.clock)
+    r.Runner(["i1"], lambda inst: FakeSession(e.registry, "resolved",
+                                             clock=e.clock),
+             clock=e.clock, sleeper=e.sleeper, reporter=ckpt).run()
+    ckpt.close()
+    # the next load is clean — the glued line did not happen
+    recs2, dropped2 = r.load_checkpoint(p)
+    assert dropped2 is False
+    assert [(rec["instance_id"], rec["status"]) for rec in recs2] == [
+        ("i0", "resolved"), ("i1", "resolved")]
+    # the raw file is clean: two newline-terminated lines, no garbage
+    raw = open(p, encoding="utf-8").read()
+    assert "GARBAGE" not in raw and raw.count("\n") == 2
+
+
+def test_checkpoint_resume_blank_last_line_repaired(tmp_path):
+    """A trailing blank line (newline-terminated empty last line) is
+    dropped by the reader and truncated by the repair — the appended
+    record must not glue onto it either."""
+    p = str(tmp_path / "run-1.jsonl")
+    with open(p, "w", encoding="utf-8") as f:
+        f.write('{"instance_id": "i0", "status": "resolved", "meta": {}, "ts": 1.0}\n')
+        f.write("\n")  # a trailing blank line
+    records, dropped = r.load_checkpoint(p)
+    assert [rec["instance_id"] for rec in records] == ["i0"]
+    e = Env()
+    ckpt = r.JsonlCheckpoint(p, clock=e.clock)
+    r.Runner(["i1"], lambda inst: FakeSession(e.registry, "resolved",
+                                             clock=e.clock),
+             clock=e.clock, sleeper=e.sleeper, reporter=ckpt).run()
+    ckpt.close()
+    recs2, dropped2 = r.load_checkpoint(p)
+    assert dropped2 is False
+    assert [rec["instance_id"] for rec in recs2] == ["i0", "i1"]
+
+
+def test_fetch_models_list_missing_stdout_attr_fail_closed():
+    """A stubbed ``run`` returning an object *without* a ``stdout``
+    attribute is a fail-closed typed refusal (the round-2 finding — a
+    leaked AttributeError would traceback in ``main()`` instead of
+    exiting 2). The stub signature matches the call convention (the
+    round-3 fix — see the sibling test); ``match="not valid JSON"``
+    pins the ``getattr(proc, 'stdout', None)`` path specifically."""
+    def run(cmd, capture_output=None, timeout=None):
+        return types.SimpleNamespace(returncode=0)  # no .stdout / .stderr
+    with pytest.raises(r.ModelGateError, match="not valid JSON"):
+        r.fetch_models_list("whatever", run=run)
+
+
+def test_cli_models_json_and_devin_bin_mutually_exclusive(capsys):
+    """The gate's input is the file OR the live binary — the
+    combination is refused (``--models-json`` would silently win; a
+    silently inert ``--devin-bin`` is the same footgun class as the
+    flags-without-``--model`` refusal)."""
+    assert r.main(["--model", "swe-1-7", "--models-json", "x.json",
+                  "--devin-bin", "somedevin"]) == 2
+    assert "mutually exclusive" in capsys.readouterr().err
+
+
+def test_wall_clock_step_back_clamps_to_zero():
+    """A backward wall-clock step (NTP / VM snapshot) never records a
+    negative wall: the measurement sites clamp to 0.0 (a negative
+    ``wall_s`` would be subtracted from the budget's ``wall_used_s``).
+    A negative ``hold_s`` simulates the step."""
+    e = Env()
+    runner = e.make(["i0"], {"i0": "resolved"},
+                   factory=lambda inst: FakeSession(e.registry,
+                                                  "resolved",
+                                                  clock=e.clock,
+                                                  hold_s=-10.0))
+    runner.run()
+    ev = [ev for ev in e.reporter.events if ev[0] == "instance"][0]
+    assert ev[3]["wall_s"] == 0.0  # clamped
+    assert runner.budget.wall_used_s == 0.0  # nothing subtracted
+
+
+# ---------------------------------------------------------------------------
+# WP3b review round 3 (PR #30, commit 604890b) — review-finding regressions
+# ---------------------------------------------------------------------------
+
+
+def test_checkpoint_resume_non_ascii_prefix_byte_boundary(tmp_path):
+    """Review round 3 [minor]: the repair's ``boundary`` is a *character*
+    offset (text-mode read) while ``f.truncate`` takes *bytes* — with a
+    non-ASCII record in the preserved prefix (the reader's contract
+    accepts literal non-ASCII records; the writer's own records are
+    ASCII via ``ensure_ascii``), truncating at the character offset
+    cuts *inside* the last clean record, which the next open drops →
+    a finished instance re-runs (the pass@1 violation this code exists
+    to prevent)."""
+    p = str(tmp_path / "run-1.jsonl")
+    # Literal (non-escaped) CJK in the file: 3 chars = 9 bytes, so the
+    # character and byte offsets of the prefix differ by 6 — the exact
+    # shape the old ``f.truncate(boundary)`` corrupted.
+    rec0 = ('{"instance_id": "i0", "status": "resolved", '
+           '"meta": {"reason": "\u65e5\u672c\u8a9e"}, "ts": 1.0}')
+    with open(p, "wb") as f:
+        f.write(rec0.encode("utf-8") + b"\n")
+        f.write(b'{"instance_id": "i1", "status": "quota_lim')  # the torn tail
+    # the reader half drops the torn tail (the CJK record stands)
+    records, dropped = r.load_checkpoint(p)
+    assert dropped is True
+    assert [rec["instance_id"] for rec in records] == ["i0"]
+    # the writer half must preserve the CJK record byte-for-byte
+    e = Env()
+    ckpt = r.JsonlCheckpoint(p, clock=e.clock)
+    r.Runner(["i1"], lambda inst: FakeSession(e.registry, "resolved",
+                                             clock=e.clock),
+             clock=e.clock, sleeper=e.sleeper, reporter=ckpt).run()
+    ckpt.close()
+    # the next load is clean — the last clean record was not torn
+    recs2, dropped2 = r.load_checkpoint(p)
+    assert dropped2 is False
+    assert [rec["instance_id"] for rec in recs2] == ["i0", "i1"]
+    assert recs2[0]["meta"]["reason"] == "日本語"
+    raw = open(p, "rb").read()
+    assert rec0.encode("utf-8") + b"\n" in raw  # intact, byte-for-byte
+
+
+def test_checkpoint_resume_torn_tail_mid_multibyte_sequence_dropped(tmp_path):
+    """A foreign torn tail ending mid-multibyte-sequence is a
+    droppable tail, not a bare UnicodeDecodeError: the reader's strict
+    per-line decode fails on the torn last line (the historical
+    round-3 bug was that a whole-file ``errors="replace"`` decode
+    masked it; f5eca02 moved the drop to the strict-decode torn-tail
+    branch — ``UnicodeDecodeError`` on the last line → dropped) and
+    the repair truncates it byte-exactly."""
+    p = str(tmp_path / "run-1.jsonl")
+    with open(p, "wb") as f:
+        f.write(b'{"instance_id": "i0", "status": "resolved", "meta": {}, "ts": 1.0}\n')
+        f.write(b'{"instance_id": "i1", "status": "quo')
+        f.write(b"\xe6\x97")  # the first 2 bytes of a 3-byte CJK char — torn
+    records, dropped = r.load_checkpoint(p)  # no UnicodeDecodeError
+    assert dropped is True
+    assert [rec["instance_id"] for rec in records] == ["i0"]
+    e = Env()
+    ckpt = r.JsonlCheckpoint(p, clock=e.clock)
+    r.Runner(["i1"], lambda inst: FakeSession(e.registry, "resolved",
+                                             clock=e.clock),
+             clock=e.clock, sleeper=e.sleeper, reporter=ckpt).run()
+    ckpt.close()
+    recs2, dropped2 = r.load_checkpoint(p)
+    assert dropped2 is False
+    assert [rec["instance_id"] for rec in recs2] == ["i0", "i1"]
+
+
+def test_fetch_models_list_missing_returncode_fail_closed():
+    """A stubbed ``run`` returning an object without a ``returncode``
+    attribute is a fail-closed typed refusal (the round-3 finding — a
+    bare ``proc.returncode`` in the f-string is the same leak class
+    round 2 fixed for ``stdout``): ``rc`` defaults to 1 (unverified —
+    fail-closed) and the message uses it, not a leaked AttributeError."""
+    def run(cmd, capture_output=None, timeout=None):
+        return types.SimpleNamespace(stdout="[]")  # no .returncode / .stderr
+    with pytest.raises(r.ModelGateError, match="fail-closed.*1"):
+        r.fetch_models_list("whatever", run=run)
+
+
+# ---------------------------------------------------------------------------
+# WP3b review round 4 (PR #30, commit 99de3bf) — review-finding regressions
+# ---------------------------------------------------------------------------
+
+
+def test_preflight_default_image_for_matches_wp0_pin():
+    """The shipped default ``image_for`` matches the project's own WP0
+    pin (README: ``swebench/sweb.eval.x86_64.<owner>_1776_<repo>-<PR>:
+    latest``) — the ``swebench/`` namespace and the Docker-Hub escape
+    of ``__`` (→ ``_1776_``) — or ``docker image inspect`` resolves to
+    ``docker.io/library/sweb.eval.…`` and the leg fails on every
+    instance (the round-4 finding)."""
+    seen = []
+    pf = r.Preflight("FAKEDEVIN", "FAKEDOCKER", disk_path="/",
+                    largest_image_bytes=1024,
+                    run=_fake_run(None, 0, seen),
+                    disk_usage_fn=lambda p: _ok_disk())
+    pf("django__django-12345")
+    inspect_cmds = [s for s in seen if "image inspect" in s]
+    assert len(inspect_cmds) == 1
+    assert inspect_cmds[0] == (
+        "FAKEDOCKER image inspect "
+        "swebench/sweb.eval.x86_64.django_1776_django-12345"
+    ), inspect_cmds
+
+
+def test_checkpoint_resume_mid_file_invalid_utf8_in_string_is_typed(tmp_path):
+    """Review round 4 [minor]: an invalid UTF-8 byte *inside a string
+    field of a mid-file (fsync'd) line* must fail loud with a typed
+    error — the round-3 ``errors="replace"`` decode masked it as a
+    U+FFFD character, a valid-but-unknown record the resume logic
+    treats as stale → the finished instance silently re-runs (a
+    pass@1 violation where the strict decode at least crashed loud)."""
+    p = str(tmp_path / "run-1.jsonl")
+    with open(p, "wb") as f:
+        f.write(b'{"instance_id": "i0", "status": "resolved", '
+                b'"meta": {"reason": "a\xffb"}, "ts": 1.0}\n')
+        f.write(b'{"instance_id": "i2", "status": "timeout", "meta": {}, "ts": 3.0}\n')
+    with pytest.raises(r.RunnerProtocolError, match="invalid UTF-8"):
+        r.load_checkpoint(p)
+    # the writer-side repair fails loud too (before touching the file)
+    with pytest.raises(r.RunnerProtocolError, match="invalid UTF-8"):
+        r.JsonlCheckpoint(p)
+
+
+def test_checkpoint_resume_torn_tail_invalid_utf8_newline_terminated(tmp_path):
+    """A torn *last* line containing an invalid UTF-8 byte (even
+    newline-terminated) is a droppable tail for the reader and is
+    truncated by the write-side repair — the byte-exact (binary)
+    boundary keeps the clean prefix intact."""
+    p = str(tmp_path / "run-1.jsonl")
+    with open(p, "wb") as f:
+        f.write(b'{"instance_id": "i0", "status": "resolved", "meta": {}, "ts": 1.0}\n')
+        f.write(b'{"instance_id": "i1", "status": "quo\xff\n')
+    records, dropped = r.load_checkpoint(p)
+    assert dropped is True
+    assert [rec["instance_id"] for rec in records] == ["i0"]
+    e = Env()
+    ckpt = r.JsonlCheckpoint(p, clock=e.clock)
+    r.Runner(["i1"], lambda inst: FakeSession(e.registry, "resolved",
+                                             clock=e.clock),
+             clock=e.clock, sleeper=e.sleeper, reporter=ckpt).run()
+    ckpt.close()
+    recs2, dropped2 = r.load_checkpoint(p)
+    assert dropped2 is False
+    assert [rec["instance_id"] for rec in recs2] == ["i0", "i1"]
