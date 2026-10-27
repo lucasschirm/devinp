@@ -752,15 +752,33 @@ def test_ok_mode_multi_turn_prompt(tmp_path):
 
 
 def test_patch_failure_is_an_event_not_a_crash(tmp_path):
-    """Round 1 [minor]: when *both* apply paths fail, the mock records
-    ``patch_failed`` and stays alive — the turn still completes
-    (``end_turn``), per the documented contract. The session cwd is a
-    read-only dir (the client's Popen needs an existing cwd, so this is
-    the deterministic way to break both ``git apply`` — not a repo —
-    and the direct write — no write permission)."""
-    cwd = tmp_path / "ro"
+    """Round 1 [minor] + round 2 [minor]: when *both* apply paths
+    fail, the mock records ``patch_failed`` and stays alive — the turn
+    still completes (``end_turn``), per the documented contract. The
+    session cwd is a git repo in which the patch target exists as a
+    **committed directory**: ``git apply`` refuses ("Directory not
+    empty", rc 128) and ``open(target, "w")`` raises
+    ``IsADirectoryError`` (EISDIR) — for *any* uid, including
+    root/CAP_DAC_OVERRIDE (a ``0o555`` cwd would not: root bypasses
+    permission bits, so that variant failed spuriously in root-run CI
+    containers; a bare directory does not either — ``git apply``
+    happily clobbers an *empty* dir in a non-repo cwd)."""
+    cwd = tmp_path / "blocked"
     cwd.mkdir()
-    cwd.chmod(0o555)
+    _git_repo(cwd)
+    # repo-local identity — CI runners have no global git identity
+    for k, v in (("user.email", "mock@example.com"), ("user.name", "mock")):
+        r = subprocess.run(["git", "-C", str(cwd), "config", k, v],
+                          capture_output=True, timeout=30)
+        assert r.returncode == 0, r.stderr
+    (cwd / CANNED_FILE).mkdir()
+    (cwd / CANNED_FILE / "inner.txt").write_text("tracked content\n")
+    r = subprocess.run(["git", "-C", str(cwd), "add", "-A"],
+                      capture_output=True, timeout=30)
+    assert r.returncode == 0, r.stderr
+    r = subprocess.run(["git", "-C", str(cwd), "commit", "-qm", "init"],
+                      capture_output=True, timeout=30)
+    assert r.returncode == 0, r.stderr
     cwd_str = str(cwd)
     s, state = _session(
         tmp_path, "ok", cwd=cwd_str,
@@ -773,7 +791,6 @@ def test_patch_failure_is_an_event_not_a_crash(tmp_path):
         s.close()
     finally:
         s.close()
-        cwd.chmod(0o755)
 
     assert result.stop_reason == "end_turn"  # the turn completed
     assert s.returncode == 0  # the mock survived (no traceback)
@@ -822,7 +839,11 @@ def test_env_mode_empty_rejected_and_devin_model_respected(tmp_path):
     )
     import stat as _stat
     w.chmod(w.stat().st_mode | _stat.S_IXUSR | _stat.S_IXGRP | _stat.S_IXOTH)
-    r = subprocess.run([str(w)], capture_output=True, text=True, timeout=30)
+    # round 2 [minor]: stdin=DEVNULL for a deterministic EOF — with
+    # inherited stdin, an interactive TTY (or any held-open fd 0) would
+    # never EOF and subprocess.run's timeout would fire spuriously.
+    r = subprocess.run([str(w)], capture_output=True, text=True,
+                      timeout=30, stdin=subprocess.DEVNULL)
     # no client attached: the mock reads stdin until EOF -> clean exit 0
     assert r.returncode == 0, r.stderr
     evs = _read_state(str(state))

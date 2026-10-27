@@ -34,8 +34,9 @@ Subcommands (the real CLI surface the runner/adapter touches):
   ``{swe-2-medium, swe-2-high, swe-2-max}`` (WP0 §7); the paid SWE
   models (``swe-1-6``/``swe-1-7``: ``Low cost``; ``swe-2-*-lightning``:
   ``High cost``) and the non-SWE families (``claude-opus-4.6``,
-  ``gpt-6-sol``) are **verbatim copies from the WP0 capture**
-  (``notes/models-list.json``); cost tiers cover Free, Low cost,
+  ``gpt-6-sol``) carry **verbatim variants** of the WP0 capture's
+  families (a representative subset of each captured family;
+  ``notes/models-list.json``); cost tiers cover Free, Low cost,
   Med cost and High cost; the ``adaptive`` router variant has **no**
   ``cost_tier`` (the WP3 cost-tier gate is fail-closed on shape
   deviation — this exercises it).
@@ -144,7 +145,7 @@ CANNED_OPTIONS = [
 #: ``families[]`` with ``family_label``/``family_uid``/``slug``/
 #: ``aliases[]``/``variants[]``; variants carry ``model_uid``/``label`` and
 #: **optional** ``cost_tier``/``cost_summary``/``max_context_tokens``/
-#: ``max_output_tokens``. Cost tiers cover Free, Low cost, High cost and
+#: ``max_output_tokens``. Cost tiers cover Free, Low cost, Med cost and
 #: the absent-tier ``adaptive`` router (WP0 §7) — both Free and paid
 #: models are present, as the WP3 cost-tier gate requires.
 MODELS_LIST_FIXTURE = {
@@ -478,7 +479,9 @@ def _acp(argv: list) -> int:
 
     session_cwd = os.getcwd()
     prompt_rid = None
-    perm_rid = 100  # the canned agent's single permission request id
+    perm_rid = 99  # pre-incremented per turn: turn 1's request is 100,
+    # turn 2's is 101, … — per-turn-unique so a stale response can't
+    # be misattributed across turns
     pending_permission = False
     prompt_done = False
 
@@ -560,7 +563,7 @@ def _acp(argv: list) -> int:
     SESSION_ID = "mock-sid"
 
     def handle(obj) -> None:
-        nonlocal prompt_rid, pending_permission, prompt_done, session_cwd
+        nonlocal prompt_rid, pending_permission, prompt_done, session_cwd, perm_rid
         m = obj.get("method")
         rid = obj.get("id")
 
@@ -663,7 +666,7 @@ def _acp(argv: list) -> int:
                     {"id": "model", "name": "Model",
                      "description": "AI model to use",
                      "category": "model", "type": "select",
-                     "currentValue": "swe-2-high",
+                     "currentValue": model or "swe-2-high",
                      "options": [
                          {"value": "adaptive", "name": "Adaptive",
                           "_meta": {"cognition.ai/supportsImages": True}},
@@ -701,6 +704,7 @@ def _acp(argv: list) -> int:
             # an indistinguishable wrong `timeout` signal).
             prompt_done = False
             pending_permission = False
+            perm_rid += 1  # per-turn-unique permission request id
             prompt_rid = rid
             text = "".join(
                 b.get("text", "")
@@ -930,10 +934,14 @@ def main(argv: list) -> int:
     cmd, rest = argv[0], argv[1:]
     if cmd == "acp":
         return _acp(rest)
-    if cmd == "models" and len(rest) >= 1 and rest[0] == "list":
-        return _models_list(rest[1:])
-    if cmd == "auth" and len(rest) >= 1 and rest[0] == "status":
-        return _auth_status(rest[1:])
+    if cmd == "models":
+        if len(rest) >= 1 and rest[0] == "list":
+            return _models_list(rest[1:])
+        return _cli_error("models requires a subcommand (list)")
+    if cmd == "auth":
+        if len(rest) >= 1 and rest[0] == "status":
+            return _auth_status(rest[1:])
+        return _cli_error("auth requires a subcommand (status)")
     if cmd == "--version":
         print(f"mock-devin {MOCK_VERSION}")
         return 0
