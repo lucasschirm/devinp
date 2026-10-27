@@ -82,19 +82,26 @@ python -m pytest tests/          # zero-cost, mock server only, no quota
 the `devin` binary: the **key testability lever** (full pipeline with
 zero quota, PLAN.md §5 WP2). It speaks the WP0-verified ACP subset
 (NDJSON + wire names + startup vendor notifications + real-wire
-toolCall shape) and runs a canned agent that reads the task, applies a
+toolCall shape; the `initialize`/`session/new` results mirror the WP0
+live capture — capability blocks, 5 modes incl. `plan`/`bypass`,
+`configOptions`) and runs a canned agent that reads the task, applies a
 canned patch to the session-cwd repo (via `git apply` when the cwd is a
 git repo), answers its *own* permission flow (the patch is applied only
 after the client's `session/request_permission` response — a denial skips
-it), and emits the stop reason + usage. It also serves the canned
+it), and emits the stop reason + usage. Multi-turn: a second
+`session/prompt` is answered like the first. It also serves the canned
 `devin models list --format json` fixture (WP0 shape; Free is exactly
 `swe-2-medium`/`swe-2-high`/`swe-2-max`; paid `swe-1-6`/`swe-1-7`/
-`swe-2-*-lightning`; the `adaptive` variant has no `cost_tier` — the
-WP3 fail-closed gate data).
+`swe-2-*-lightning`; the non-SWE families `claude-opus-4.6` and
+`gpt-6-sol` are verbatim copies from the WP0 capture; cost tiers cover
+Free/Low/Med/High; the `adaptive` variant has no `cost_tier` — the WP3
+fail-closed gate data) and a canned `devin auth status` (the PLAN §2.7
+pre-flight probe).
 
 ```bash
 cd bench
 python3 mock_devin.py models list --format json
+python3 mock_devin.py auth status
 MOCK_DEVIN_MODE=ok MOCK_DEVIN_STATE=/tmp/ev.jsonl \
   python3 mock_devin.py acp --model swe-2-high
 python -m pytest tests/          # zero-cost, mock only, no quota
@@ -108,7 +115,11 @@ python -m pytest tests/          # zero-cost, mock only, no quota
   `quota` → stop reason `quota_limited` + stderr note (no usage;
   retry class); `crash` → mid-prompt death, exit 1 (`agent_error`).
 - **Strict CLI:** unknown flags/modes/subcommands are rejected (exit 2)
-  so an adapter/runner mistake surfaces instead of being absorbed.
+  so an adapter/runner mistake surfaces instead of being absorbed; with
+  no `--model`, `DEVIN_MODEL` is honored (as in the real `devin acp`).
+- **Canned-patch failure is an event, not a crash:** if both the
+  `git apply` and the direct write fail (e.g. an unwritable session
+  cwd), the mock records `patch_failed` and the turn still completes.
 - **Event file** (`MOCK_DEVIN_STATE` / `--state-file`): JSON-line log
   (task text as received, cwd, every permission response, cancel/close)
   — the tests assert the round-trip and the permission-flow ordering.

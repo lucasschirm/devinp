@@ -66,17 +66,24 @@ MOCK_PATH = str(Path(__file__).resolve().parent.parent / "mock_devin.py")
 
 def _wrapper(root, mode: str) -> tuple[str, str]:
     """Materialize a wrapper script (the test's ``devin`` binary) that
-    execs ``mock_devin.py`` with the mode + state path baked in via env
-    (the extra CLI args stay on the real wire)."""
+    execs a **tmp-dir copy** of ``mock_devin.py`` with the mode +
+    state path baked in via env (the extra CLI args stay on the real
+    wire). The copy — named ``mock_w2_<mode>.py`` — gives the orphan
+    check a unique process-table marker, exactly the WP1 pattern
+    (``mock_server.py`` copies its mock into the test's tmp dir): a
+    repo-path marker would false-positive on any sibling process that
+    merely references the repo file."""
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
     state = root / f"state-{mode}.jsonl"
+    mock = root / f"mock_w2_{mode}.py"
+    mock.write_text(Path(MOCK_PATH).read_text())
     w = root / f"mock-devin-{mode}"
     w.write_text(
         f"#!/bin/sh\n"
         f"export MOCK_DEVIN_MODE={mode}\n"
         f"export MOCK_DEVIN_STATE={state}\n"
-        f"exec {sys.executable} {MOCK_PATH} \"$@\"\n"
+        f"exec \"{sys.executable}\" \"{mock}\" \"$@\"\n"
     )
     w.chmod(w.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     return str(w), str(state)
@@ -101,9 +108,12 @@ def _git_repo(path) -> None:
 def _assert_no_orphans(s: ac.AcpSession) -> None:
     """Group check + process-table check for surviving mock processes.
 
-    Ancestor processes are excluded from the match: a shell wrapper
-    launched as ``bash -c "… pytest …/test_mock_devin.py …"" carries the
-    marker in its own cmdline — it is not a leaked agent."""
+    The marker is the unique tmp-dir copy name (``mock_w2_``) — the
+    WP1 pattern — so a sibling process that merely references the repo
+    file can never false-positive. Ancestor processes are excluded as
+    well: a shell wrapper launched as ``bash -c "… pytest
+    …/test_mock_devin.py …"`` carries the test name in its own cmdline.
+    """
     assert not s.group_alive(), "agent process group still alive"
     if not os.path.isdir("/proc"):
         return
@@ -121,7 +131,7 @@ def _assert_no_orphans(s: ac.AcpSession) -> None:
         return out
 
     skip = _ancestors()
-    pids = []
+    found = []
     for entry in os.listdir("/proc"):
         if not entry.isdigit():
             continue
@@ -133,9 +143,14 @@ def _assert_no_orphans(s: ac.AcpSession) -> None:
                 cmd = f.read()
         except OSError:
             continue
-        if b"mock_devin.py" in cmd:
-            pids.append(pid)
-    assert pids == [], f"orphan mock processes: {pids}"
+        if b"mock_w2_" in cmd:
+            try:
+                with open(f"/proc/{entry}/stat") as f:
+                    ppid = f.read().rsplit(")", 1)[1].split()[1]
+            except (OSError, ValueError, IndexError):
+                ppid = "?"
+            found.append(f"pid={pid} ppid={ppid} cmd={cmd[:160]!r}")
+    assert found == [], f"orphan mock processes: {found}"
 
 
 def _session(root, mode: str, cwd: str, **kw):
@@ -463,7 +478,15 @@ def test_models_list_fixture(tmp_path):
     for uid in ("swe-2-medium-lightning", "swe-2-high-lightning",
                 "swe-2-max-lightning"):
         assert by_uid[uid]["cost_tier"] == "High cost"
-    # paid variants carry a cost summary (the $ rates, WP0 §7).
+    # Round 1 [minor]: the non-SWE family is a verbatim copy of a real
+    # captured family (not fabricated), and the Med cost tier (the most
+    # common paid tier in the real capture) is present.
+    assert by_uid["claude-opus-4-6"]["cost_tier"] == "High cost"
+    assert by_uid["claude-opus-4-6"]["cost_summary"] == \
+        "$5 / 1M Input \u00b7 $0.5 / 1M Cached input \u00b7 $25 / 1M Output"
+    assert by_uid["gpt-6-sol-medium"]["cost_tier"] == "Med cost"
+    # paid variants carry a cost summary (the $ rates, WP0 §7) — the
+    # Med cost branch now executes (gpt-6-sol-medium).
     for v in vs:
         if v.get("cost_tier") in ("Low cost", "High cost", "Med cost"):
             assert v.get("cost_summary")
@@ -685,3 +708,123 @@ def test_terminal_status_signal_mapping(tmp_path):
 
 def test_valid_modes_are_the_five_documented_ones():
     assert VALID_MODES == ("ok", "no_patch", "hang", "quota", "crash")
+
+
+# ---------------------------------------------------------------------------
+# review round 1 (Devin/swe-2) follow-ups
+# ---------------------------------------------------------------------------
+
+def test_ok_mode_multi_turn_prompt(tmp_path):
+    """Round 1 [major]: the WP1 client is multi-turn (its state returns
+    to ``session`` after each turn) — a second ``session/prompt`` must
+    be answered like the first, not silently swallowed (which would
+    burn the client's wall-clock cap into a wrong ``timeout`` signal).
+    Turn 2's patch re-apply goes through the direct-write fallback (the
+    file already exists, so ``git apply`` of a file-creation patch
+    fails) — the turn still completes legitimately."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_repo(repo)
+
+    s, state = _session(
+        tmp_path, "ok", cwd=str(repo),
+        policy=ac.SwebenchPolicy(workdir=str(repo)),
+    )
+    try:
+        s.initialize()
+        s.create_session(cwd=str(repo))
+        r1 = s.prompt("turn one", timeout=30)
+        r2 = s.prompt("turn two", timeout=30)
+        s.close()
+    finally:
+        s.close()
+
+    assert r1.stop_reason == "end_turn"
+    assert r2.stop_reason == "end_turn"  # answered, not swallowed
+    evs = _read_state(state)
+    applied = [e for e in evs if e["event"] == "patch_applied"]
+    assert len(applied) == 2
+    assert applied[0]["via"] == "git-apply"
+    assert applied[1]["via"] == "direct-write"  # idempotent re-apply
+    assert (repo / CANNED_FILE).read_text() == CANNED_CONTENT
+    assert s.returncode == 0
+    _assert_no_orphans(s)
+
+
+def test_patch_failure_is_an_event_not_a_crash(tmp_path):
+    """Round 1 [minor]: when *both* apply paths fail, the mock records
+    ``patch_failed`` and stays alive — the turn still completes
+    (``end_turn``), per the documented contract. The session cwd is a
+    read-only dir (the client's Popen needs an existing cwd, so this is
+    the deterministic way to break both ``git apply`` — not a repo —
+    and the direct write — no write permission)."""
+    cwd = tmp_path / "ro"
+    cwd.mkdir()
+    cwd.chmod(0o555)
+    cwd_str = str(cwd)
+    s, state = _session(
+        tmp_path, "ok", cwd=cwd_str,
+        policy=ac.SwebenchPolicy(workdir=cwd_str),
+    )
+    try:
+        s.initialize()
+        s.create_session(cwd=cwd_str)
+        result = s.prompt("task", timeout=30)
+        s.close()
+    finally:
+        s.close()
+        cwd.chmod(0o755)
+
+    assert result.stop_reason == "end_turn"  # the turn completed
+    assert s.returncode == 0  # the mock survived (no traceback)
+    evs = _read_state(state)
+    failed = [e for e in evs if e["event"] == "patch_failed"]
+    assert failed, "a failed patch must record patch_failed"
+    assert not any(e["event"] == "patch_applied" for e in evs)
+    _assert_no_orphans(s)
+
+
+def test_auth_status_canned_stub(tmp_path):
+    """Round 1 [minor]: PLAN §2.7 pre-flight probes ``devin auth
+    status`` — the mock serves a canned logged-in status (exit 0) so a
+    runner driven through it does not record ``preflight_failed``."""
+    w, _ = _wrapper(tmp_path, "ok")
+    r = subprocess.run([w, "auth", "status"],
+                      capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr
+    assert "Logged in" in r.stdout
+    # an unknown 'auth' subargument is rejected like other strict-CLI
+    # mistakes
+    r = subprocess.run([w, "auth", "bogus"],
+                      capture_output=True, text=True, timeout=30)
+    assert r.returncode == 2
+
+
+def test_env_mode_empty_rejected_and_devin_model_respected(tmp_path):
+    """Round 1 [nit]: ``MOCK_DEVIN_MODE=""`` is rejected like
+    ``--mode ""`` (no silent fallback to ``ok`` — a typo'd wrapper must
+    surface), and with no ``--model`` the ``DEVIN_MODEL`` env var is
+    honored (WP0 §1: the real ``devin acp`` reads it too)."""
+    env = dict(os.environ, MOCK_DEVIN_MODE="")
+    r = subprocess.run([sys.executable, MOCK_PATH, "acp"],
+                      capture_output=True, text=True, timeout=30, env=env)
+    assert r.returncode == 2
+
+    from pathlib import Path
+    state = tmp_path / "state-env.jsonl"
+    w = tmp_path / "mock-devin-env"
+    w.write_text(
+        f"#!/bin/sh\n"
+        f"export MOCK_DEVIN_MODE=ok\n"
+        f"export MOCK_DEVIN_STATE={state}\n"
+        f"export DEVIN_MODEL=env-model\n"
+        f"exec \"{sys.executable}\" \"{MOCK_PATH}\" acp\n"
+    )
+    import stat as _stat
+    w.chmod(w.stat().st_mode | _stat.S_IXUSR | _stat.S_IXGRP | _stat.S_IXOTH)
+    r = subprocess.run([str(w)], capture_output=True, text=True, timeout=30)
+    # no client attached: the mock reads stdin until EOF -> clean exit 0
+    assert r.returncode == 0, r.stderr
+    evs = _read_state(str(state))
+    started = [e for e in evs if e["event"] == "started"][0]
+    assert started["model"] == "env-model"

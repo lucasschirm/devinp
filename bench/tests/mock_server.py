@@ -273,12 +273,33 @@ def living_mock_pids():
 
     Returns ``None`` when the process table is not inspectable (no
     ``/proc``) so callers can fall back to the group-alive check.
+
+    Ancestor processes are excluded from the match: a shell wrapper
+    launched as ``bash -c "… mock_devin.py …"`` (e.g. a bench runner
+    whose own command line names the mock) is not a leaked agent.
     """
     if not os.path.isdir("/proc"):
         return None
+
+    def _ancestors() -> set:
+        out = {os.getpid()}
+        p = os.getpid()
+        while p > 1:
+            try:
+                with open(f"/proc/{p}/stat") as f:
+                    p = int(f.read().rsplit(")", 1)[1].split()[1])
+            except (OSError, ValueError, IndexError):
+                break
+            out.add(p)
+        return out
+
+    skip = _ancestors()
     pids = []
     for entry in os.listdir("/proc"):
         if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid in skip:
             continue
         try:
             with open(f"/proc/{entry}/cmdline", "rb") as f:
@@ -286,5 +307,5 @@ def living_mock_pids():
         except OSError:
             continue
         if b"mock_devin.py" in cmd:
-            pids.append(int(entry))
+            pids.append(pid)
     return pids

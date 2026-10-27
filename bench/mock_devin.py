@@ -21,17 +21,27 @@ Subcommands (the real CLI surface the runner/adapter touches):
   flags (a test double's extension point); ``MOCK_DEVIN_MODE`` /
   ``MOCK_DEVIN_STATE`` env vars are equivalent (the wrapper scripts the
   tests use set the env vars so the extra CLI args stay on the real
-  wire). Unknown flags are **rejected** (exit 2) so an adapter/runner
-  mistake surfaces instead of being silently absorbed.
+  wire). With no ``--model`` the ``DEVIN_MODEL`` env var is honored
+  (WP0 §1: the real ``devin acp`` reads it too). Unknown flags are
+  **rejected** (exit 2) so an adapter/runner mistake surfaces instead
+  of being silently absorbed. Multi-turn: a second ``session/prompt``
+  is answered like the first (per-turn state is reset each turn — the
+  WP1 client is multi-turn).
 * ``mock_devin models list [--format json|table]`` — the canned
   ``devin models list --format json`` fixture (WP2 AC3): the WP0-captured
   shape (top-level ``{"families": [...]}``), with ``cost_tier`` values and
   **both Free and paid models** — Free is exactly
-  ``{swe-2-medium, swe-2-high, swe-2-max}`` (WP0 §7), paid SWE models
-  (``swe-1-6``/``swe-1-7``: ``Low cost``; ``swe-2-*-lightning``:
-  ``High cost``), plus one non-SWE family and the ``adaptive`` router
-  variant that has **no** ``cost_tier`` (the WP3 cost-tier gate is
-  fail-closed on shape deviation — this exercises it).
+  ``{swe-2-medium, swe-2-high, swe-2-max}`` (WP0 §7); the paid SWE
+  models (``swe-1-6``/``swe-1-7``: ``Low cost``; ``swe-2-*-lightning``:
+  ``High cost``) and the non-SWE families (``claude-opus-4.6``,
+  ``gpt-6-sol``) are **verbatim copies from the WP0 capture**
+  (``notes/models-list.json``); cost tiers cover Free, Low cost,
+  Med cost and High cost; the ``adaptive`` router variant has **no**
+  ``cost_tier`` (the WP3 cost-tier gate is fail-closed on shape
+  deviation — this exercises it).
+* ``mock_devin auth status`` — canned logged-in status (exit 0), the
+  PLAN §2.7 pre-flight probe: a runner driven through this mock must
+  not record ``preflight_failed`` on auth.
 
 The canned "agent" (WP2 AC1): reads the task text out of the
 ``session/prompt`` blocks, streams ``session/update`` notifications,
@@ -268,24 +278,61 @@ MODELS_LIST_FIXTURE = {
                 },
             ],
         },
-        # A non-SWE family — the fixture must not let a gate key on the
-        # "swe" prefix instead of cost_tier.
+        # A non-SWE family — a gate that keyed on the "swe" prefix
+        # instead of cost_tier would miss it. Verbatim from the WP0
+        # capture (notes/models-list.json, family "claude-opus-4.6").
         {
-            "family_label": "Claude",
-            "family_uid": "claude",
-            "slug": "claude",
+            "family_label": "Claude Opus 4.6",
+            "family_uid": "claude-opus-4.6",
+            "slug": "claude-opus-4.6",
             "aliases": [],
             "variants": [
                 {
-                    "model_uid": "claude-opus-4",
-                    "label": "Claude Opus 4",
-                    "description": "Large reasoning model",
+                    "model_uid": "claude-opus-4-6",
+                    "label": "Claude Opus 4.6",
                     "max_context_tokens": 200000,
-                    "max_output_tokens": 64000,
+                    "max_output_tokens": 128000,
                     "cost_tier": "High cost",
                     "cost_summary": (
-                        "$15 / 1M Input \u00b7 $1.5 / 1M Cached input"
-                        " \u00b7 $75 / 1M Output"
+                        "$5 / 1M Input \u00b7 $0.5 / 1M Cached input"
+                        " \u00b7 $25 / 1M Output"
+                    ),
+                    "is_new": False,
+                    "is_beta": False,
+                },
+                {
+                    "model_uid": "claude-opus-4-6-1m",
+                    "label": "Claude Opus 4.6 1M",
+                    "max_context_tokens": 1000000,
+                    "max_output_tokens": 128000,
+                    "cost_tier": "High cost",
+                    "cost_summary": (
+                        "$5 / 1M Input \u00b7 $0.5 / 1M Cached input"
+                        " \u00b7 $25 / 1M Output"
+                    ),
+                    "is_new": False,
+                    "is_beta": False,
+                },
+            ],
+        },
+        # Verbatim from the WP0 capture (family "gpt-6-sol") — the
+        # ``Med cost`` tier (179 variants in the real capture, the most
+        # common paid tier) must be present, not just Low/High.
+        {
+            "family_label": "GPT-6 Sol",
+            "family_uid": "gpt-6-sol",
+            "slug": "gpt-6-sol",
+            "aliases": [],
+            "variants": [
+                {
+                    "model_uid": "gpt-6-sol-medium",
+                    "label": "GPT-6 Sol Medium Thinking",
+                    "max_context_tokens": 1000000,
+                    "max_output_tokens": 128000,
+                    "cost_tier": "Med cost",
+                    "cost_summary": (
+                        "$2 / 1M Input \u00b7 $0.2 / 1M Cached input"
+                        " \u00b7 $10 / 1M Output"
                     ),
                     "is_new": False,
                     "is_beta": False,
@@ -316,13 +363,40 @@ MODELS_LIST_FIXTURE = {
     ]
 }
 
+#: Canned ``devin auth status`` output (PLAN §2.7 pre-flight probe):
+#: the runner's check is "auth status ok" — a logged-in status, exit 0.
+#: Shaped like the real CLI output (notes/auth-status.txt) with a mock
+#: identity; no real account facts are embedded.
+AUTH_STATUS_OUTPUT = """Logged in (via Devin).
+
+Credentials:
+  File:              $XDG_DATA_HOME/devin/credentials.toml
+  API server:        https://server.codeium.com
+  Devin webapp:      https://app.devin.ai
+  Devin API:         https://api.devin.ai
+
+User:
+  Name:              mock-devin
+  User ID:           user-mock0000000000000000000000
+
+Account:
+  Tier:              mock
+  Plan:              mock
+  Enterprise:        no
+  Telemetry:         disabled
+"""
+
 # ---------------------------------------------------------------------------
 # the ACP server (canned agent)
 # ---------------------------------------------------------------------------
 
 
 def _acp(argv: list) -> int:
-    mode = os.environ.get("MOCK_DEVIN_MODE") or "ok"
+    # An *empty* env value is validated like an empty ``--mode`` (exit
+    # 2) — ``"" or "ok"`` would silently absorb a typo'd wrapper, which
+    # is exactly what the strict CLI exists to prevent.
+    env_mode = os.environ.get("MOCK_DEVIN_MODE")
+    mode = "ok" if env_mode is None else env_mode
     state_path = os.environ.get("MOCK_DEVIN_STATE") or None
     model = None
     i = 0
@@ -355,6 +429,11 @@ def _acp(argv: list) -> int:
                 "(mock_devin is strict: the real CLI would reject it too)"
             )
         i += 1
+    # WP0 §1: the real `devin acp` reads DEVIN_MODEL when --model is
+    # absent — the mock honors it the same way (the runner's model gate
+    # can then assert the requested model in the state file).
+    if model is None:
+        model = os.environ.get("DEVIN_MODEL")
     if mode not in VALID_MODES:
         return _cli_error(
             f"unknown --mode {mode!r} (valid: {', '.join(VALID_MODES)})"
@@ -451,11 +530,13 @@ def _acp(argv: list) -> int:
 
         ``git apply`` when the cwd is a git repo (the sweb.eval layout);
         a direct write otherwise (a non-repo dry-run cwd still gets the
-        patch on disk). Best-effort + recorded: a failure is an event,
-        not a crash — the mock must stay alive for the wire contract.
+        patch on disk). Best-effort + recorded: a failure — including
+        *both* paths failing (e.g. the session cwd does not exist) — is
+        a ``patch_failed`` event, not a crash: the mock must stay alive
+        for the wire contract and the turn still completes.
         """
         target = os.path.join(session_cwd, CANNED_FILE)
-        via = "direct-write"
+        via = None
         try:
             r = subprocess.run(
                 ["git", "-C", session_cwd, "apply", "-"],
@@ -464,14 +545,16 @@ def _acp(argv: list) -> int:
             )
             if r.returncode == 0:
                 via = "git-apply"
-            else:
-                # not a git repo / git missing / patch rejected — fall
-                # back to the direct write (record which path ran).
+        except (OSError, subprocess.SubprocessError):
+            pass  # git missing / cwd gone / not a repo -> direct write
+        if via is None:
+            try:
                 with open(target, "w") as f:
                     f.write(CANNED_CONTENT)
-        except (OSError, subprocess.SubprocessError):
-            with open(target, "w") as f:
-                f.write(CANNED_CONTENT)
+                via = "direct-write"
+            except OSError as exc:
+                state("patch_failed", reason=str(exc))
+                return
         state("patch_applied", via=via, path=target)
 
     SESSION_ID = "mock-sid"
@@ -482,15 +565,51 @@ def _acp(argv: list) -> int:
         rid = obj.get("id")
 
         if m == "initialize":
-            # Mirrors the WP0 live capture (notes/acp-surface.md §1).
+            # Mirrors the WP0 live capture verbatim (notes/
+            # acp-probe-handshake2.frames.jsonl): promptCapabilities /
+            # mcpCapabilities / sessionCapabilities (incl.
+            # close._meta["cognition.ai/force"]) / auth / authMethods
+            # and the cognition.ai/* _meta flag block. agentInfo keeps
+            # the mock identity (the captured name is a devin codename);
+            # the top-level _meta (mcpConfigPath) is a probe-host
+            # artifact, not a capability, and is omitted.
             send({"jsonrpc": "2.0", "id": rid, "result": {
                 "protocolVersion": 1,
-                "agentCapabilities": {"loadSession": True,
-                                     "sessionCapabilities": {"close": {}}},
-                "promptCapabilities": {"image": False, "audio": False,
-                                      "embeddedContext": True},
-                "mcpCapabilities": {"http": False, "sse": False},
+                "agentCapabilities": {
+                    "loadSession": True,
+                    "promptCapabilities": {"image": True, "audio": False,
+                                         "embeddedContext": True},
+                    "mcpCapabilities": {"http": True, "sse": True},
+                    "sessionCapabilities": {
+                        "list": {},
+                        "delete": {},
+                        "additionalDirectories": {},
+                        "close": {"_meta": {"cognition.ai/force": True}}},
+                    "auth": {},
+                    "_meta": {
+                        "cognition.ai/multiRootWorkspace": True,
+                        "cognition.ai/sessionListContentSearch": True,
+                        "cognition.ai/sessionListOrderBy":
+                            ["updated_at", "created_at"],
+                        "cognition.ai/sessionRename": True,
+                        "cognition.ai/persistOnCreate": True,
+                        "cognition.ai/sessionShare": True,
+                        "cognition.ai/documentLifecycle": True,
+                        "cognition.ai/userEdits": True,
+                        "cognition.ai/terminalLifecycle": True,
+                        "cognition.ai/userConfig": True,
+                        "cognition.ai/userShellCommand": True,
+                        "cognition.ai/editableCommands": True,
+                        "cognition.ai/commandRevision": True,
+                        "cognition.ai/chains": True,
+                        "cognition.ai/megaplan": True,
+                        "cognition.ai/ruleMentions": True,
+                        "cognition.ai/midTurnPrompts": True}},
+                "authMethods": [{"id": "devin-browser",
+                                "name": "Log in with browser",
+                                "description": "Sign in via your browser"}],
                 "agentInfo": {"name": "mock-devin",
+                             "title": "Devin Agent",
                              "version": MOCK_VERSION}}})
             return
         if m == "session/new":
@@ -499,17 +618,89 @@ def _acp(argv: list) -> int:
             if cwd:
                 session_cwd = str(cwd)
             state("session_new", cwd=session_cwd)
-            # The real session/new result carries modes (WP0 §1) — the
-            # client ignores them; keep the shape faithful.
+            # Mirrors the WP0 live capture: the real session/new result
+            # carries 5 modes (incl. plan/bypass) + configOptions
+            # (mode/model/thought_level/speed) + the lock _meta. The
+            # model option list is a representative subset of the real
+            # one (the captured list is account-specific, 150+ entries);
+            # the shape is verbatim.
             send({"jsonrpc": "2.0", "id": rid, "result": {
                 "sessionId": SESSION_ID,
                 "modes": {"currentModeId": "accept-edits",
                          "availableModes": [
                              {"id": "accept-edits", "name": "Code"},
                              {"id": "smart", "name": "Smart"},
-                             {"id": "ask", "name": "Ask"}]}}})
+                             {"id": "ask", "name": "Ask"},
+                             {"id": "plan", "name": "Plan"},
+                             {"id": "bypass",
+                              "name": "Bypass Permissions"}]},
+                "configOptions": [
+                    {"id": "mode", "name": "Session Mode",
+                     "category": "mode", "type": "select",
+                     "currentValue": "accept-edits",
+                     "options": [
+                         {"value": "accept-edits", "name": "Code",
+                          "description": "Write and edit code",
+                          "_meta": {"cognition.ai/icon": "code"}},
+                         {"value": "smart", "name": "Smart",
+                          "description":
+                              "Auto-approve actions the model judges safe",
+                          "_meta": {"cognition.ai/icon": "sparkles"}},
+                         {"value": "ask", "name": "Ask",
+                          "description":
+                              "Answer questions without code changes",
+                          "_meta": {"cognition.ai/icon": "message-circle"}},
+                         {"value": "plan", "name": "Plan",
+                          "description":
+                              "Plan changes before implementing",
+                          "_meta": {"cognition.ai/icon": "file-text"}},
+                         {"value": "bypass",
+                          "name": "Bypass Permissions",
+                          "description":
+                              "Auto-approve all tool calls unless your "
+                              "organization's policy requires approval",
+                          "_meta": {"cognition.ai/icon": "shield-off"}}]},
+                    {"id": "model", "name": "Model",
+                     "description": "AI model to use",
+                     "category": "model", "type": "select",
+                     "currentValue": "swe-2-high",
+                     "options": [
+                         {"value": "adaptive", "name": "Adaptive",
+                          "_meta": {"cognition.ai/supportsImages": True}},
+                         {"value": "swe-2-high", "name": "SWE-2",
+                          "_meta": {"cognition.ai/supportsImages": True}},
+                         {"value": "claude-opus-4-6",
+                          "name": "Claude Opus 4.6",
+                          "_meta": {"cognition.ai/supportsImages": True}},
+                         {"value": "gpt-6-sol-medium",
+                          "name": "GPT-6 Sol",
+                          "_meta": {"cognition.ai/supportsImages": True}}]},
+                    {"id": "thought_level", "name": "Thinking",
+                     "category": "thought_level", "type": "select",
+                     "currentValue": "high",
+                     "options": [
+                         {"value": "medium", "name": "Medium"},
+                         {"value": "high", "name": "High"},
+                         {"value": "max", "name": "Max"}]},
+                    {"id": "speed", "name": "Speed",
+                     "category": "model_config", "type": "select",
+                     "currentValue": "standard",
+                     "options": [
+                         {"value": "standard", "name": "Standard"},
+                         {"value": "fast", "name": "Fast"}]},
+                ],
+                "_meta": {"cognition.ai/isLocked": False,
+                         "cognition.ai/lockHolderPid": None}}})
             return
         if m == "session/prompt":
+            # A fresh turn: reset the per-turn state so a *second*
+            # session/prompt is answered like the first (the WP1 client
+            # is multi-turn — _state returns to "session" after each
+            # turn; a stale prompt_done would silently swallow the
+            # response and the client would burn its wall-clock cap,
+            # an indistinguishable wrong `timeout` signal).
+            prompt_done = False
+            pending_permission = False
             prompt_rid = rid
             text = "".join(
                 b.get("text", "")
@@ -588,8 +779,14 @@ def _acp(argv: list) -> int:
 
         if m == "session/cancel":
             state("cancel")
-            # A hang stays hung: cancel is a request the stalled agent
-            # never processes; the client's group kill is what ends it.
+            # A cancelled turn is abandoned: reset the per-turn state so
+            # a subsequent prompt starts fresh (a stale pending
+            # permission/prompt_done would swallow or misattribute its
+            # frames). A hang stays hung: cancel is a request the
+            # stalled agent never processes; the client's group kill is
+            # what ends it.
+            pending_permission = False
+            prompt_done = False
             return
         if m == "session/close":
             state("close")
@@ -672,6 +869,13 @@ def _cli_error(msg: str) -> int:
     return 2
 
 
+def _auth_status(argv: list) -> int:
+    if argv:
+        return _cli_error(f"unknown argument for 'auth status': {argv[0]!r}")
+    print(AUTH_STATUS_OUTPUT, end="")
+    return 0
+
+
 def _models_list(argv: list) -> int:
     as_json = False
     i = 0
@@ -720,6 +924,7 @@ def main(argv: list) -> int:
             "  mock_devin acp [--model M] [--mode "
             + "|".join(VALID_MODES) + "] [--state-file P]\n"
             "  mock_devin models list [--format json|table]\n"
+            "  mock_devin auth status\n"
         )
         return 0
     cmd, rest = argv[0], argv[1:]
@@ -727,6 +932,8 @@ def main(argv: list) -> int:
         return _acp(rest)
     if cmd == "models" and len(rest) >= 1 and rest[0] == "list":
         return _models_list(rest[1:])
+    if cmd == "auth" and len(rest) >= 1 and rest[0] == "status":
+        return _auth_status(rest[1:])
     if cmd == "--version":
         print(f"mock-devin {MOCK_VERSION}")
         return 0
