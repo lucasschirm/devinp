@@ -67,8 +67,12 @@ Acceptance criteria (issue #15, PLAN §2.4–§2.7) and where they live:
    dropped, not fatal; no instance runs twice → :func:`load_checkpoint`
    (the EOF torn-line rule; a mid-file corruption is fail-loud),
    :class:`JsonlCheckpoint` (one fsync'd line per finished instance —
-   the line is on disk before the runner proceeds), :func:`resume_queue`
-   / :func:`resume_from_checkpoint` (the pass@1 retry-class rules).
+   the line is on disk before the runner proceeds; on open it also
+   runs the *write-side* half of the rule — ``_repair_checkpoint_file``
+   — truncating a torn tail / newline-completing a complete record
+   missing its newline, so a resumed run never glues its first record
+   onto the torn fragment), :func:`resume_queue` / :func:
+   `resume_from_checkpoint` (the pass@1 retry-class rules).
 7. **pass@1 retry classes (PLAN §2.5)** → the :data:`NEVER_RERUN_
    STATUSES` / :data:`RETRY_STATUSES` split, enforced by
    :func:`resume_queue`: ``resolved`` / ``failed_test`` / ``timeout`` /
@@ -546,10 +550,14 @@ class ModelGateResult:
 
 
 def _valid_token_budget(budget: object) -> bool:
-    """The paid override's token-budget leg: a positive number — a bool
-    is not a budget (the house validation style)."""
-    return isinstance(budget, (int, float)) \
-        and not isinstance(budget, bool) and budget > 0
+    """The paid override's token-budget leg: a positive, **finite**
+    number — a bool is not a budget (the house validation style), and
+    ``inf`` is not a budget (an unbounded token budget is not a
+    budget)."""
+    if isinstance(budget, bool) or not isinstance(budget, (int, float)) \
+            or budget <= 0:
+        return False
+    return isinstance(budget, int) or math.isfinite(budget)
 
 
 def gate_cost_tier(models_json: object, configured_model: str, *,
@@ -632,7 +640,10 @@ def fetch_models_list(devin_bin: str = "devin", timeout_s: float = 30.0,
         )
     try:
         return json.loads(proc.stdout)
-    except ValueError as exc:
+    except (ValueError, TypeError) as exc:
+        # ValueError covers JSONDecodeError (a str subclass); TypeError
+        # covers a non-str/bytes stdout (e.g. None from a stubbed
+        # ``run`` — the seam exists for tests) — fail-closed either way.
         raise ModelGateError(
             f"fail-closed: the models list output is not valid JSON: {exc}"
         ) from exc
@@ -809,6 +820,11 @@ def resume_queue(instances: Sequence[str],
     known = set(instances)
     last: dict = {}
     for rec in records:
+        if not isinstance(rec, dict):
+            raise RunnerProtocolError(
+                f"checkpoint record is not a dict (got "
+                f"{type(rec).__name__})"
+            )
         iid = rec.get("instance_id")
         if iid is None:
             continue
@@ -831,22 +847,13 @@ def resume_queue(instances: Sequence[str],
     return to_run, skipped
 
 
-def load_checkpoint(path: str) -> "tuple[list, bool]":
-    """Read a progress file ``run-<id>.jsonl`` → ``(records,
-    dropped_last)``.
-
-    The **last** line that is not a complete record (a truncated JSON,
-    or a complete JSON with the wrong shape) is **dropped, not fatal**
-    — a kill mid-write leaves a torn line at EOF (issue #15 AC1). A
-    corrupted line *anywhere else* raises :class:`RunnerProtocolError`
+def _scan_checkpoint_lines(raw: str) -> "tuple[list, bool]":
+    """The shared line scan (:func:`load_checkpoint` + the write-side
+    repair). Returns ``(records, dropped_last)``. A non-record line
+    *anywhere but the last* raises :class:`RunnerProtocolError`
     (fail-loud: a mid-file line was fsync'd complete by the writer —
-    garbage there is not a kill artifact). A missing file is a fresh
-    run (no records, nothing dropped).
-    """
-    if not os.path.exists(path):
-        return [], False
-    with open(path, "r", encoding="utf-8") as f:
-        raw = f.read()
+    garbage there is not a kill artifact); a non-record line at EOF is
+    a torn write → dropped (not fatal)."""
     lines = raw.split("\n")
     if lines and lines[-1] == "":
         lines = lines[:-1]  # the final newline is not a line
@@ -883,6 +890,30 @@ def load_checkpoint(path: str) -> "tuple[list, bool]":
     return records, dropped
 
 
+def load_checkpoint(path: str) -> "tuple[list, bool]":
+    """Read a progress file ``run-<id>.jsonl`` → ``(records,
+    dropped_last)``.
+
+    The **last** line that is not a complete record (a truncated JSON,
+    or a complete JSON with the wrong shape) is **dropped, not fatal**
+    — a kill mid-write leaves a torn line at EOF (issue #15 AC1). A
+    corrupted line *anywhere else* raises :class:`RunnerProtocolError`
+    (fail-loud). A missing file is a fresh run (no records, nothing
+    dropped).
+
+    The *write-side* half of the rule lives in :class:`JsonlCheckpoint`
+    (:func:`_repair_checkpoint_file` on open): the reader drops the
+    torn tail for the resume *decision*; the writer truncates (or
+    newline-completes) it before appending, so a resumed run never
+    glues its first record onto the torn fragment.
+    """
+    if not os.path.exists(path):
+        return [], False
+    with open(path, "r", encoding="utf-8") as f:
+        raw = f.read()
+    return _scan_checkpoint_lines(raw)
+
+
 def _is_checkpoint_record(obj: object) -> bool:
     """The record shape (a kill can tear the line at any byte offset, so
     a torn *shape* at EOF is indistinguishable from a torn JSON — both
@@ -897,11 +928,64 @@ def _is_checkpoint_record(obj: object) -> bool:
     return obj["status"] in TERMINAL_STATUSES
 
 
+def _repair_checkpoint_file(path: str) -> None:
+    """The write-side half of the EOF torn-line rule (issue #15 AC1 —
+    "no instance runs twice", the review-found blocker): before the
+    writer appends, the file must end on a clean line boundary, or the
+    first appended record glues onto the torn tail (a glued line is
+    mid-file corruption on the next load — or a silently dropped
+    *completed* record, i.e. a re-run of a finished instance).
+
+    * the file ends with a newline → clean, nothing to do.
+    * the trailing segment (after the last newline) is a **complete
+      record** missing only the trailing newline (a kill after the JSON
+      but before the ``"\\n"``) → complete it (write the newline — the
+      record is preserved, and it is what the reader keeps).
+    * the trailing segment is a torn fragment (truncated JSON / wrong
+      shape — indistinguishable from a torn write) → **truncate** it to
+      the last clean boundary. (Appending a ``"\\n"`` would *not* fix
+      it — the fragment would remain a mid-file line and still fail on
+      the next load; it must be removed.)
+    * a corrupted line *anywhere else* → :class:
+      `RunnerProtocolError` (fail-loud, before the file is touched).
+    """
+    if not os.path.exists(path):
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        raw = f.read()
+    if raw == "":
+        return  # nothing to repair
+    # Fail-loud on a mid-file corruption before touching the file —
+    # even when the tail is clean (a corrupted line anywhere else was
+    # fsync'd complete; garbage there is not a kill artifact).
+    _scan_checkpoint_lines(raw)
+    if raw.endswith("\n"):
+        return  # clean — every record line is newline-terminated
+    seg = raw[raw.rfind("\n") + 1:]  # the trailing segment (the kill zone)
+    complete = False
+    try:
+        complete = _is_checkpoint_record(json.loads(seg))
+    except json.JSONDecodeError:
+        pass
+    if complete:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("\n")  # complete the record — it survives the resume
+        return
+    # A torn fragment — truncate to the last clean boundary.
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(raw[: len(raw) - len(seg)])
+        f.flush()
+        os.fsync(f.fileno())
+
+
 def resume_from_checkpoint(path: str,
                           instances: Sequence[str]) -> "tuple[list, dict]":
     """The convenience path: :func:`load_checkpoint` then
     :func:`resume_queue`. A missing file = a fresh run (everything is
-    re-run)."""
+    re-run). Pair it with a fresh :class:`JsonlCheckpoint` on the same
+    path for the resume run — its open repairs (truncates /
+    newline-completes) the torn tail before the first append.
+    """
     records, _ = load_checkpoint(path)
     return resume_queue(instances, records)
 # ---------------------------------------------------------------------------
@@ -997,6 +1081,15 @@ class JsonlCheckpoint:
 
     Durable across kills: append mode (a resume appends to the same
     file); every line is fsync'd.
+
+    **The write-side half of the EOF torn-line rule** (issue #15 AC1,
+    the review-found blocker): on open, :func:`_repair_checkpoint_file`
+    repairs the tail before the first append — a torn fragment is
+    truncated to the last clean boundary, and a complete record missing
+    only its trailing newline is completed — so a resumed run never
+    glues its first record onto the torn tail (which would be mid-file
+    corruption on the next load, or a silently dropped *completed*
+    record — a re-run of a finished instance, a pass@1 violation).
     """
 
     def __init__(self, path: str,
@@ -1008,6 +1101,7 @@ class JsonlCheckpoint:
             d = os.path.dirname(path)
             if d:
                 os.makedirs(d, exist_ok=True)
+            _repair_checkpoint_file(path)  # never append onto a torn tail
             _file = open(path, "a", encoding="utf-8")
         self._file = _file
         self._closed = False
@@ -1217,6 +1311,10 @@ def next_quota_window(ts: float) -> float:
 
     WP0 §4: the allowance refreshes on a calendar basis; the
     fine-grained reset is the calendar day ⇒ the next **UTC midnight**.
+    ``ts`` is expected on the **epoch/wall** basis (the Runner's
+    default clock is ``time.time`` for exactly this reason — see the
+    ``clock`` default note in :class:`Runner.__init__`), so the result
+    is a true UTC midnight in epoch seconds.
     """
     day = 86400.0
     return (math.floor(ts / day) + 1) * day
@@ -1292,7 +1390,17 @@ class Runner:
         config: "BudgetConfig | None" = None,
         concurrency: int = 1,
         i_know_about_quota: bool = False,
-        clock: Callable[[], float] = time.monotonic,
+        # The default is **wall time** (epoch seconds), not
+        # ``time.monotonic``: the backoff target is computed by
+        # ``next_quota_window`` as the next *epoch* UTC midnight (WP0 §4
+        # "calendar basis" reset), so the clock feeding it must be the
+        # same epoch basis — a monotonic (boot-relative) clock would
+        # align the sleep to a boot-dependent phase, waking up to ~24 h
+        # off the real quota reset (review finding on the WP3a default;
+        # WP3b's per-window pre-flight makes the phase alignment
+        # load-bearing). Tests inject their own clock/sleeper, so the
+        # default only governs a real (uninjected) run.
+        clock: Callable[[], float] = time.time,
         sleeper: Callable[[float], None] = time.sleep,
         next_window: "Callable[[float], float] | None" = None,
         reporter: "Reporter | None" = None,
@@ -1452,10 +1560,13 @@ class Runner:
         try:
             self._preflight(None)
         except PreflightFailed as exc:
-            self._reporter.record_instance(
-                None, "preflight_failed",
-                {"reason": str(exc), "phase": "batch"})
+            # The record hook runs under the runner lock (the WP3a hook
+            # discipline — the batch phase is single-threaded, but the
+            # discipline is the contract).
             with self._lock:
+                self._reporter.record_instance(
+                    None, "preflight_failed",
+                    {"reason": str(exc), "phase": "batch"})
                 if self._state in (BackoffState.RUNNING,
                                   BackoffState.BUDGET_EXHAUSTED):
                     self._abort_reason = f"preflight_failed (batch): {exc}"
@@ -1553,7 +1664,11 @@ class Runner:
         **before** any session is built — on a failure the budget claim
         is released (no session ever started), the instance is marked
         ``preflight_failed`` (the reason lands in the JSONL meta), and
-        the batch stops with an abort. Budget-claim lifecycle:
+        the batch stops with an abort. The *session* wall (the budget
+        ``record_wall`` charge) excludes the zero-quota pre-flight time
+        (a pre-flight consumes no session quota — the claim is
+        released on its failure); the pre-flight wall is recorded in
+        the mark's meta. Budget-claim lifecycle:
         a factory/``start()`` failure releases the claim (no session
         ever started); a ``run()``/``close()`` failure stands (the
         partial session consumed the work). The guard slot is released
@@ -1571,6 +1686,7 @@ class Runner:
                 self._handle_preflight_failure(
                     inst, str(exc), self._clock() - t0)
                 return
+        t0 = self._clock()  # the session wall excludes the pre-flight
         try:
             try:
                 s = self._session_factory(inst)
@@ -1826,6 +1942,18 @@ def main(argv: "Sequence[str] | None" = None) -> int:
         )
     except (ConcurrencyRefusedError, RunnerConfigError) as exc:
         print(f"runner: {exc}", file=sys.stderr)
+        return 2
+    # WP3b (issue #15 AC3): the gate flags are inert without --model —
+    # refuse them there (an explicit contract: a silent no-op that
+    # "validated" nothing is a footgun; if a default model is ever
+    # added, the gate must run for it too).
+    if args.model is None and (args.allow_paid
+                              or args.token_budget is not None
+                              or args.models_json is not None
+                              or args.devin_bin != "devin"):
+        print("runner: --allow-paid / --token-budget / --models-json / "
+              "--devin-bin require --model (the startup model gate does "
+              "not run without a configured model)", file=sys.stderr)
         return 2
     # WP3b (issue #15 AC3, PLAN §2.4): the startup model gate — a
     # refusal exits 2 before the batch starts (fail-closed).

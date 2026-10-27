@@ -202,7 +202,14 @@ WP3b (issue #15, PLAN §2.4–2.7):
   one fsync'd line per finished instance (status, artifact paths /
   usage in `meta`, timestamp); a killed mid-write run leaves a torn
   last line, which `load_checkpoint` **drops, not fatal** (a corrupted
-  mid-file line fails loud). `resume_queue` (pure) splits the full
+  mid-file line fails loud) and which `JsonlCheckpoint`'s open
+  **repairs on the write side** (`_repair_checkpoint_file`):
+  a torn fragment is *truncated* to the last clean boundary, and a
+  complete record missing only its trailing newline is *completed*
+  (newline written) — so a resumed run never glues its first record
+  onto the torn tail (mid-file corruption on the next load, or a
+  silently dropped *completed* record — a re-run of a finished
+  instance, a pass@1 violation). `resume_queue` (pure) splits the full
   instance list into `to_run` / `skipped`: `resolved` / `failed_test`
   / `timeout` / `no_patch` (and `agent_error` — a terminal agent
   outcome) are **never re-run**; `quota_limited` / `eval_error` /
@@ -216,9 +223,16 @@ WP3b (issue #15, PLAN §2.4–2.7):
   absent-tier) model is refused, a model missing from the list is
   refused, a JSON shape change is a typed `ModelGateError` refusal;
   a paid override requires **both** an explicit `allow_paid` config
-  **and** a positive token budget (CLI: `--model`, `--allow-paid`,
-  `--token-budget`, `--models-json` / `--devin-bin`; a refusal exits
-  2 before the batch starts).
+  **and** a positive (finite) token budget (CLI: `--model`,
+  `--allow-paid`, `--token-budget`, `--models-json` / `--devin-bin`;
+  a refusal exits 2 before the batch starts; the gate flags without
+  `--model` exit 2 too — the gate is a no-op there, and a silent
+  no-op that "validated" nothing is a footgun). The Runner's default
+  clock is **wall time** (`time.time`): the backoff target is the next
+  *epoch* UTC midnight (WP0 §4 "calendar basis"), so a monotonic
+  (boot-relative) clock would align the sleep ~24 h off the real quota
+  reset (the WP3a default, review finding — WP3b's per-window
+  pre-flight makes the phase alignment load-bearing).
 - **Zero-quota pre-flight** (PLAN §2.7): `Preflight` runs the ordered,
   short-circuiting legs — `devin auth status` ok → Docker daemon
   responsive (bounded — a hung daemon is a failure, not a wait) →

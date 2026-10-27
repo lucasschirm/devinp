@@ -86,7 +86,11 @@ WP3b acceptance mapping (issue #15, PLAN §2.4–§2.7):
   :func:`test_jsonl_checkpoint_roundtrip`,
   :func:`test_jsonl_checkpoint_refuses_unknown_status`,
   :func:`test_resume_from_checkpoint_convenience`,
-  :func:`test_checkpoint_resume_e2e_host_crash_retry_class`
+  :func:`test_checkpoint_resume_e2e_host_crash_retry_class`,
+  :func:`test_checkpoint_resume_torn_tail_repaired`,
+  :func:`test_checkpoint_resume_torn_tail_complete_json_no_newline`,
+  :func:`test_checkpoint_resume_mid_file_corruption_refuses_repair`,
+  :func:`test_resume_queue_non_dict_record_is_typed`
 * AC2 — pass@1 retry classes → :func:
   `test_resume_never_rerun_agent_outcomes`, :func:
   `test_resume_only_retry_classes_rerun`, :func:
@@ -107,7 +111,11 @@ WP3b acceptance mapping (issue #15, PLAN §2.4–§2.7):
   `test_cli_gate_shape_change_refused`, :func:
   `test_cli_gate_paid_override`, :func:
   `test_cli_gate_paid_override_without_budget`, :func:
-  `test_cli_gate_live_devin_bin`
+  `test_cli_gate_live_devin_bin`, :func:
+  `test_cli_gate_flags_without_model_refused`, :func:
+  `test_fetch_models_list_none_stdout_fail_closed`, :func:
+  `test_gate_inf_token_budget_refused`, :func:
+  `test_next_quota_window_wall_clock_alignment`
 * AC4 — zero-quota pre-flight before every batch and each instance →
   :func:`test_preflight_checks_short_circuit_at_first_failure`,
   :func:`test_preflight_checks_all_ok`, :func:
@@ -119,7 +127,8 @@ WP3b acceptance mapping (issue #15, PLAN §2.4–§2.7):
   `test_preflight_batch_failure_aborts_before_any_session`, :func:
   `test_preflight_instance_failure_marks_releases_claim_aborts`,
   :func:`test_preflight_batch_reruns_each_window`, :func:
-  `test_preflight_failure_resume_cycle`
+  `test_preflight_failure_resume_cycle`, :func:
+  `test_preflight_wall_excluded_from_session_wall`
 """
 
 from __future__ import annotations
@@ -1982,3 +1991,171 @@ def test_cli_gate_live_devin_bin(tmp_path, capsys):
     w = _make_wrapper(tmp_path, f"\"{sys.executable}\" \"{MOCK_PATH}\"")
     assert r.main(["--model", "swe-2-high", "--devin-bin", w]) == 0
     assert r.main(["--model", "swe-1-7", "--devin-bin", w]) == 2
+
+
+# ---------------------------------------------------------------------------
+# WP3b review round 1 (PR #30) — review-finding regressions
+# ---------------------------------------------------------------------------
+
+
+def test_checkpoint_resume_torn_tail_repaired(tmp_path):
+    """Review round 1 [blocker]: a resumed run must not append onto the
+    torn tail. The file has a complete line + a torn fragment (no
+    newline); the fresh :class:`~runner.JsonlCheckpoint` (the resume
+    writer) truncates the fragment on open, so two appended records
+    are clean *mid-file* lines on the next load (no
+    ``RunnerProtocolError``), and the resume decision respected the
+    torn ``quota_limited`` drop (i1 re-ran — exactly once)."""
+    p = str(tmp_path / "run-1.jsonl")
+    with open(p, "w", encoding="utf-8") as f:
+        f.write('{"instance_id": "i0", "status": "resolved", "meta": {}, "ts": 1.0}\n')
+        f.write('{"instance_id": "i1", "status": "quota_lim')  # the torn tail
+    # the resume decision (the reader half)
+    records, dropped = r.load_checkpoint(p)
+    assert dropped is True
+    assert [rec["instance_id"] for rec in records] == ["i0"]
+    to_run, skipped = r.resume_queue(["i0", "i1", "i2"], records)
+    assert to_run == ["i1", "i2"]
+    # the writer half: open (repair), append two records, close
+    e = Env()
+    ckpt = r.JsonlCheckpoint(p, clock=e.clock)
+    r.Runner(to_run, lambda inst: FakeSession(e.registry,
+                                             "resolved" if inst == "i2"
+                                             else "no_patch",
+                                             clock=e.clock),
+             clock=e.clock, sleeper=e.sleeper, reporter=ckpt).run()
+    ckpt.close()
+    # the next load is clean — no glued mid-file line, nothing dropped
+    recs2, dropped2 = r.load_checkpoint(p)
+    assert dropped2 is False
+    assert [(rec["instance_id"], rec["status"]) for rec in recs2] == [
+        ("i0", "resolved"), ("i1", "no_patch"), ("i2", "resolved")]
+    # and a resume after the resumed run re-runs nothing
+    to_run3, _ = r.resume_queue(["i0", "i1", "i2"], recs2)
+    assert to_run3 == []
+
+
+def test_checkpoint_resume_torn_tail_complete_json_no_newline(tmp_path):
+    """Review round 1 [blocker], the second shape: a kill after the
+    JSON is complete but before the ``"\\n"`` — the record is
+    *complete* (the reader keeps it) and the writer must complete it
+    (newline) rather than truncate it, so the appended record is a
+    clean line and the completed record is not silently lost (a lost
+    ``resolved`` record would re-run a finished instance — a pass@1
+    violation)."""
+    p = str(tmp_path / "run-1.jsonl")
+    with open(p, "w", encoding="utf-8") as f:
+        f.write('{"instance_id": "i0", "status": "resolved", "meta": {}, "ts": 1.0}\n')
+        f.write('{"instance_id": "i1", "status": "resolved", "meta": {}, "ts": 2.0}')
+    # the reader half keeps the complete (un-newlined) record
+    records, dropped = r.load_checkpoint(p)
+    assert dropped is False
+    assert [rec["instance_id"] for rec in records] == ["i0", "i1"]
+    to_run, _ = r.resume_queue(["i0", "i1", "i2"], records)
+    assert to_run == ["i2"]  # both resolved records stand — no re-run
+    # the writer half completes the record instead of truncating it
+    e = Env()
+    ckpt = r.JsonlCheckpoint(p, clock=e.clock)
+    r.Runner(["i2"], lambda inst: FakeSession(e.registry, "resolved",
+                                             clock=e.clock),
+             clock=e.clock, sleeper=e.sleeper, reporter=ckpt).run()
+    ckpt.close()
+    recs2, dropped2 = r.load_checkpoint(p)
+    assert dropped2 is False
+    assert [rec["instance_id"] for rec in recs2] == ["i0", "i1", "i2"]
+    assert [rec["status"] for rec in recs2] == ["resolved"] * 3
+    # the raw file is clean: three newline-terminated lines, no glue
+    raw = open(p, encoding="utf-8").read()
+    assert raw.endswith("\n") and raw.count("\n") == 3
+
+
+def test_checkpoint_resume_mid_file_corruption_refuses_repair(tmp_path):
+    """The repair is fail-loud like the reader: a mid-file corruption
+    (fsync'd — not a kill artifact) refuses the open, not a silent
+    truncation."""
+    p = str(tmp_path / "run-1.jsonl")
+    with open(p, "w", encoding="utf-8") as f:
+        f.write('{"instance_id": "i0", "status": "resolved", "meta": {}, "ts": 1.0}\n')
+        f.write("GARBAGE-NOT-JSON\n")
+        f.write('{"instance_id": "i2", "status": "timeout", "meta": {}, "ts": 3.0}\n')
+    with pytest.raises(r.RunnerProtocolError):
+        r.JsonlCheckpoint(p)
+
+
+def test_resume_queue_non_dict_record_is_typed():
+    """A non-dict record (a direct-API caller with a malformed list) is
+    a typed contract error, not a bare AttributeError."""
+    with pytest.raises(r.RunnerProtocolError, match="not a dict"):
+        r.resume_queue(["i0"], ["not-a-dict"])
+
+
+def test_gate_inf_token_budget_refused():
+    """The paid override's token budget must be finite: ``inf`` is not
+    a budget (an unbounded token budget is not a budget)."""
+    fx = _gate_fixture()
+    for bad in (float("inf"), float("nan")):
+        g = r.gate_cost_tier(fx, "swe-1-7", allow_paid=True,
+                            token_budget=bad)
+        assert not g.allowed, bad
+        assert "token budget" in g.reason
+    # a large (but finite) int budget is still valid
+    g = r.gate_cost_tier(fx, "swe-1-7", allow_paid=True,
+                         token_budget=10**12)
+    assert g.allowed
+
+
+def test_fetch_models_list_none_stdout_fail_closed(tmp_path):
+    """A stubbed ``run`` returning ``stdout=None`` (a non-str/bytes
+    seam value) is a fail-closed refusal, not a traceback."""
+    def run(cmd, timeout_s):
+        return types.SimpleNamespace(returncode=0, stdout=None,
+                                    stderr=b"")
+    with pytest.raises(r.ModelGateError, match="fail-closed"):
+        r.fetch_models_list("whatever", run=run)
+
+
+def test_cli_gate_flags_without_model_refused(capsys):
+    """The gate flags are inert without --model — the CLI refuses them
+    there (an explicit contract: a silent no-op that "validated"
+    nothing is a footgun)."""
+    for flags in (["--allow-paid"], ["--token-budget", "1000"],
+                 ["--devin-bin", "somedevin"]):
+        assert r.main(flags) == 2, flags
+        assert "--model" in capsys.readouterr().err
+    # --models-json alone is refused too (it names the gate's input)
+    assert r.main(["--models-json", "x.json"]) == 2
+
+
+def test_next_quota_window_wall_clock_alignment():
+    """The Runner's default clock is wall time (``time.time``): the
+    backoff target is a true UTC midnight in epoch seconds (review
+    finding — the WP3a default ``time.monotonic`` would align the
+    sleep to a boot-dependent phase, up to ~24 h off the real quota
+    reset; WP3b's per-window pre-flight makes the alignment
+    load-bearing)."""
+    import inspect
+    import time as _t
+    now = _t.time()
+    w = r.next_quota_window(now)
+    assert w > now and w % 86400 == 0 and w - now < 86400
+    sig = inspect.signature(r.Runner.__init__)
+    assert sig.parameters["clock"].default is _t.time
+
+
+def test_preflight_wall_excluded_from_session_wall():
+    """The *session* wall (the budget ``record_wall`` charge) excludes
+    the zero-quota pre-flight time (a pre-flight consumes no session
+    quota); the pre-flight wall is recorded in the failure mark's meta
+    only."""
+    e = Env()
+
+    def pf(inst):
+        e.clock.advance(5.0)  # the pre-flight consumes 5 s of wall
+
+    runner = e.make(["i0"], {"i0": "resolved"}, preflight=pf,
+                   factory=lambda inst: FakeSession(
+                       e.registry, "resolved", clock=e.clock, hold_s=2.0))
+    runner.run()
+    ev = [ev for ev in e.reporter.events if ev[0] == "instance"][0]
+    assert ev[3]["wall_s"] == 2.0  # the session wall, not 2.0 + 5.0
+    assert runner.budget.wall_used_s == 2.0
