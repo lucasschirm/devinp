@@ -96,24 +96,40 @@ Flow:
 1. **Typed validation (pre-harness, zero cost):**
    * `instance_id` a non-empty str, else `InvalidInputError`.
    * `model_patch` a str or None, else `InvalidInputError`.
-   * A non-empty patch must carry unified-diff file headers (`--- ` / `+++ `
-     lines), else `PatchCorruptionError` — a garbage/truncated-without-headers
-     patch fails clean *before* any dataset download or Docker work. (A
-     truncated patch that is still structurally well-formed reaches the
-     harness's git-apply chain — that is the *definitive* corruption guard,
-     step 4; both layers report `PatchCorruptionError`.)
+   * `run_id` (when given) on the Docker container-name character set
+     `[A-Za-z0-9._-]`, starting alphanumeric, without `..` — it becomes the
+     eval container name suffix and a CWD-relative log path component
+     (whitespace / `/` / `..` are refused, not absorbed), else
+     `InvalidInputError`.
+   * `dataset` / `split` non-empty str; `workdir` a str/path (or None);
+     `python` a str (or None); `harness_runner` callable (or None) — else
+     `InvalidInputError` (the same "never a raw TypeError" contract).
    * **Empty/None patch → short-circuit**
-     `{"resolved": False, "logs": {"empty_patch": True, ...}}` — the harness's
+     `{"resolved": False, "logs": {"empty_patch": True, …}}` — the harness's
      own filter semantics (fact 4); no harness spawn, no dataset download, no
      Docker.
+   * **No structural patch pre-check** — the harness's 4-command git-apply
+     chain (fact 5) is the *sole authority* on applicability: it accepts
+     patch forms without `---`/`+++` file headers (rename-only / mode-only
+     `diff --git` hunks, `GIT binary patch` sections, tab-separated
+     `diff -u` headers, context/normal diffs), so a header check would
+     reject applicable patches before they could ever reach the harness and
+     score `resolved`. Every non-empty patch reaches the harness.
 2. **Predictions file** — `<workdir>/predictions.jsonl`, one JSON line with
    *exactly* the three standard fields (`instance_id`,
-   `model_name_or_path`, `model_patch`), the WP0-verified format.
+   `model_name_or_path`, `model_patch`), the WP0-verified format. A
+   relative `workdir` is resolved to an absolute path **before** the
+   spawn — the harness resolves `-p` / `--report_dir` against its own cwd
+   (= workdir), so an unresolved relative path would double-resolve
+   (`workdir/workdir/…`).
 3. **The delegation (AC1)** — the *only* harness interaction:
    `[python, "-m", "swebench.harness.run_evaluation", "-d", dataset, "-s",
    split, "-p", <preds>, "-i", <iid>, "-id", <run_id>, "--max_workers", "1",
    "-t", <timeout>, "--report_dir", <workdir>]`, run with `cwd=workdir`
-   (fact 2). No custom apply/grade flags; no other harness touch.
+   (fact 2). No custom apply/grade flags; no other harness touch. A runner
+   spawn failure (missing `python` → `FileNotFoundError`, fork/exec
+   `OSError`) or a malformed process result (no usable `returncode`) is a
+   typed `HarnessFailedError`, never a raw traceback escape.
 4. **Outcome resolution — reading only what the harness wrote (AC3):**
    * exit ≠ 0 → `HarnessFailedError` (typed; stderr tail in the message —
      e.g. unknown instance id, dataset fetch failure, unreachable daemon).
@@ -123,7 +139,10 @@ Flow:
      `APPLY_PATCH_FAIL` in `run_instance.log` → `PatchCorruptionError` (the
      clean typed error for a truncated patch — AC4); the timeout marker in
      `test_output.txt` → `EvaluationTimeoutError`; anything else →
-     `EvaluationInfraError` (Docker/infra failure; log tail in the message).
+     `HarnessFailedError` (Docker/infra failure; log tail in the message).
+   * a `report.json` that is unreadable (non-UTF-8 / invalid JSON) or not a
+     JSON object is a typed `HarnessFailedError`, never a raw
+     `UnicodeDecodeError` / `AttributeError` escape.
    * A typed error carries `instance_id`, the log paths, and the relevant
      harness output tail — a clean typed error, never a traceback escape.
 5. **Return contract (AC3):**
@@ -148,10 +167,10 @@ Error hierarchy (all carry `.instance_id` + log paths where applicable):
 
 ```
 EvaluationError(Exception)
-├── InvalidInputError      # bad instance_id / non-str patch
-├── PatchCorruptionError   # no diff structure (pre) / APPLY_PATCH_FAIL (post)
+├── InvalidInputError      # typed refusal of any bad call input
+├── PatchCorruptionError   # the harness's own git-apply chain wrote APPLY_PATCH_FAIL
 ├── EvaluationTimeoutError # harness test timeout
-└── HarnessFailedError     # subprocess exit ≠ 0 / infra (no report, no marker)
+└── HarnessFailedError     # spawn/exit ≠ 0 / infra (no report, no marker) / unreadable report
 ```
 
 A small operator CLI (`python bench/evaluate.py --instance-id … --patch-file …
@@ -175,9 +194,13 @@ exit 0 with the JSON result on stdout (resolved *or* unresolved), 2
 * **AC3 (`{resolved, logs}`)** → the return contract (step 5); `resolved` is
   only ever the harness's `report.json` value (step 4) or the documented
   harness empty-patch semantics (step 1) — no bespoke grading.
-* **AC4 corruption guard** → two layers, both typed: the zero-cost pre-check
-  (step 1) and the definitive post-harness triage on the harness's own
-  `APPLY_PATCH_FAIL` marker (step 4).
+* **AC4 corruption guard** → the harness's own 4-command git-apply chain is
+  the *sole authority* on applicability (fact 5) — no structural pre-check
+  (it would reject patch forms the chain applies: rename/mode-only git
+  hunks, `GIT binary patch` sections, tab-separated `diff -u` headers,
+  context diffs); a truncated/garbage patch reaches the harness, the chain
+  fails, and the harness's own `APPLY_PATCH_FAIL` marker (step 4) becomes a
+  clean typed `PatchCorruptionError`, never a crash.
 
 ## Tests — `bench/tests/test_evaluate.py`
 
@@ -190,10 +213,22 @@ exit 0 with the JSON result on stdout (resolved *or* unresolved), 2
 * **Fresh-container naming** — the default `run_id` is unique per call; the
   harness container name `sweb.eval.<iid>.<run_id>` ≠ the agent container
   name `sweb.eval.<iid>`.
-* **Validation matrix** — empty/non-str `instance_id`, non-str `model_patch`
-  (bytes/dict) → `InvalidInputError`; header-less garbage patch →
-  `PatchCorruptionError` with **no harness spawn** (injected runner not
+* **Validation matrix** — empty/non-str `instance_id`, non-str
+  `model_patch` (bytes/dict), run_id charset (whitespace / `/` / `..` /
+  non-str), empty model name, bad timeout, empty/non-str `dataset` / `split`,
+  non-path `workdir`, non-str `python`, non-callable `harness_runner` →
+  `InvalidInputError`, typed before any side effect (injected runner not
   called — no dataset download, no Docker).
+* **Corruption guard (unit, fabricated tree)** — every non-empty patch
+  (incl. header-less garbage — the forms a header check would have wrongly
+  rejected) reaches the harness; the fabricated `APPLY_PATCH_FAIL` marker →
+  `PatchCorruptionError`; a well-formed-but-truncated gold patch → same.
+* **Delegation robustness edges** — a relative `workdir` is resolved to an
+  absolute path before the spawn (`-p` / `--report_dir` / cwd all
+  absolute); a runner spawn failure (`FileNotFoundError` / `OSError`) and a
+  process object without a usable `returncode` → typed
+  `HarnessFailedError`, never a raw traceback; a non-object or non-UTF-8
+  `report.json` → typed `HarnessFailedError`.
 * **Negative control (docker-free)** — `""` and `None` patch →
   `resolved is False`, `empty_patch: True`, **no harness spawn**.
 * **Post-harness triage against fabricated harness trees** (no Docker — the
@@ -201,13 +236,14 @@ exit 0 with the JSON result on stdout (resolved *or* unresolved), 2
   (resolved true / false) → passthrough of the harness value; no report +
   `APPLY_PATCH_FAIL` in `run_instance.log` → `PatchCorruptionError`; timeout
   marker in `test_output.txt` → `EvaluationTimeoutError`; no report, no
-  marker → `EvaluationInfraError`; exit ≠ 0 → `HarnessFailedError` with the
+  marker → `HarnessFailedError`; exit ≠ 0 → `HarnessFailedError` with the
   stderr tail.
 * **Container-id extraction** — from a fixture `run_instance.log` (the
   harness's own `Container for … created/started: <id>` line); absent log →
   `None` (never a crash).
-* **CLI** — `--help`; bad input → exit 2; success (injected runner) → JSON
-  with `resolved` on stdout.
+* **CLI** — `--help`; bad input (missing / directory / non-UTF-8 patch
+  file) → exit 2; success (injected runner) → JSON with `resolved` on
+  stdout; the typed error classes → exit 3/4/5.
 
 **Integration (CI — public images, zero quota; auto-skip without a Docker
 daemon, which this dev workspace lacks, so these run in CI):**

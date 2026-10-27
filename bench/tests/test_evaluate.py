@@ -38,21 +38,30 @@ Acceptance mapping (issue #17, ``bench/PLAN-WP4.md``):
     and locally): :func:`test_negative_control_no_op_patch_is_unresolved`
     (``""`` and ``None``; **no harness spawn** — the harness's own
     empty-patch filter semantics, verified in the pinned source);
-  * pre-check corruption guard: :func:`test_headerless_patch_is_corruption_
-    and_spawns_nothing`;
-  * definitive corruption guard (a well-formed-but-truncated patch reaches
-    the harness; its own git-apply chain fails and writes the
-    ``APPLY_PATCH_FAIL`` marker → typed error): :func:`test_truncated_
-    wellformed_patch_reaches_harness_and_is_corruption` (unit, fabricated
-    tree) and :func:`test_integration_corruption_guard_truncated_gold_patch`
-    (real harness, real container);
+  * corruption guard (the harness's own 4-command git-apply chain is the
+    sole authority on applicability — no structural pre-check, so every
+    non-empty patch reaches the harness; the chain's ``APPLY_PATCH_FAIL``
+    marker becomes a clean typed error): :func:`test_nonempty_patch_
+    always_reaches_harness_and_apply_fail_is_typed` (header-less garbage
+    — the forms a header check would have wrongly rejected) and
+    :func:`test_truncated_wellformed_patch_reaches_harness_and_is_
+    corruption` (unit, fabricated tree) and
+    :func:`test_integration_corruption_guard_truncated_gold_patch` (real
+    harness, real container);
   * corruption triage edges: :func:`test_no_report_timeout_marker_is_
     evaluation_timeout`, :func:`test_no_report_no_marker_is_infra_error`,
     :func:`test_exit_nonzero_is_harness_failed_with_stderr_tail`,
     :func:`test_unreadable_report_is_harness_failed`,
     :func:`test_report_missing_instance_entry_is_harness_failed`;
   * validation matrix (typed, before any side effect):
-    :func:`test_input_validation_matrix`;
+    :func:`test_input_validation_matrix` (instance id / patch / run_id
+    charset / model name / timeout), :func:`test_extra_input_validation_
+    matrix` (dataset / split / workdir / python / harness_runner);
+  * the delegation's robustness edges: :func:`test_relative_workdir_is_
+    resolved_to_absolute_before_spawn`, :func:`test_runner_spawn_failure_
+    is_typed_not_raw`, :func:`test_process_object_without_returncode_is_
+    typed`, :func:`test_non_object_report_is_harness_failed`,
+    :func:`test_non_utf8_report_is_harness_failed`;
   * isolation: asserted inside :func:`test_integration_positive_control`
     (eval container id ≠ agent container id; the eval container id is a
     real container id from the harness's own log).
@@ -278,18 +287,32 @@ def test_default_run_id_is_unique_per_call(tmp_path):
     assert run_ids[0].startswith("eval-iid-")
 
 
-def test_eval_container_name_never_equals_agent_container_name():
+def test_eval_container_name_never_equals_agent_container_name(tmp_path):
     """The harness names the eval container ``sweb.eval.<iid>.<run_id>``
     (verified in the pinned source, create_container); the adapter names the
-    agent container ``sweb.eval.<iid>`` (PLAN §1). With a non-empty run_id
-    the two can never be equal — and our default run_id is always non-empty
-    and unique. AC2."""
+    agent container ``sweb.eval.<iid>`` (PLAN §1). The guarantee lives in
+    production code — the validated, per-call unique ``run_id`` flows into
+    the name — so this test asserts it against the run id values the
+    module *actually emits* (not against strings the test constructs)."""
     instance_id = "pallets__flask-5014"
     agent_name = f"sweb.eval.{instance_id}"
-    for run_id in ("eval-x-01234567", "rid-custom"):
+    # the default (unique, production-emitted) run id
+    for i in range(2):
+        fake = FakeHarness()  # no tree: the random run id has no report → infra error
+        with pytest.raises(ev.HarnessFailedError):
+            ev.evaluate(instance_id, _WELLFORMED_PATCH, workdir=tmp_path, harness_runner=fake)
+        argv, _ = fake.calls[0]
+        run_id = argv[argv.index("-id") + 1]
+        assert run_id  # non-empty — the whole name separation rests on this
         eval_name = f"sweb.eval.{instance_id.lower()}.{run_id}"
         assert eval_name != agent_name
         assert eval_name.endswith(f".{run_id}")  # the suffix the agent name lacks
+    # an explicit run id: same guarantee, value taken from the emitted argv
+    fake = FakeHarness(tree=_report_tree("rid-custom", "devin", instance_id, resolved=False))
+    ev.evaluate(instance_id, _WELLFORMED_PATCH, workdir=tmp_path, run_id="rid-custom", harness_runner=fake)
+    argv, _ = fake.calls[0]
+    run_id = argv[argv.index("-id") + 1]
+    assert f"sweb.eval.{instance_id.lower()}.{run_id}" != agent_name
 
 
 # ---------------------------------------------------------------------------
@@ -366,25 +389,38 @@ def test_negative_control_no_op_patch_is_unresolved(tmp_path):
         assert fake.calls == []  # no dataset download, no Docker
 
 
-def test_headerless_patch_is_corruption_and_spawns_nothing(tmp_path):
-    """Corruption guard, layer 1: garbage (no ``---``/``+++`` file headers)
-    fails clean *before* any harness spawn (no dataset download, no
-    Docker)."""
+def test_nonempty_patch_always_reaches_harness_and_apply_fail_is_typed(tmp_path):
+    """No structural pre-check is made (deliberate): the harness's own
+    4-command apply chain is the *sole authority* on patch applicability —
+    it accepts patch forms without ``---``/``+++`` file headers (rename-only
+    and mode-only ``diff --git`` hunks, ``GIT binary patch`` sections,
+    tab-separated ``diff -u`` headers, context/normal diffs), so a header
+    check would reject applicable patches before they could ever reach the
+    harness and score ``resolved``. Every non-empty patch — even header-less
+    garbage — therefore reaches the harness, and the chain's
+    ``APPLY_PATCH_FAIL`` marker becomes a clean typed error."""
     for garbage in ("hello world", "just some text\nno diff here", "---\n+++\n"):
-        fake = FakeHarness()
-        with pytest.raises(ev.PatchCorruptionError) as e:
-            ev.evaluate("iid", garbage, workdir=tmp_path, harness_runner=fake)
-        assert e.value.instance_id == "iid"
-        assert fake.calls == []
+        fake = FakeHarness(
+            tree=lambda cwd: _build_tree(
+                cwd,
+                "rid",
+                "devin",
+                "iid",
+                instance_log="applying patch…\n>>>>> Patch Apply Failed:\nerror: corrupt patch\n",
+            )
+        )
+        with pytest.raises(ev.PatchCorruptionError):
+            ev.evaluate("iid", garbage, workdir=tmp_path, run_id="rid", harness_runner=fake)
+        assert len(fake.calls) == 1  # the harness *was* spawned
 
 
 def test_truncated_wellformed_patch_reaches_harness_and_is_corruption(tmp_path):
-    """Corruption guard, layer 2 (definitive): a truncation that still
-    leaves both diff headers is structurally well-formed — it reaches the
-    harness, whose git-apply chain fails and writes its own
-    APPLY_PATCH_FAIL marker; the marker becomes a clean typed error."""
+    """A truncation that still leaves both diff headers is structurally
+    well-formed — it reaches the harness, whose git-apply chain fails and
+    writes its own APPLY_PATCH_FAIL marker; the marker becomes a clean typed
+    error."""
     truncated = _truncated_gold_patch()
-    assert "--- " in truncated and "+++ " in truncated  # layer 1 passes it
+    assert "--- " in truncated and "+++ " in truncated  # well-formed: it reaches the harness
     fake = FakeHarness(
         tree=lambda cwd: _build_tree(
             cwd,
@@ -465,6 +501,79 @@ def test_report_missing_instance_entry_is_harness_failed(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# robustness edges — typed, never a traceback escape
+# ---------------------------------------------------------------------------
+
+
+def test_relative_workdir_is_resolved_to_absolute_before_spawn(tmp_path, monkeypatch):
+    """The harness resolves -p / --report_dir against its own cwd (= workdir),
+    so a relative workdir must be resolved before the spawn or the paths
+    double-resolve (workdir/workdir/…) and every relative-workdir call
+    fails."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "rel-workdir").mkdir()
+    fake = FakeHarness(tree=lambda cwd: _build_tree(cwd, "rid", "devin", "iid", report={"iid": {"resolved": False}}))
+    ev.evaluate("iid", _WELLFORMED_PATCH, workdir="rel-workdir", run_id="rid", harness_runner=fake)
+    argv, cwd = fake.calls[0]
+    assert cwd == str(tmp_path / "rel-workdir")  # absolute cwd
+    assert argv[argv.index("-p") + 1] == str(tmp_path / "rel-workdir" / "predictions.jsonl")
+    assert argv[argv.index("--report_dir") + 1] == str(tmp_path / "rel-workdir")
+
+
+def test_runner_spawn_failure_is_typed_not_raw(tmp_path):
+    """A spawn failure of the harness subprocess (missing python →
+    FileNotFoundError; fork/exec limits → OSError) is a typed
+    HarnessFailedError, never a raw traceback escape."""
+    def boom(argv, cwd):
+        raise FileNotFoundError(2, "No such file or directory", "/nope")
+
+    with pytest.raises(ev.HarnessFailedError) as e:
+        ev.evaluate("iid", _WELLFORMED_PATCH, workdir=tmp_path, run_id="rid", harness_runner=boom)
+    assert "harness runner failed" in e.value.message
+
+
+def test_process_object_without_returncode_is_typed(tmp_path):
+    """A process object without a usable returncode (a malformed runner
+    result) is a typed HarnessFailedError — proc.returncode is never
+    accessed bare."""
+    class NoReturncode:
+        stdout = ""
+        stderr = ""
+
+    with pytest.raises(ev.HarnessFailedError):
+        ev.evaluate("iid", _WELLFORMED_PATCH, workdir=tmp_path, run_id="rid",
+                    harness_runner=lambda a, c: NoReturncode())
+
+
+def test_non_object_report_is_harness_failed(tmp_path):
+    """A valid-JSON-but-not-an-object report.json is a typed
+    HarnessFailedError (not an AttributeError escape)."""
+    def tree(cwd: Path) -> None:
+        _build_tree(cwd, "rid", "devin", "iid")
+        (cwd / "logs" / "run_evaluation" / "rid" / "devin" / "iid" / "report.json").write_text(
+            '["a", "list"]', encoding="utf-8"
+        )
+
+    fake = FakeHarness(tree=tree)
+    with pytest.raises(ev.HarnessFailedError):
+        ev.evaluate("iid", _WELLFORMED_PATCH, workdir=tmp_path, run_id="rid", harness_runner=fake)
+
+
+def test_non_utf8_report_is_harness_failed(tmp_path):
+    """A non-UTF-8 report.json is a typed HarnessFailedError (not a
+    UnicodeDecodeError escape)."""
+    def tree(cwd: Path) -> None:
+        _build_tree(cwd, "rid", "devin", "iid")
+        (cwd / "logs" / "run_evaluation" / "rid" / "devin" / "iid" / "report.json").write_bytes(
+            b"\xff\xfe{invalid"
+        )
+
+    fake = FakeHarness(tree=tree)
+    with pytest.raises(ev.HarnessFailedError):
+        ev.evaluate("iid", _WELLFORMED_PATCH, workdir=tmp_path, run_id="rid", harness_runner=fake)
+
+
+# ---------------------------------------------------------------------------
 # validation matrix — typed, before any side effect
 # ---------------------------------------------------------------------------
 
@@ -485,6 +594,12 @@ def test_report_missing_instance_entry_is_harness_failed(tmp_path):
         ("iid", _WELLFORMED_PATCH, None, "devin", -5),  # timeout negative
         ("iid", _WELLFORMED_PATCH, None, "devin", "1800"),  # timeout str
         ("iid", _WELLFORMED_PATCH, None, "devin", True),  # timeout bool
+        ("iid", _WELLFORMED_PATCH, "has\ttab", "devin", 1800),  # run_id tab
+        ("iid", _WELLFORMED_PATCH, "has\nnewline", "devin", 1800),  # run_id newline
+        ("iid", _WELLFORMED_PATCH, "with/slash", "devin", 1800),  # run_id slash
+        ("iid", _WELLFORMED_PATCH, "..", "devin", 1800),  # run_id traversal
+        ("iid", _WELLFORMED_PATCH, ".leading", "devin", 1800),  # run_id leading dot
+        ("iid", _WELLFORMED_PATCH, 42, "devin", 1800),  # non-str run_id
     ],
 )
 def test_input_validation_matrix(
@@ -500,6 +615,35 @@ def test_input_validation_matrix(
             timeout=timeout,
             workdir=tmp_path,
             harness_runner=fake,
+        )
+    assert fake.calls == []  # typed before any side effect
+
+
+@pytest.mark.parametrize(
+    ("dataset", "split", "workdir", "python", "harness_runner"),
+    [
+        ("", "test", None, None, None),  # empty dataset
+        (None, "test", None, None, None),  # non-str dataset
+        ("SWE-bench/SWE-bench_Verified", "", None, None, None),  # empty split
+        ("SWE-bench/SWE-bench_Verified", 42, None, None, None),  # non-str split
+        ("SWE-bench/SWE-bench_Verified", "test", 42, None, None),  # non-path workdir
+        ("SWE-bench/SWE-bench_Verified", "test", None, 42, None),  # non-str python
+        ("SWE-bench/SWE-bench_Verified", "test", None, None, "not-callable"),  # non-callable runner
+    ],
+)
+def test_extra_input_validation_matrix(dataset, split, workdir, python, harness_runner, tmp_path):
+    """The remaining call inputs are validated typed too — the same
+    'never a raw TypeError' contract as the primary matrix."""
+    fake = FakeHarness()
+    with pytest.raises(ev.InvalidInputError):
+        ev.evaluate(
+            "iid",
+            _WELLFORMED_PATCH,
+            dataset=dataset,
+            split=split,
+            workdir=workdir if workdir is not None else tmp_path,
+            python=python,
+            harness_runner=harness_runner if harness_runner is not None else fake,
         )
     assert fake.calls == []  # typed before any side effect
 
@@ -541,6 +685,20 @@ def test_cli_success_prints_json_on_stdout(tmp_path, capsys):
 
 def test_cli_missing_patch_file_is_exit_2(tmp_path, capsys):
     code = ev.main(["--instance-id", "iid", "--patch-file", str(tmp_path / "nope")])
+    assert code == 2
+    assert "Invalid input" in capsys.readouterr().err
+
+
+def test_cli_directory_patch_file_is_exit_2(tmp_path, capsys):
+    code = ev.main(["--instance-id", "iid", "--patch-file", str(tmp_path)])  # a directory
+    assert code == 2
+    assert "Invalid input" in capsys.readouterr().err
+
+
+def test_cli_non_utf8_patch_file_is_exit_2(tmp_path, capsys):
+    patch_file = tmp_path / "bad.patch"
+    patch_file.write_bytes(b"\xff\xfe\x00garbage")
+    code = ev.main(["--instance-id", "iid", "--patch-file", str(patch_file)])
     assert code == 2
     assert "Invalid input" in capsys.readouterr().err
 

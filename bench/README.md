@@ -326,14 +326,16 @@ python -m pytest tests/test_evaluate.py   # unit: zero quota, no Docker (injecte
   in `resolved_ids`); `evaluate` mirrors that exactly by short-circuiting
   to `resolved: False` with `empty_patch: True` — no harness spawn, no
   dataset download, no Docker.
-- **Corruption guard (AC4), two layers, both typed:** a zero-cost
-  pre-check (a non-empty patch must carry `---` / `+++` file headers —
-  garbage fails before any dataset download or Docker work) and the
-  definitive post-harness triage on the harness's own markers (the
-  harness's 4-command git-apply chain fails → its `APPLY_PATCH_FAIL`
-  marker → `PatchCorruptionError`; a timeout marker →
-  `EvaluationTimeoutError`; anything else → `HarnessFailedError` — the WP3
-  `eval_error` retry class). A clean typed error, never a crash.
+- **Corruption guard (AC4):** the harness's own 4-command git-apply chain is
+  the *sole authority* on applicability, so no structural pre-check is made
+  (the chain applies patch forms without `---` / `+++` file headers —
+  rename-only / mode-only `diff --git` hunks, `GIT binary patch`
+  sections, tab-separated `diff -u` headers, context/normal diffs — which a
+  header check would wrongly reject). Every non-empty patch reaches the
+  harness; the chain's `APPLY_PATCH_FAIL` marker → `PatchCorruptionError`,
+  a timeout marker → `EvaluationTimeoutError`, anything else →
+  `HarnessFailedError` (the WP3 `eval_error` retry class). A clean typed
+  error, never a crash.
 
 ## SWE-bench pin (WP0 result)
 
