@@ -221,7 +221,9 @@ def handle(obj):
         # negative control; parity with the WP2 mock — round 5 [minor]).
         send({"jsonrpc": "2.0", "id": rid,
               "error": {"code": -32601,
-                        "message": f"Method not found: {m}"}})
+                        "message": "Method not found"}})
+        # (WP0 capture verbatim: the real server's message carries no
+        # method-name suffix — round 6 [nit])
         return
     # Unknown notification (no id): ignore — vendor/unknown
     # notifications never block (WP0 contract).
@@ -245,7 +247,15 @@ while True:
         try:
             handle(json.loads(line))
         except json.JSONDecodeError:
-            state("bad_line", line=line[:200].decode("utf-8", "replace"))
+            # WP0 negative control: the real server answers a non-JSON
+            # line with a parse error (id null, data.line echoing the
+            # line) and keeps serving (round 6 [minor]: parity with the
+            # WP2 mock, which sends the same frame).
+            bad = line[:200].decode("utf-8", "replace")
+            state("bad_line", line=bad)
+            send({"jsonrpc": "2.0", "id": None,
+                  "error": {"code": -32700, "message": "Parse error",
+                           "data": {"line": bad}}})
 '''
 
 

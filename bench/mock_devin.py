@@ -838,7 +838,9 @@ def _acp(argv: list) -> int:
             # JSON-RPC error, it does not crash (WP0 negative control).
             send({"jsonrpc": "2.0", "id": rid,
                  "error": {"code": -32601,
-                          "message": f"Method not found: {m}"}})
+                          "message": "Method not found"}})
+            # (WP0 capture verbatim: the real server's message carries
+            # no method-name suffix — round 6 [nit])
             return
         # Unknown notification (no id): ignore — vendor/unknown
         # notifications never block (WP0 contract).
