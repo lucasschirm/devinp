@@ -92,6 +92,8 @@ WP3b acceptance mapping (issue #15, PLAN §2.4–§2.7):
   :func:`test_checkpoint_resume_mid_file_corruption_refuses_repair`,
   :func:`test_checkpoint_resume_newline_terminated_non_record_last_line_repaired`,
   :func:`test_checkpoint_resume_blank_last_line_repaired`,
+  :func:`test_checkpoint_resume_non_ascii_prefix_byte_boundary`,
+  :func:`test_checkpoint_resume_torn_tail_mid_multibyte_sequence_dropped`,
   :func:`test_resume_queue_non_dict_record_is_typed`
 * AC2 — pass@1 retry classes → :func:
   `test_resume_never_rerun_agent_outcomes`, :func:
@@ -118,6 +120,7 @@ WP3b acceptance mapping (issue #15, PLAN §2.4–§2.7):
   `test_cli_models_json_and_devin_bin_mutually_exclusive`, :func:
   `test_fetch_models_list_none_stdout_fail_closed`, :func:
   `test_fetch_models_list_missing_stdout_attr_fail_closed`, :func:
+  `test_fetch_models_list_missing_returncode_fail_closed`, :func:
   `test_gate_inf_token_budget_refused`, :func:
   `test_next_quota_window_wall_clock_alignment`
 * AC4 — zero-quota pre-flight before every batch and each instance →
@@ -2111,11 +2114,17 @@ def test_gate_inf_token_budget_refused():
 
 def test_fetch_models_list_none_stdout_fail_closed(tmp_path):
     """A stubbed ``run`` returning ``stdout=None`` (a non-str/bytes
-    seam value) is a fail-closed refusal, not a traceback."""
-    def run(cmd, timeout_s):
+    seam value) is a fail-closed refusal, not a traceback. The stub
+    signature matches the call convention (``capture_output=`` /
+    ``timeout=`` as keywords — the round-3 finding: a positional
+    ``run(cmd, timeout_s)`` raised TypeError on the call itself, which
+    the outer wrap swallowed, and the test never reached the ``stdout``
+    handling it claimed to pin); ``match="not valid JSON"`` pins the
+    stdout path specifically."""
+    def run(cmd, capture_output=None, timeout=None):
         return types.SimpleNamespace(returncode=0, stdout=None,
                                     stderr=b"")
-    with pytest.raises(r.ModelGateError, match="fail-closed"):
+    with pytest.raises(r.ModelGateError, match="not valid JSON"):
         r.fetch_models_list("whatever", run=run)
 
 
@@ -2229,10 +2238,12 @@ def test_fetch_models_list_missing_stdout_attr_fail_closed():
     """A stubbed ``run`` returning an object *without* a ``stdout``
     attribute is a fail-closed typed refusal (the round-2 finding — a
     leaked AttributeError would traceback in ``main()`` instead of
-    exiting 2)."""
-    def run(cmd, timeout_s):
+    exiting 2). The stub signature matches the call convention (the
+    round-3 fix — see the sibling test); ``match="not valid JSON"``
+    pins the ``getattr(proc, 'stdout', None)`` path specifically."""
+    def run(cmd, capture_output=None, timeout=None):
         return types.SimpleNamespace(returncode=0)  # no .stdout / .stderr
-    with pytest.raises(r.ModelGateError, match="fail-closed"):
+    with pytest.raises(r.ModelGateError, match="not valid JSON"):
         r.fetch_models_list("whatever", run=run)
 
 
@@ -2261,3 +2272,82 @@ def test_wall_clock_step_back_clamps_to_zero():
     ev = [ev for ev in e.reporter.events if ev[0] == "instance"][0]
     assert ev[3]["wall_s"] == 0.0  # clamped
     assert runner.budget.wall_used_s == 0.0  # nothing subtracted
+
+
+# ---------------------------------------------------------------------------
+# WP3b review round 3 (PR #30, commit 604890b) — review-finding regressions
+# ---------------------------------------------------------------------------
+
+
+def test_checkpoint_resume_non_ascii_prefix_byte_boundary(tmp_path):
+    """Review round 3 [minor]: the repair's ``boundary`` is a *character*
+    offset (text-mode read) while ``f.truncate`` takes *bytes* — with a
+    non-ASCII record in the preserved prefix (the reader's contract
+    accepts literal non-ASCII records; the writer's own records are
+    ASCII via ``ensure_ascii``), truncating at the character offset
+    cuts *inside* the last clean record, which the next open drops →
+    a finished instance re-runs (the pass@1 violation this code exists
+    to prevent)."""
+    p = str(tmp_path / "run-1.jsonl")
+    # Literal (non-escaped) CJK in the file: 3 chars = 9 bytes, so the
+    # character and byte offsets of the prefix differ by 6 — the exact
+    # shape the old ``f.truncate(boundary)`` corrupted.
+    rec0 = ('{"instance_id": "i0", "status": "resolved", '
+           '"meta": {"reason": "\u65e5\u672c\u8a9e"}, "ts": 1.0}')
+    with open(p, "wb") as f:
+        f.write(rec0.encode("utf-8") + b"\n")
+        f.write(b'{"instance_id": "i1", "status": "quota_lim')  # the torn tail
+    # the reader half drops the torn tail (the CJK record stands)
+    records, dropped = r.load_checkpoint(p)
+    assert dropped is True
+    assert [rec["instance_id"] for rec in records] == ["i0"]
+    # the writer half must preserve the CJK record byte-for-byte
+    e = Env()
+    ckpt = r.JsonlCheckpoint(p, clock=e.clock)
+    r.Runner(["i1"], lambda inst: FakeSession(e.registry, "resolved",
+                                             clock=e.clock),
+             clock=e.clock, sleeper=e.sleeper, reporter=ckpt).run()
+    ckpt.close()
+    # the next load is clean — the last clean record was not torn
+    recs2, dropped2 = r.load_checkpoint(p)
+    assert dropped2 is False
+    assert [rec["instance_id"] for rec in recs2] == ["i0", "i1"]
+    assert recs2[0]["meta"]["reason"] == "日本語"
+    raw = open(p, "rb").read()
+    assert rec0.encode("utf-8") + b"\n" in raw  # intact, byte-for-byte
+
+
+def test_checkpoint_resume_torn_tail_mid_multibyte_sequence_dropped(tmp_path):
+    """A foreign torn tail ending mid-multibyte-sequence is a
+    droppable tail, not a bare UnicodeDecodeError: the reader drops it
+    (``errors="replace"`` — U+FFFD fails the record shape) and the
+    repair truncates it."""
+    p = str(tmp_path / "run-1.jsonl")
+    with open(p, "wb") as f:
+        f.write(b'{"instance_id": "i0", "status": "resolved", "meta": {}, "ts": 1.0}\n')
+        f.write(b'{"instance_id": "i1", "status": "quo')
+        f.write(b"\xe6\x97")  # the first 2 bytes of a 3-byte CJK char — torn
+    records, dropped = r.load_checkpoint(p)  # no UnicodeDecodeError
+    assert dropped is True
+    assert [rec["instance_id"] for rec in records] == ["i0"]
+    e = Env()
+    ckpt = r.JsonlCheckpoint(p, clock=e.clock)
+    r.Runner(["i1"], lambda inst: FakeSession(e.registry, "resolved",
+                                             clock=e.clock),
+             clock=e.clock, sleeper=e.sleeper, reporter=ckpt).run()
+    ckpt.close()
+    recs2, dropped2 = r.load_checkpoint(p)
+    assert dropped2 is False
+    assert [rec["instance_id"] for rec in recs2] == ["i0", "i1"]
+
+
+def test_fetch_models_list_missing_returncode_fail_closed():
+    """A stubbed ``run`` returning an object without a ``returncode``
+    attribute is a fail-closed typed refusal (the round-3 finding — a
+    bare ``proc.returncode`` in the f-string is the same leak class
+    round 2 fixed for ``stdout``): ``rc`` defaults to 1 (unverified —
+    fail-closed) and the message uses it, not a leaked AttributeError."""
+    def run(cmd, capture_output=None, timeout=None):
+        return types.SimpleNamespace(stdout="[]")  # no .returncode / .stderr
+    with pytest.raises(r.ModelGateError, match="fail-closed.*1"):
+        r.fetch_models_list("whatever", run=run)

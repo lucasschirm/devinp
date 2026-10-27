@@ -209,10 +209,17 @@ WP3b (issue #15, PLAN §2.4–2.7):
   a droppable torn tail too) — if a complete record missing only its
   trailing newline is *completed* (newline written), otherwise
   *truncated* via `ftruncate` (atomic w.r.t. the preserved prefix — a
-  kill mid-repair cannot destroy fsync'd records) — so a resumed run
-  never glues its first record onto the tail (mid-file corruption on
-  the next load, or a silently dropped *completed* record — a re-run
-  of a finished instance, a pass@1 violation). `resume_queue` (pure)
+  kill mid-repair cannot destroy fsync'd records; the truncation
+  point is the *encoded byte length* of the prefix — the reader's
+  contract accepts a foreign/hand-edited file with literal non-ASCII
+  records, and a character-offset truncation would cut inside the
+  last clean record; both reader and repair decode with
+  `errors="replace"`, so a foreign torn tail ending
+  mid-multibyte-sequence is a droppable tail, not a bare
+  UnicodeDecodeError) — so a resumed run never glues its first
+  record onto the tail (mid-file corruption on the next load, or a
+  silently dropped *completed* record — a re-run of a finished
+  instance, a pass@1 violation). `resume_queue` (pure)
   splits the full instance list into `to_run` / `skipped`:
   `resolved` / `failed_test` / `timeout` / `no_patch` (and
   `agent_error` — a terminal agent outcome) are **never re-run**;
@@ -241,7 +248,11 @@ WP3b (issue #15, PLAN §2.4–2.7):
   default, review finding — WP3b's per-window pre-flight makes the
   phase alignment load-bearing); wall-clock step-backs (NTP / VM
   snapshots) clamp to 0.0 at the measurement sites — a negative wall
-  would be subtracted from the budget's `wall_used_s`.
+  would be subtracted from the budget's `wall_used_s`. The gate's
+  live fetch and the pre-flight's `devin`/Docker commands are
+  fail-closed end to end: a malformed `proc` (missing / non-
+  sliceable `stdout` / `stderr` / `returncode`) is a typed refusal,
+  not a leaked `AttributeError`/`TypeError`.
 - **Zero-quota pre-flight** (PLAN §2.7): `Preflight` runs the ordered,
   short-circuiting legs — `devin auth status` ok → Docker daemon
   responsive (bounded — a hung daemon is a failure, not a wait) →

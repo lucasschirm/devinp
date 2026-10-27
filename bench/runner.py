@@ -629,13 +629,22 @@ def fetch_models_list(devin_bin: str = "devin", timeout_s: float = 30.0,
             f"fail-closed: `devin models list --format json` could not be "
             f"run: {type(exc).__name__}: {exc}"
         ) from exc
-    if getattr(proc, "returncode", 1) != 0:
+    # ``getattr`` in both the guard and the message (the round-3
+    # finding — a bare ``proc.returncode`` in the f-string is the
+    # same leak class round 2 fixed for ``stdout``); ``rc`` defaults
+    # to 1 (a process object without a returncode is unverified —
+    # fail-closed), and a non-sliceable ``stderr`` is treated as
+    # empty (same as the ``None`` guard above).
+    rc = getattr(proc, "returncode", 1)
+    if rc != 0:
         tail = getattr(proc, "stderr", b"") or b""
         if isinstance(tail, str):
             tail = tail.encode("utf-8", "replace")
+        if not isinstance(tail, (str, bytes)):
+            tail = b""
         raise ModelGateError(
             f"fail-closed: `devin models list --format json` exited "
-            f"{proc.returncode}: "
+            f"{rc}: "
             f"{tail[-200:].decode('utf-8', 'replace').strip()!r}"
         )
     try:
@@ -914,7 +923,7 @@ def load_checkpoint(path: str) -> "tuple[list, bool]":
     """
     if not os.path.exists(path):
         return [], False
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
         raw = f.read()
     return _scan_checkpoint_lines(raw)
 
@@ -968,7 +977,12 @@ def _repair_checkpoint_file(path: str) -> None:
     """
     if not os.path.exists(path):
         return
-    with open(path, "r", encoding="utf-8") as f:
+    # ``errors="replace"``: a foreign torn tail ending mid-multibyte
+    # sequence must be a droppable tail (or a typed mid-file
+    # corruption), not a bare UnicodeDecodeError — an undecodable
+    # byte becomes U+FFFD, which fails the record shape and takes the
+    # normal drop/fail-loud path.
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
         raw = f.read()
     if raw == "":
         return  # nothing to repair
@@ -996,8 +1010,17 @@ def _repair_checkpoint_file(path: str) -> None:
             f.write("\n")  # complete the record — it survives the resume
         return
     # A non-record last line — truncate to the last clean boundary.
+    # ``boundary`` is a *character* offset (``raw`` was read in text
+    # mode); ``f.truncate`` takes *bytes* — the truncation point is the
+    # encoded length of the preserved prefix (a non-ASCII record in the
+    # prefix has more bytes than characters; truncating at the character
+    # offset would cut inside the last clean record, which the next
+    # open then drops → a finished instance re-runs, a pass@1
+    # violation). The writer's own records are ASCII (``ensure_ascii``
+    # is the ``json.dumps`` default), but the reader's contract accepts
+    # a foreign/hand-edited file with literal non-ASCII records.
     with open(path, "r+b") as f:
-        f.truncate(boundary)  # ftruncate — the preserved prefix is intact
+        f.truncate(len(raw[:boundary].encode("utf-8")))
         f.flush()
         os.fsync(f.fileno())
 
@@ -1263,12 +1286,19 @@ class Preflight:
                 name, f"{cmd[0]!r} could not be run: "
                      f"{type(exc).__name__}: {exc}"
             ) from exc
-        if getattr(proc, "returncode", 1) != 0:
+        # The ``rc`` guard is in both the check and the message (the
+        # same leak class as the ``fetch_models_list`` fix — a bare
+        # ``proc.returncode`` would be an AttributeError detail inside
+        # a typed refusal).
+        rc = getattr(proc, "returncode", 1)
+        if rc != 0:
             tail = getattr(proc, "stderr", b"") or b""
             if isinstance(tail, str):
                 tail = tail.encode("utf-8", "replace")
+            if not isinstance(tail, (str, bytes)):
+                tail = b""
             raise PreflightFailed(
-                name, f"{cmd[0]!r} exited {proc.returncode}: "
+                name, f"{cmd[0]!r} exited {rc}: "
                       f"{tail[-200:].decode('utf-8', 'replace').strip()!r}"
             )
 
