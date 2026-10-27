@@ -1034,6 +1034,7 @@ def _repair_checkpoint_file(path: str) -> None:
                                   # \n self-heals on the next open, but the
                                   # function's documented discipline is
                                   # "every write is fsync'd")
+        return
     # A non-record last line — truncate at the byte-exact boundary.
     with open(path, "r+b") as f:
         f.truncate(boundary_b)  # ftruncate — the preserved prefix is intact
