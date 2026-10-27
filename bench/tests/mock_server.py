@@ -199,7 +199,12 @@ def handle(obj):
         if mode in ("ok", "refusal", "bigframe"):
             sys.exit(0)
         return
-    if rid in pending:
+    if m is None and rid in pending:
+        # ``m is None``: a response, not a request — a client request
+        # whose id collides with a pending permission id (100–103) and
+        # isn't matched by an earlier method branch must get its own
+        # answer, not be consumed as the permission answer (round 4
+        # [nit]: the same guard the WP2 mock gained in round 3).
         pending.pop(rid)
         state("permission_response", id=rid, result=obj.get("result"))
         if not pending:

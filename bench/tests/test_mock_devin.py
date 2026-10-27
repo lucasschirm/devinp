@@ -518,6 +518,17 @@ def test_cli_rejects_unknown_mode_and_flags(tmp_path):
     r = subprocess.run([w, "frobnicate"],
                       capture_output=True, text=True, timeout=30)
     assert r.returncode == 2
+    # round 3 [nit]: message accuracy — an *unknown* subcommand of a
+    # known command is reported as such (not "requires a subcommand"),
+    # and a missing one is reported as missing
+    r = subprocess.run([w, "models", "bogus"],
+                      capture_output=True, text=True, timeout=30)
+    assert r.returncode == 2
+    assert "unknown subcommand" in r.stderr and "'bogus'" in r.stderr
+    r = subprocess.run([w, "models"],
+                      capture_output=True, text=True, timeout=30)
+    assert r.returncode == 2
+    assert "requires a subcommand" in r.stderr
     # the wrapper's baked-in mode still works after the rejections
     # (a fresh process each time — no state leak between invocations)
     r = subprocess.run([w, "models", "list", "--format", "json"],
@@ -613,9 +624,76 @@ def test_wire_conformance_rpc_errors(tmp_path):
         assert obj.get("id") == 8
         assert obj["result"]["protocolVersion"] == 1
         assert p.poll() is None  # still alive
+
+        # round 3 [nit] regression (the 'm is None' guard): with a
+        # permission request outstanding (id 100), a client *request*
+        # whose id collides with it must get its own -32601 (not be
+        # consumed as the permission answer), and a stale response
+        # (id 99) must be ignored without derailing the turn.
+        p.stdin.write(json.dumps(
+            {"jsonrpc": "2.0", "id": 9, "method": "session/new",
+             "params": {"cwd": str(tmp_path)}}).encode() + b"\n")
+        p.stdin.flush()
+        obj = json.loads(_read_line(p))
+        assert obj.get("id") == 9
+        assert obj["result"]["sessionId"] == "mock-sid"
+        p.stdin.write(json.dumps(
+            {"jsonrpc": "2.0", "id": 10, "method": "session/prompt",
+             "params": {"sessionId": "mock-sid",
+                       "prompt": [{"type": "text", "text": "t"}]}}
+            ).encode() + b"\n")
+        p.stdin.flush()
+        # the mock streams update(s) (thought + message), then the
+        # permission request (id 100, now pending)
+        obj = None
+        for _ in range(10):
+            obj = json.loads(_read_line(p))
+            if obj.get("method") == "session/request_permission":
+                break
+        assert obj is not None and obj["method"] == "session/request_permission"
+        assert obj["id"] == 100
+        # stale response (id 99 != 100): ignored, no frame expected
+        p.stdin.write(json.dumps(
+            {"jsonrpc": "2.0", "id": 99,
+             "result": {"outcome": {"outcome": "selected",
+                                   "optionId": "allow_once"}}}).encode()
+            + b"\n")
+        # colliding-id *request* (id 100 == perm_rid): -32601, not eaten
+        p.stdin.write(json.dumps(
+            {"jsonrpc": "2.0", "id": 100, "method": "bogus/x",
+             "params": {}}).encode() + b"\n")
+        p.stdin.flush()
+        obj = json.loads(_read_line(p))
+        assert obj.get("id") == 100
+        assert obj["error"]["code"] == -32601
+        # the real answer then completes the turn (end_turn + usage)
+        p.stdin.write(json.dumps(
+            {"jsonrpc": "2.0", "id": 100,
+             "result": {"outcome": {"outcome": "selected",
+                                   "optionId": "allow_once"}}}).encode()
+            + b"\n")
+        p.stdin.flush()
+        # the vendor turn_stats note, the usage update, then the prompt
+        # response — in wire order
+        obj = json.loads(_read_line(p))
+        assert obj["method"] == "_cognition.ai/turn_stats"
+        obj = json.loads(_read_line(p))
+        assert obj["method"] == "session/update"  # the usage update
+        obj = json.loads(_read_line(p))
+        assert obj.get("id") == 10
+        assert obj["result"]["stopReason"] == "end_turn"
+        # clean shutdown (ok mode exits on session/close)
+        p.stdin.write(json.dumps(
+            {"jsonrpc": "2.0", "method": "session/close",
+             "params": {"sessionId": "mock-sid"}}).encode() + b"\n")
+        p.stdin.flush()
+        p.wait(timeout=10)
+        assert p.returncode == 0
+        p = None  # clean exit — no kill needed
     finally:
-        p.kill()
-        p.wait()
+        if p is not None:
+            p.kill()
+            p.wait()
     assert _read_state(state)  # the event file was written
 
 
