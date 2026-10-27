@@ -42,9 +42,13 @@ All tests are unit-level against instrumented fake sessions
   :func:`test_quota_limited_breaks_agent_error_chain`,
   :func:`test_quota_limited_last_item_done_without_sleep`,
   :func:`test_n_gt1_single_checkpoint_for_double_quota_stop` (one
-  checkpoint per backoff — a double quota stop is one stop)
+  checkpoint per backoff — a double quota stop is one stop),
+  :func:`test_late_quota_limited_upgrades_stop_reason` (mixed-cause
+  stop reports the external signal)
 * AC5 — abort on 2 consecutive ``agent_error`` (environment drift
   suspicion) → :func:`test_abort_on_two_consecutive_agent_errors`,
+  :func:`test_n_gt1_late_agent_error_aborts_through_budget_exhausted`
+  (the late-arrival trigger preempts the backoff sleep),
   :func:`test_consecutive_agent_error_counter_resets`,
   :func:`test_window_reset_breaks_agent_error_chain` (the deliberate
   window-reset deviation, pinned)
@@ -57,6 +61,7 @@ Plus the contract edges: :func:`test_unknown_status_is_typed`,
 :func:`test_empty_queue_ends_immediately`,
 :func:`test_n_gt1_exhausted_drains_without_sleep`,
 :func:`test_n_gt1_multiple_windows`, :func:`test_run_is_one_shot`,
+:func:`test_concurrent_run_calls_reject_second`,
 :func:`test_run_finished_fires_on_clean_done`,
 :func:`test_process_lock_busy_is_retryable`,
 :func:`test_budget_config_validation`.
@@ -66,6 +71,7 @@ from __future__ import annotations
 
 import fcntl
 import threading
+import time
 
 import pytest
 
@@ -481,6 +487,49 @@ class _RaisingCloseSession(r.AgentSession):
         raise RuntimeError("teardown failed")
 
 
+class _PollStateSession(r.AgentSession):
+    """A session whose ``run()`` holds until the runner leaves
+    ``RUNNING`` (the cap emit lands) before returning its status — the
+    deterministic construction for the late-arrival N>1 corners (the
+    (budget_exhausted, abort) preemption; the mixed-cause stop
+    reason). A loud timeout: a hang is a test failure, not a hang."""
+
+    def __init__(self, registry: Registry, runner: r.Runner,
+                 status: str) -> None:
+        self.registry = registry
+        self.runner = runner
+        self.status = status
+
+    def start(self) -> None:
+        self.registry.enter()
+
+    def run(self) -> str:
+        deadline = time.monotonic() + 5.0
+        while self.runner.state is r.BackoffState.RUNNING:
+            if time.monotonic() > deadline:
+                raise RuntimeError("poll timeout — cap emit never "
+                                  "landed")
+            time.sleep(0.001)
+        return self.status
+
+    def close(self) -> None:
+        self.registry.exit()
+
+
+class _HoldingSession(r.AgentSession):
+    """A session that holds *real* time in ``start()`` — keeps the run
+    in flight long enough for a concurrent ``run()`` to be attempted."""
+
+    def start(self) -> None:
+        time.sleep(0.3)
+
+    def run(self) -> str:
+        return "resolved"
+
+    def close(self) -> None:
+        pass
+
+
 def test_guard_and_claim_released_when_session_raises():
     """A partial session (PLAN §2.5 host-crash class): the exception
     propagates, the guard slot is released (no leak), the budget claim
@@ -840,6 +889,66 @@ def test_n_gt1_single_checkpoint_for_double_quota_stop():
     assert sorted(i for i, _ in result.results) == ["i0", "i1", "i2"]
 
 
+def test_n_gt1_late_agent_error_aborts_through_budget_exhausted():
+    """(budget_exhausted, abort) end-to-end (the N>1 late-arrival
+    drift trigger): the second agent_error lands *after* a worker's
+    claim-check has already emitted budget_exhausted (cap 2, both
+    claims in flight) — the abort preempts the backoff sleep via the
+    table transition; no sleep, i2 never starts."""
+    e = Env()
+    holder = {}
+
+    def factory(inst):
+        if inst == "i1":  # held until the cap emit lands
+            return _PollStateSession(e.registry, holder["runner"],
+                                    "agent_error")
+        return FakeSession(e.registry, "agent_error" if inst == "i0"
+                          else "resolved")
+
+    runner = e.make(["i0", "i1", "i2"],
+                   {"i0": "agent_error", "i1": "agent_error",
+                    "i2": "resolved"},
+                   config=r.BudgetConfig(max_sessions_per_day=2),
+                   concurrency=2, i_know_about_quota=True, factory=factory)
+    holder["runner"] = runner
+    result = runner.run()
+    assert result.final_state == "aborted"
+    assert ("budget_exhausted", r.EVENT_ABORT, "aborted") \
+        in chain(result)  # the late trigger took the table transition
+    assert "sleep" not in [ev[0] for ev in e.reporter.events]
+    assert result.backoffs == 0  # the abort preempted the backoff
+    assert "i2" not in [c for c, _ in e.calls]  # never started
+
+
+def test_late_quota_limited_upgrades_stop_reason():
+    """Mixed-cause stop (N>1): the local cap stops the batch first
+    (budget_exhausted), then an in-flight session lands
+    ``quota_limited`` — the checkpoint reason is upgraded to
+    ``rate_limited`` (the external signal is the more operationally
+    significant cause); the mark survives in the instance record."""
+    e = Env()
+    holder = {}
+
+    def factory(inst):
+        if inst == "i0":  # held until the local-cap emit lands
+            return _PollStateSession(e.registry, holder["runner"],
+                                    "quota_limited")
+        return FakeSession(e.registry, "resolved")
+
+    runner = e.make(["i0", "i1"],
+                   {"i0": "quota_limited", "i1": "resolved"},
+                   config=r.BudgetConfig(max_sessions_per_day=1),
+                   concurrency=2, i_know_about_quota=True, factory=factory)
+    holder["runner"] = runner
+    result = runner.run()
+    cks = [ev for ev in e.reporter.events if ev[0] == "checkpoint"]
+    assert len(cks) == 1
+    assert cks[0][1] == "rate_limited"  # the late signal upgraded it
+    assert [s for _, s in result.results] == ["quota_limited", "resolved"]
+    assert result.backoffs == 1
+    assert result.final_state == "done"
+
+
 # ---------------------------------------------------------------------------
 # lifecycle edges
 # ---------------------------------------------------------------------------
@@ -851,6 +960,31 @@ def test_run_is_one_shot():
     runner.run()
     with pytest.raises(r.RunnerError, match="already running"):
         runner.run()
+
+
+def test_concurrent_run_calls_reject_second():
+    """The one-shot check-and-set is atomic under the runner lock: two
+    concurrent ``run()`` calls on the same instance — exactly one
+    wins, the other is refused (not double-scheduled)."""
+    e = Env()
+    runner = e.make(["i0"], {"i0": "resolved"},
+                   factory=lambda inst: _HoldingSession())
+    barrier = threading.Barrier(2, timeout=10)
+    outcomes = []
+
+    def go():
+        barrier.wait()
+        try:
+            outcomes.append(("ok", runner.run().final_state))
+        except r.RunnerError:
+            outcomes.append(("refused", None))
+
+    threads = [threading.Thread(target=go) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15)
+    assert sorted(k for k, _ in outcomes) == ["ok", "refused"]
 
 
 def test_run_finished_fires_on_clean_done():

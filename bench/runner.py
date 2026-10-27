@@ -724,16 +724,21 @@ class Runner:
         hook fires on normal completion — *not* on a propagated failure
         (the run did not finish). A ``ProcessLockBusy`` failure does not
         consume the one-shot: the runner may retry once the lock frees.
+        The one-shot check-and-set is atomic under the runner lock (a
+        concurrent ``run()`` on the same instance is refused, not
+        double-scheduled).
         """
-        if self._running:
-            raise RunnerError(
-                "runner is already running — one run() per instance"
-            )
         t0 = self._clock()
         if self._proc_lock is not None:
             self._proc_lock.acquire()
-        self._running = True
         try:
+            with self._lock:
+                if self._running:
+                    raise RunnerError(
+                        "runner is already running — "
+                        "one run() per instance"
+                    )
+                self._running = True
             self._reporter.run_started({
                 "concurrency": self._concurrency,
                 "budget": {
@@ -894,9 +899,10 @@ class Runner:
 
         The ``record_instance`` hook runs under the runner lock together
         with the state changes (the hook must be fast — WP3b's JSONL
-        append is a single write); the ``checkpoint`` hook (AC4) runs
-        outside the lock in the single-threaded drain, before the
-        sleep-to-window.
+        append is a single write — and must *not* call back into
+        :class:`Runner` — the lock is non-reentrant); the
+        ``checkpoint`` hook (AC4) runs outside the lock in the
+        single-threaded drain, before the sleep-to-window.
         """
         with self._lock:
             self._results.append((inst, status))
@@ -923,12 +929,19 @@ class Runner:
                 # worker whose status actually stopped the run (the
                 # fresh RUNNING -> budget_exhausted transition) records
                 # the stop reason — a late-arriving quota_limited
-                # status (N>1) does not re-stop. The checkpoint fires
-                # exactly once per backoff, in the single-threaded
-                # drain, before the sleep.
+                # status (N>1) does not re-stop. A *late* arrival after
+                # a local-cap stop upgrades the reason to
+                # rate_limited — the external signal is the more
+                # operationally significant cause (the first-cause
+                # order is otherwise arbitrary under N>1). The
+                # checkpoint fires exactly once per backoff, in the
+                # single-threaded drain, before the sleep.
                 self._stop_new = True
                 if self._state is BackoffState.RUNNING:
                     self._emit(EVENT_RATE_LIMITED)
+                    self._stop_reason = "rate_limited"
+                elif (self._state is BackoffState.BUDGET_EXHAUSTED
+                        and self._stop_reason != "rate_limited"):
                     self._stop_reason = "rate_limited"
 
     # -- state machine -----------------------------------------------------
