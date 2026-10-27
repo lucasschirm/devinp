@@ -313,12 +313,14 @@ contract — never a traceback with exit 1).
   root is CWD-relative, and the pin's `make_run_report` writes the final
   run report to `<report_dir>/<model>.<run_id>.json`, so every artifact
   lands under one directory). The argv is pinned by a unit test; the
-  module's no-`swebench`-import contract is pinned by a source test.
+  module's no-`swebench`-import contract is pinned by an AST test.
   `overall_timeout` is the optional outer watchdog (the project's hang
   policy — `-t` bounds only the *in-container* test exec; the HF dataset
   download, the image pull and the Docker daemon are not bound by `-t`);
-  pre-spawn filesystem work, a spawn failure and the watchdog firing are
-  typed `HarnessFailedError`, never a raw escape.
+  pre-spawn filesystem work, a spawn failure and the watchdog firing (its
+  typed error surfaces the possibly-still-running eval container name +
+  the partial output) are typed `HarnessFailedError`, never a raw escape.
+  Typed errors an injected runner raises *stay typed*.
 - **Fresh container (AC2):** the harness creates the eval container itself
   (`containers.create` on the published eval image, ghost-removing any
   same-name container first); the per-call unique `run_id` default makes
@@ -331,7 +333,11 @@ contract — never a traceback with exit 1).
   `TypedDict`):** `resolved` is only ever the harness's `report.json`
   value — **and it must be a bool** (a corrupted-but-parseable verdict is
   a typed failure, never a silent `bool()` coercion) — or the harness's
-  own empty-patch semantics (below); `logs` carries the harness artifact
+  own empty-patch semantics (below); a `resolved: false` report with the
+  harness's own `infra_failure` flag (unparseable test output from an
+  environment fault — the harness counts these separately,
+  `infra_failure_ids`) is a typed `HarnessFailedError` (the WP3 retry
+  class), never a terminal verdict; `logs` carries the harness artifact
   paths (`instance`, `test_output`, `final_report`), the verbatim
   per-instance `report`, `container`, and the run identity (`workdir` — a
   fresh tempdir when the caller passed None, surfaced so the caller-owned
@@ -340,11 +346,16 @@ contract — never a traceback with exit 1).
   harness writes the per-instance report before the final-report leg).
 - **Stale-report protection:** the harness's own `exclude_completed` treats
   a pre-existing per-run `report.json` as "already run" and silently skips
-  the instance — `evaluate` never trusts a pre-existing report: it unlinks
-  one before the spawn (on an unlink failure the pre-run mtime is recorded
-  and the post-run report must be newer), so a re-used (workdir, run_id)
+  the instance (and `run_instance` itself early-returns a pre-existing
+  report) — `evaluate` never trusts a pre-existing report: it unlinks one
+  before the spawn (on an unlink failure the pre-run mtime is recorded and
+  the post-run report must be strictly newer — a missing pre-run mtime
+  makes freshness unverifiable → reject), so a re-used (workdir, run_id)
   pair can never return the previous run's verdict for a patch that was
-  never evaluated.
+  never evaluated. The same re-use risk for the *terminal-class triage
+  markers*: a pre-existing `run_instance.log` / `test_output.txt` whose
+  mtime this run did not update is stale — its markers are not this
+  run's verdict, and triage downgrades them to the retryable class.
 - **Empty patches (the negative control):** the harness itself filters
   empty/`None` `model_patch` (skipped; counted in `empty_patch_ids`, never
   in `resolved_ids`); `evaluate` mirrors that exactly by short-circuiting
@@ -357,10 +368,12 @@ contract — never a traceback with exit 1).
   sections, tab-separated `diff -u` headers, context/normal diffs — which a
   header check would wrongly reject). Every non-empty patch reaches the
   harness; the chain's `APPLY_PATCH_FAIL` marker in `run_instance.log` →
-  `PatchCorruptionError` (wins over a timeout marker), the anchored
-  `Timeout error: N seconds exceeded` marker in `test_output.txt` (or the
-  harness's timeout message / `>>>>> Tests Timed Out` logger line in
-  `run_instance.log`) → `EvaluationTimeoutError` (terminal in WP3 — hence
+  `PatchCorruptionError` (wins over a timeout marker), the
+  tail-anchored `Timeout error: N seconds exceeded.` marker (the harness's
+  final write) or `>>>>> Tests Timed Out` (the dataset eval-script's
+  marker, graded *inside* the test output) in `test_output.txt`, or the
+  harness's own `Test timed out after N seconds` message in
+  `run_instance.log` → `EvaluationTimeoutError` (terminal in WP3 — hence
   the loose markers are anchored and file-specific, so a docker-client
   flake cannot zero out a retryable instance), anything else →
   `HarnessFailedError` (the WP3 `eval_error` retry class). A clean typed

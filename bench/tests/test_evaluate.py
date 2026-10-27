@@ -5,83 +5,102 @@ All unit tests run with **zero quota, no Docker and no network**: the harness
 subprocess is replaced by an injected ``harness_runner`` (the module's
 documented test seam), and the harness's CWD-relative artifact layout is
 fabricated on disk (the exact ``logs/run_evaluation/<run_id>/<model>/<iid>/``
-tree the pinned swebench 5.0.2 writes). The three acceptance controls that
-need a container runtime (positive / corruption / isolation) are the
-integration tests at the bottom — CI (public images, no quota); they
-auto-skip where no Docker daemon exists (e.g. this dev workspace).
+tree the pinned swebench 5.0.2 writes). The acceptance controls that need a
+container runtime (positive / corruption / isolation) are the two
+integration tests at the bottom (isolation is asserted inside the positive
+control) — CI (public images, no quota); they auto-skip where no Docker
+daemon exists (e.g. this dev workspace).
 
 Acceptance mapping (issue #17, ``bench/PLAN-WP4.md``):
 
 * **AC1 — delegates entirely to the official CLI on a standard predictions
-  file** → :func:`test_harness_argv_is_exactly_the_official_cli` (the argv
-  is *pinned* — any bespoke flag breaks it), :func:`test_harness_runs_with_
-  cwd_as_workdir` (the harness's CWD-relative log layout),
-  :func:`test_predictions_file_is_exactly_the_standard_format` (exactly
-  ``instance_id`` / ``model_name_or_path`` / ``model_patch``),
-  :func:`test_no_swebench_import_in_evaluate_module` (no bespoke
-  apply/grade logic — the subprocess is the only harness interaction).
+  file** → ``test_harness_argv_is_exactly_the_official_cli`` (the argv is
+  *pinned* — any bespoke flag breaks it),
+  ``test_harness_runs_with_cwd_as_workdir`` (the harness's CWD-relative log
+  layout), ``test_predictions_file_is_exactly_the_standard_format``
+  (exactly ``instance_id`` / ``model_name_or_path`` / ``model_patch``),
+  ``test_no_swebench_import_in_evaluate_module`` (no bespoke apply/grade
+  logic — the subprocess is the only harness interaction).
 * **AC2 — fresh container, never the agent's mutated one** →
-  :func:`test_default_run_id_is_unique_per_call` (per-call unique run id),
-  :func:`test_eval_container_name_never_equals_agent_container_name` (the
+  ``test_default_run_id_is_unique_per_call`` (per-call unique run id),
+  ``test_eval_container_name_never_equals_agent_container_name`` (the
   harness container-name formula with our run id vs the adapter's agent
-  name), :func:`test_integration_positive_control` (the eval container id
-  comes from the harness's own log — the only container the module can
-  name).
+  name), ``test_integration_positive_control`` (the eval container id comes
+  from the harness's own log — the only container the module can name).
 * **AC3 — returns ``{resolved, logs}``, no bespoke grading** →
-  :func:`test_report_json_is_the_sole_source_of_resolved` (true and false
-  passthrough of the harness value), :func:`test_return_contract_shape`
-  (the exact key set), :func:`test_container_id_extracted_from_harness_log`
+  ``test_report_json_is_the_sole_source_of_resolved`` (true and false
+  passthrough of the harness value), ``test_return_contract_shape`` (the
+  exact key set), ``test_container_id_extracted_from_harness_log``
   (``logs.container`` from the harness's own line; absent → None, never a
   crash).
 * **AC4 — the controls:**
   * negative control (no-op/empty patch → false, docker-free — runs in CI
-    and locally): :func:`test_negative_control_no_op_patch_is_unresolved`
-    (``""`` and ``None``; **no harness spawn** — the harness's own
-    empty-patch filter semantics, verified in the pinned source);
+    and locally): ``test_negative_control_no_op_patch_is_unresolved`` (``""``
+    and ``None``; **no harness spawn** — the harness's own empty-patch
+    filter semantics, verified in the pinned source; validation still
+    precedes the short-circuit —
+    ``test_empty_patch_with_invalid_input_is_invalid_input``);
   * corruption guard (the harness's own 4-command git-apply chain is the
     sole authority on applicability — no structural pre-check, so every
     non-empty patch reaches the harness; the chain's ``APPLY_PATCH_FAIL``
-    marker becomes a clean typed error): :func:`test_nonempty_patch_
-    always_reaches_harness_and_apply_fail_is_typed` (header-less garbage
-    — the forms a header check would have wrongly rejected) and
-    :func:`test_truncated_wellformed_patch_reaches_harness_and_is_
-    corruption` (unit, fabricated tree) and
-    :func:`test_integration_corruption_guard_truncated_gold_patch` (real
+    marker becomes a clean typed error):
+    ``test_nonempty_patch_always_reaches_harness_and_apply_fail_is_typed``
+    (header-less garbage — the forms a header check would have wrongly
+    rejected) and
+    ``test_truncated_wellformed_patch_reaches_harness_and_is_corruption``
+    (unit, fabricated tree) and
+    ``test_integration_corruption_guard_truncated_gold_patch`` (real
     harness, real container);
   * triage edges (fabricated trees — markers by the file the pinned harness
-    writes them to): :func:`test_no_report_timeout_marker_is_` `evaluation` `_timeout` (all markers × the file placement),
-    :func:`test_timeout_marker_in_wrong_file_is_not_terminal_timeout`
-    (anchored + file-specific), :func:`test_apply_fail_and_timeout_`
-    `markers_corruption_wins`, :func:`test_no_report_no_marker_is_infra_error`,
-    :func:`test_exit_nonzero_is_harness_failed_with_stderr_tail` (the
-    combined stdout + stderr tail), :func:`test_report_present_but_exit_` `nonzero_is_harness_failed` (the exit-≠ 0-always-error rule),
-    :func:`test_exit_nonzero_with_apply_fail_marker_is_harness_failed`,
-    :func:`test_stale_report_surviving_unlink_failure_is_not_trusted` (the
+    writes / the test output it grades): ``test_no_report_timeout_marker_is_evaluation_timeout``
+    (all markers × the file placement),
+    ``test_timeout_marker_in_wrong_file_is_not_terminal_timeout`` (anchored
+    + file-specific), ``test_apply_fail_and_timeout_markers_corruption_wins``,
+    ``test_no_report_no_marker_is_infra_error``,
+    ``test_exit_nonzero_is_harness_failed_with_stderr_tail`` (the combined
+    stdout + stderr tail), ``test_report_present_but_exit_nonzero_is_harness_failed``
+    (the exit-≠ 0-always-error rule),
+    ``test_exit_nonzero_with_apply_fail_marker_is_harness_failed``,
+    ``test_stale_report_surviving_unlink_failure_is_not_trusted`` (the
     stale-report protection: the harness's exclude_completed would skip the
     instance; the pre-run report is unlinked / mtime-checked),
-    :func:`test_preexisting_report_is_unlinked_and_not_trusted`,
-    :func:`test_unreadable_report_is_harness_failed`,
-    :func:`test_report_missing_instance_entry_is_harness_failed`,
-    :func:`test_non_bool_resolved_verdict_is_harness_failed` (AC3 — no
-    ``bool()`` coercion of a malformed verdict);
+    ``test_preexisting_report_is_unlinked_and_not_trusted``,
+    ``test_unreadable_report_is_harness_failed``,
+    ``test_report_missing_instance_entry_is_harness_failed``,
+    ``test_non_bool_resolved_verdict_is_harness_failed`` (AC3 — no
+    ``bool()`` coercion of a malformed verdict),
+    ``test_infra_failure_report_is_harness_failed`` (the harness's own
+    environment-fault classification → the WP3 retry class, not a terminal
+    verdict),
+    ``test_stale_log_marker_is_not_a_terminal_verdict`` (a marker that
+    survived from a previous run — the file was not updated by this run —
+    is the retryable class, never a terminal verdict);
   * validation matrix (typed, before any side effect — the tests also assert
-    zero filesystem side effects): :func:`test_input_validation_matrix`
+    zero filesystem side effects): ``test_input_validation_matrix``
     (instance id charset / patch / run_id charset / model name / timeout),
-    :func:`test_extra_input_validation_matrix` (dataset / split / workdir /
-    python / harness_runner / overall_timeout);
-  * the delegation's robustness edges: :func:`test_relative_workdir_is_`
-    `resolved_to_absolute_before_spawn`, :func:`test_workdir_none_creates_` `tempdir_and_surfaces_it` (the caller-owned-cleanup contract),
-    :func:`test_pre_spawn_filesystem_failure_is_typed`,
-    :func:`test_runner_spawn_failure_is_typed_not_raw`,
-    :func:`test_overall_timeout_flows_to_the_runner` (the outer watchdog —
-    the project's hang policy), :func:`test_process_object_without_` `returncode_is_typed`, :func:`test_non_object_report_is_harness_failed`,
-    :func:`test_non_utf8_report_is_harness_failed`;
-  * isolation: asserted inside :func:`test_integration_positive_control`
-    (eval container id ≠ agent container id; the eval container id is a
-    real container id from the harness's own log).
+    ``test_extra_input_validation_matrix`` (dataset / split / workdir /
+    python / harness_runner / overall_timeout — incl. nan/inf and NUL
+    argv-carrying strings);
+  * the delegation's robustness edges: ``test_relative_workdir_is_resolved_to_absolute_before_spawn``,
+    ``test_workdir_none_creates_tempdir_and_surfaces_it`` (the
+    caller-owned-cleanup contract), ``test_pre_spawn_filesystem_failure_is_typed``,
+    ``test_runner_spawn_failure_is_typed_not_raw``,
+    ``test_timeout_expired_from_runner_is_typed_with_partial_output`` (the
+    outer watchdog — surfaces the eval container name + the partial
+    output), ``test_overall_timeout_flows_to_the_runner``,
+    ``test_injected_runner_typed_error_stays_typed``,
+    ``test_process_object_without_returncode_is_typed``,
+    ``test_non_object_report_is_harness_failed``,
+    ``test_non_utf8_report_is_harness_failed``,
+    ``test_default_harness_runner_watchdog_fires`` (the real runner's
+    ``overall_timeout`` wiring);
+  * isolation: asserted inside ``test_integration_positive_control`` (eval
+    container id ≠ agent container id; the eval container id is a real
+    container id from the harness's own log).
 
-Plus the operator CLI: :func:`test_cli_*` (exit codes 0/2/3/4/5 — 0 = ran,
-resolved or not — JSON on stdout).
+Plus the operator CLI: ``test_cli_*`` (exit codes 0/2/3/4/5 — 0 = ran,
+resolved or not — JSON on stdout; an unexpected exception is exit 5, the
+documented contract, not a traceback).
 
 The two Docker-gated integration tests carry a ``pytest.mark.timeout``
 watchdog (a wedged pull must fail the test, not hang the job).
@@ -95,7 +114,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 
 import pytest
 
@@ -161,7 +180,7 @@ def _build_tree(
 ) -> None:
     """Fabricate the harness's exact CWD-relative artifact layout (the pinned
     swebench 5.0.2 log root / filenames; the final report is the pin's
-    ``<report_dir>/<model>.<run_id>.json``, reporting.py:170-172)."""
+    ``<report_dir>/<model>.<run_id>.json``, reporting.py:170-178)."""
     base = cwd / "logs" / "run_evaluation" / run_id / model.replace("/", "__") / instance_id
     base.mkdir(parents=True, exist_ok=True)
     if report is not None:
@@ -182,9 +201,9 @@ def _report_tree(
     instance_id: str,
     *,
     resolved: bool,
-    instance_log: "str | None" = None,
-    test_output: "str | None" = None,
-) -> "callable":
+    instance_log: Optional[str] = None,
+    test_output: Optional[str] = None,
+) -> Callable[[Path], None]:
     return lambda cwd: _build_tree(
         cwd,
         run_id,
@@ -279,17 +298,24 @@ def test_no_swebench_import_in_evaluate_module():
     """AC1/AC3 — "no bespoke apply/grade logic inside": the subprocess is the
     *only* harness interaction, so the module must not import swebench (a
     direct import would be the seam for re-implementing the harness's
-    apply/grade path)."""
-    src = inspect.getsource(ev)
-    assert "import swebench" not in src
-    assert "from swebench" not in src
+    apply/grade path). AST-based — a string match would also flag a string
+    literal mentioning the import."""
+    import ast
+
+    tree = ast.parse(inspect.getsource(ev))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                assert not alias.name.startswith("swebench"), alias.name
+        elif isinstance(node, ast.ImportFrom):
+            assert not (node.module or "").startswith("swebench"), node.module
 
 
 def test_model_name_slash_is_escaped_like_the_harness(tmp_path):
     """The harness escapes ``/`` → ``__`` in the log dir / report name; our
     path derivation must match or the report is never found. (The final
     report is the pin's ``<report_dir>/<model>.<run_id>.json`` —
-    reporting.py:170-172; ``--report_dir = workdir``.)"""
+    reporting.py:170-178; ``--report_dir = workdir``.)"""
     fake = FakeHarness(
         tree=lambda cwd: _build_tree(
             cwd, "rid4", "devin/swe-2-high", "iid",
@@ -320,7 +346,7 @@ def test_default_run_id_is_unique_per_call(tmp_path):
     argv is captured even though the run "fails" (no report fabricated for
     the random run id; the failure is the point of no consequence here)."""
     run_ids = []
-    for i in range(2):
+    for _ in range(2):
         fake = FakeHarness()  # no tree: the random run id has no report → infra error
         with pytest.raises(ev.HarnessFailedError):
             ev.evaluate("iid", _WELLFORMED_PATCH, workdir=tmp_path, harness_runner=fake)
@@ -340,7 +366,7 @@ def test_eval_container_name_never_equals_agent_container_name(tmp_path):
     instance_id = "pallets__flask-5014"
     agent_name = f"sweb.eval.{instance_id}"
     # the default (unique, production-emitted) run id
-    for i in range(2):
+    for _ in range(2):
         fake = FakeHarness()  # no tree: the random run id has no report → infra error
         with pytest.raises(ev.HarnessFailedError):
             ev.evaluate(instance_id, _WELLFORMED_PATCH, workdir=tmp_path, harness_runner=fake)
@@ -535,11 +561,15 @@ def _timeout_marker_tree(marker_file: str, marker: str):
 @pytest.mark.parametrize(
     ("marker_file", "marker"),
     [
-        # the markers, in the file the pinned harness writes them to
-        # (run_evaluation.py:376 et al.)
+        # the markers, in the file the pinned harness writes / the test
+        # output it grades (run_evaluation.py:376-381 appends the
+        # tail-anchored marker as the file's final write; grading.py:
+        # 130-141 reads ">>>>> Tests Timed Out" *inside* the test
+        # output; the instance-log marker is the harness's own
+        # EvaluationError message via the logger)
         ("test_output", "Timeout error: 1800 seconds exceeded."),
+        ("test_output", ">>>>> Tests Timed Out"),
         ("instance_log", "Test timed out after 1800 seconds."),
-        ("instance_log", ">>>>> Tests Timed Out"),
     ],
 )
 def test_no_report_timeout_marker_is_evaluation_timeout(tmp_path, marker_file, marker):
@@ -560,10 +590,10 @@ def test_no_report_timeout_marker_is_evaluation_timeout(tmp_path, marker_file, m
         # HarnessFailedError is the retried eval_error class, so a
         # docker-client/network line containing "Timeout error:" in the
         # instance log (or test output echoing a suite's own timeout text)
-        # must convert a retryable infra flake into a terminal timeout.
+        # must NOT convert a retryable infra flake into a terminal timeout.
         ("instance_log", "Timeout error: 1800 seconds exceeded."),
-        ("test_output", ">>>>> Tests Timed Out"),
         ("test_output", "Test timed out after 1800 seconds."),
+        ("instance_log", ">>>>> Tests Timed Out"),
     ],
 )
 def test_timeout_marker_in_wrong_file_is_not_terminal_timeout(tmp_path, marker_file, marker):
@@ -575,9 +605,9 @@ def test_timeout_marker_in_wrong_file_is_not_terminal_timeout(tmp_path, marker_f
 
 
 def test_apply_fail_and_timeout_markers_corruption_wins(tmp_path):
-    """Both markers present (apply-fail + timeout in the instance log):
-    corruption wins — a corrupt patch is a terminal verdict and a retry
-    would just re-fail the apply."""
+    """Both markers present (apply-fail + the timeout message, both in the
+    instance log): corruption wins — a corrupt patch is a terminal verdict
+    and a retry would just re-fail the apply."""
     fake = FakeHarness(
         tree=lambda cwd: _build_tree(
             cwd,
@@ -586,11 +616,30 @@ def test_apply_fail_and_timeout_markers_corruption_wins(tmp_path):
             "iid",
             instance_log=(
                 ">>>>> Patch Apply Failed:\nerror: patch failed\n"
-                ">>>>> Tests Timed Out\n"
+                "Test timed out after 1800 seconds.\n"
             ),
         )
     )
     with pytest.raises(ev.PatchCorruptionError):
+        ev.evaluate("iid", _WELLFORMED_PATCH, workdir=tmp_path, run_id="rid", harness_runner=fake)
+
+
+def test_apply_fail_in_wrong_file_is_not_corruption(tmp_path):
+    """The ``APPLY_PATCH_FAIL`` marker in test_output.txt (the wrong file —
+    the harness writes it to run_instance.log) is not the harness's
+    apply-failed verdict → the retryable infra class, not corruption."""
+    fake = FakeHarness(
+        tree=lambda cwd: _build_tree(
+            cwd,
+            "rid",
+            "devin",
+            "iid",
+            test_output=(
+                ">>>>> Patch Apply Failed:\nerror: patch failed\n"
+            ),
+        )
+    )
+    with pytest.raises(ev.HarnessFailedError):
         ev.evaluate("iid", _WELLFORMED_PATCH, workdir=tmp_path, run_id="rid", harness_runner=fake)
 
 
@@ -748,7 +797,7 @@ def test_pre_spawn_filesystem_failure_is_typed(tmp_path):
     """Pre-spawn filesystem work (workdir mkdir / predictions write) is typed
     — a workdir whose parent is a *file* (deterministic regardless of
     privileges) fails with an OSError that must not escape raw (PLAN §7
-    names disk exhaustion an expected mid-benchmark risk)."""
+    disk management / §9 risk table: "500 images exhaust disk")."""
     (tmp_path / "blocker").write_text("i am a file", encoding="utf-8")
     fake = FakeHarness()
     with pytest.raises(ev.HarnessFailedError) as e:
@@ -824,6 +873,97 @@ def test_stale_report_surviving_unlink_failure_is_not_trusted(tmp_path, monkeypa
     assert "stale" in e.value.message.lower()
 
 
+def test_stale_guard_accepts_a_fresh_report_when_unlink_fails(tmp_path, monkeypatch):
+    """Stale-report protection, unlink-failure fallback — the positive leg:
+    when the pre-existing report cannot be removed but the harness
+    *demonstrably updated* it (post-run mtime strictly after the pre-run
+    mtime), it is this run's report and is accepted."""
+    import os
+    import time
+
+    run_dir = tmp_path / "logs" / "run_evaluation" / "rid" / "devin" / "iid"
+    run_dir.mkdir(parents=True)
+    stale = run_dir / "report.json"
+    stale.write_text(json.dumps({"iid": {"resolved": True}}), encoding="utf-8")
+    t_past = time.time() - 10
+    os.utime(stale, (t_past, t_past))  # the pre-run mtime, clearly in the past
+    monkeypatch.setattr(
+        Path, "unlink",
+        lambda self: (_ for _ in ()).throw(PermissionError("locked")),
+    )
+
+    def tree(cwd: Path) -> None:
+        _build_tree(cwd, "rid", "devin", "iid", report={"iid": {"resolved": False}})
+        t_future = time.time() + 1
+        os.utime(cwd / "logs" / "run_evaluation" / "rid" / "devin" / "iid" / "report.json", (t_future, t_future))
+
+    fake = FakeHarness(tree=tree)
+    result = ev.evaluate("iid", _WELLFORMED_PATCH, workdir=tmp_path, run_id="rid", harness_runner=fake)
+    assert result["resolved"] is False  # the *new* report's verdict, not the stale one
+
+
+def test_timeout_expired_from_runner_is_typed_with_partial_output(tmp_path):
+    """The outer watchdog firing (subprocess.TimeoutExpired — the default
+    runner or an injected one) is a typed HarnessFailedError that surfaces
+    the possibly-still-running eval container name (for 'docker rm -f')
+    and the partial output — never a raw escape."""
+    def boom(argv, cwd, overall_timeout=None):
+        raise subprocess.TimeoutExpired(
+            cmd="harness", timeout=overall_timeout,
+            output="partial stdout…", stderr="partial stderr…",
+        )
+
+    with pytest.raises(ev.HarnessFailedError) as e:
+        ev.evaluate("iid", _WELLFORMED_PATCH, workdir=tmp_path, run_id="rid9", harness_runner=boom)
+    m = e.value.message.lower()
+    assert "watchdog" in m
+    assert "sweb.eval.iid.rid9" in m  # the eval container name for cleanup
+    tail = e.value.output_tail or ""
+    assert "partial stdout" in tail and "partial stderr" in tail  # both tails, labeled
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        lambda: ev.InvalidInputError("the runner refuses"),
+        lambda: ev.EvaluationTimeoutError("runner timeout", instance_id="iid"),
+    ],
+)
+def test_injected_runner_typed_error_stays_typed(tmp_path, exc):
+    """A typed error an injected runner raises stays typed — the generic
+    runner-failure clause must not re-wrap an EvaluationError (a
+    runner-raised EvaluationTimeoutError would be a *terminal* error
+    silently becoming the retried eval_error class; an InvalidInputError
+    would be the wrong CLI exit class)."""
+    def boom(argv, cwd, overall_timeout=None):
+        raise exc()
+
+    with pytest.raises(ev.EvaluationError) as e:
+        ev.evaluate("iid", _WELLFORMED_PATCH, workdir=tmp_path, run_id="rid", harness_runner=boom)
+    assert type(e.value) is type(exc())  # the type is preserved, not re-wrapped
+
+
+def test_default_harness_runner_success_watchdog_fires():
+    """The default runner's own wiring (previously untested — only the
+    injected seam was): a trivial subprocess succeeds, and
+    ``overall_timeout`` really bounds the run (a hung command raises
+    TimeoutExpired, not hangs the benchmark)."""
+    proc = ev._default_harness_runner(
+        [sys.executable, "-c", "print('hello harness')"],
+        cwd=".",
+        overall_timeout=30,
+    )
+    assert proc.returncode == 0
+    assert "hello harness" in proc.stdout
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        ev._default_harness_runner(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            cwd=".",
+            overall_timeout=0.5,
+        )
+
+
 def test_overall_timeout_flows_to_the_runner(tmp_path):
     """The optional outer watchdog (the project's hang policy — the harness
     -t bounds only the in-container test exec) flows through the runner
@@ -865,10 +1005,100 @@ def test_non_utf8_report_is_harness_failed(tmp_path):
         ev.evaluate("iid", _WELLFORMED_PATCH, workdir=tmp_path, run_id="rid", harness_runner=fake)
 
 
+@pytest.mark.parametrize("with_reason", [True, False])
+def test_infra_failure_report_is_harness_failed(tmp_path, with_reason):
+    """The harness's own environment-fault classification (infra_failure —
+    grading.py:373-374: unparseable test output; the harness keeps
+    resolved False but counts these separately in the final report's
+    infra_failure_ids) is the WP3 eval_error retry class — never a
+    terminal 'not resolved' verdict."""
+    entry = {"resolved": False, "infra_failure": True}
+    if with_reason:
+        entry["infra_failure_reason"] = "conda env broken"
+    fake = FakeHarness(
+        tree=lambda cwd: _build_tree(
+            cwd, "rid", "devin", "iid", report={"iid": entry}
+        )
+    )
+    with pytest.raises(ev.HarnessFailedError) as e:
+        ev.evaluate("iid", _WELLFORMED_PATCH, workdir=tmp_path, run_id="rid", harness_runner=fake)
+    assert "infra" in e.value.message.lower()
+
+
+def test_plain_unresolved_is_not_infra_failed(tmp_path):
+    """Control: a plain resolved=False report (no infra_failure flag) is a
+    legitimate 'not resolved' verdict, not an error."""
+    fake = FakeHarness(
+        tree=lambda cwd: _build_tree(
+            cwd, "rid", "devin", "iid",
+            report={"iid": {"resolved": False, "infra_failure": False}},
+        )
+    )
+    result = ev.evaluate("iid", _WELLFORMED_PATCH, workdir=tmp_path, run_id="rid", harness_runner=fake)
+    assert result["resolved"] is False
+
+
+def test_empty_patch_with_invalid_input_is_invalid_input(tmp_path):
+    """Validation precedes the empty-patch short-circuit: an empty patch
+    with a bad instance_id is an InvalidInputError (typed before any
+    side effect), not the empty-patch result."""
+    fake = FakeHarness()
+    with pytest.raises(ev.InvalidInputError):
+        ev.evaluate("a/b", "", workdir=tmp_path, harness_runner=fake)
+    assert fake.calls == []
+
+
+def test_stale_log_marker_is_not_a_terminal_verdict(tmp_path):
+    """Stale-log-marker protection: a pre-existing run_instance.log (from a
+    re-used workdir/run_id) carrying APPLY_PATCH_FAIL, which this run does
+    not update (the run dies before the harness reaches logger setup —
+    no report, no fresh log), must not be triaged as this run's verdict →
+    the retryable infra class, never the terminal corruption class."""
+    import os
+    import time
+
+    log = tmp_path / "logs" / "run_evaluation" / "rid" / "devin" / "iid" / "run_instance.log"
+    log.parent.mkdir(parents=True)
+    log.write_text(">>>>> Patch Apply Failed:\nerror: patch failed\n", encoding="utf-8")
+    t_past = time.time() - 10
+    os.utime(log, (t_past, t_past))  # the pre-run mtime, clearly in the past
+    fake = FakeHarness()  # no tree: the run writes nothing new
+    with pytest.raises(ev.HarnessFailedError) as e:
+        ev.evaluate("iid", _WELLFORMED_PATCH, workdir=tmp_path, run_id="rid", harness_runner=fake)
+    assert "stale" in e.value.message.lower()
+
+
+def test_updated_log_marker_is_this_runs_verdict(tmp_path):
+    """Control: the same pre-existing log file, but *updated by this run*
+    (the harness truncates/rewrites it — newer mtime), is this run's
+    verdict → the terminal corruption class."""
+    import os
+    import time
+
+    log = tmp_path / "logs" / "run_evaluation" / "rid" / "devin" / "iid" / "run_instance.log"
+    log.parent.mkdir(parents=True)
+    log.write_text(">>>>> Patch Apply Failed:\nerror: patch failed\n", encoding="utf-8")
+    t_past = time.time() - 10
+    os.utime(log, (t_past, t_past))
+
+    def tree(cwd: Path) -> None:
+        _build_tree(
+            cwd, "rid", "devin", "iid",
+            instance_log=(
+                ">>>>> Patch Apply Failed:\nerror: patch failed\n"
+            ),
+        )
+        t_future = time.time() + 1
+        os.utime(cwd / "logs" / "run_evaluation" / "rid" / "devin" / "iid" / "run_instance.log", (t_future, t_future))
+
+    fake = FakeHarness(tree=tree)
+    with pytest.raises(ev.PatchCorruptionError):
+        ev.evaluate("iid", _WELLFORMED_PATCH, workdir=tmp_path, run_id="rid", harness_runner=fake)
+
+
 # ---------------------------------------------------------------------------
 # validation matrix — typed, before any side effect
 # ---------------------------------------------------------------------------
-
 
 @pytest.mark.parametrize(
     ("instance_id", "model_patch", "run_id", "model_name", "timeout"),
@@ -937,6 +1167,12 @@ def test_input_validation_matrix(
         ("SWE-bench/SWE-bench_Verified", "test", None, None, None, -5),  # overall_timeout negative
         ("SWE-bench/SWE-bench_Verified", "test", None, None, None, "600"),  # overall_timeout str
         ("SWE-bench/SWE-bench_Verified", "test", None, None, None, True),  # overall_timeout bool
+        ("SWE-bench/SWE-bench_Verified", "test", None, None, None, float("nan")),  # overall_timeout nan (a nan deadline hangs / fires unpredictably)
+        ("SWE-bench/SWE-bench_Verified", "test", None, None, None, float("inf")),  # overall_timeout inf (no outer bound = no watchdog)
+        ("SWE-bench\x00/SWE-bench_Verified", "test", None, None, None, None),  # dataset NUL (an argv context)
+        ("SWE-bench/SWE-bench_Verified", "test\x00", None, None, None, None),  # split NUL (an argv context)
+        ("SWE-bench/SWE-bench_Verified", "test", "w\x00d", None, None, None),  # workdir NUL (an argv context)
+        ("SWE-bench/SWE-bench_Verified", "test", None, "/py\x00", None, None),  # python NUL (an argv context)
     ],
 )
 def test_extra_input_validation_matrix(
@@ -988,6 +1224,9 @@ def test_cli_success_prints_json_on_stdout(tmp_path, capsys):
 
     code = ev.main(
         ["--instance-id", "iid", "--patch-file", str(patch_file),
+         "--model-name", "devin-cli", "--dataset", "org/ds", "--split", "cs",
+         "--workdir", str(tmp_path / "wd"), "--run-id", "rid-cli",
+         "--python", "/custom/python", "--timeout", "999",
          "--overall-timeout", "600"],
         evaluate_fn=fake_evaluate,
     )
@@ -996,7 +1235,15 @@ def test_cli_success_prints_json_on_stdout(tmp_path, capsys):
     assert out == fixed
     assert seen["args"][0] == "iid"
     assert seen["args"][1] == _WELLFORMED_PATCH
-    assert seen["args"][2]["overall_timeout"] == 600.0  # the flag flows through
+    seen_kwargs = seen["args"][2]
+    assert seen_kwargs["overall_timeout"] == 600.0  # the flag flows through
+    assert seen_kwargs["model_name_or_path"] == "devin-cli"
+    assert seen_kwargs["dataset"] == "org/ds"
+    assert seen_kwargs["split"] == "cs"
+    assert seen_kwargs["workdir"] == str(tmp_path / "wd")
+    assert seen_kwargs["run_id"] == "rid-cli"
+    assert seen_kwargs["python"] == "/custom/python"
+    assert seen_kwargs["timeout"] == 999
 
 
 def test_cli_missing_patch_file_is_exit_2(tmp_path, capsys):
@@ -1042,6 +1289,27 @@ def test_cli_error_exit_codes(tmp_path, capsys):
         )
         assert code == expected, f"{type(exc).__name__} → {code}"
         assert capsys.readouterr().err  # the typed message on stderr
+
+
+def test_cli_unexpected_exception_is_exit_5(tmp_path, capsys):
+    """The CLI catch-all: an *unexpected* exception (a bug, not a documented
+    failure class) is exit 5 with a typed message — the documented
+    contract, not a traceback."""
+    patch_file = tmp_path / "p.diff"
+    patch_file.write_text(_WELLFORMED_PATCH, encoding="utf-8")
+
+    def boom(*a, **k):
+        raise RuntimeError("a bug")
+
+    code = ev.main(
+        ["--instance-id", "iid", "--patch-file", str(patch_file)],
+        evaluate_fn=boom,
+    )
+    assert code == 5
+    err = capsys.readouterr().err
+    assert "Unexpected failure" in err
+    assert "RuntimeError" in err
+    assert "Traceback" not in err
 
 
 # ---------------------------------------------------------------------------

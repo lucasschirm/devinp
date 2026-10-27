@@ -33,14 +33,25 @@ Estimate: S (1 pt).
    per-instance artifact lands under one per-instance directory (PLAN §5
    WP2 artifact atomicity). The **final run report** is written by the pin's
    `make_run_report` to `<report_dir>/<model>.<run_id>.json` (verified in the
-   pinned source, `reporting.py:170-172` — `--report_dir` *is* honored in the
+   pinned source, `reporting.py:170-178` — `--report_dir` *is* honored in the
    5.0.2 pin, default `.`), so `--report_dir workdir` lands it beside the
    CWD-relative log tree.
 3. **Per-instance report** (`report.json`): `{instance_id: {resolved,
    patch_is_None, patch_exists, patch_successfully_applied, infra_failure,
-   FAIL_TO_PASS, PASS_TO_PASS, tests?}}`. **Final report**
-   (`<report_dir>/<model>.<run_id>.json`, `schema_version: 2`) carries
-   `resolved_ids` / `unresolved_ids` / `error_ids` / `empty_patch_ids`.
+   infra_failure_reason?, tests_status?}}` — `infra_failure_reason` is
+   conditional (set with the flag) and `FAIL_TO_PASS` / `PASS_TO_PASS`
+   (alongside `FAIL_TO_FAIL` / `PASS_TO_FAIL`) live nested under
+   `tests_status` (per `get_eval_report`, `grading.py:350-391`). **Final
+   report** (`<report_dir>/<model>.<run_id>.json`, `schema_version: 2`)
+   carries `resolved_ids` / `unresolved_ids` / `error_ids` /
+   `empty_patch_ids` / **`infra_failure_ids`** (with per-instance
+   `infra_failure_reasons` — `reporting.py:105-107`): on unparseable test
+   output from an environment fault, `grading.py:373-374` sets
+   `infra_failure` + reason while keeping `resolved` False — the harness's
+   *own* environment-fault classification, tallied separately from
+   `unresolved_ids`. evaluate.py maps that classification to
+   `HarnessFailedError` (the WP3 `eval_error` retry class) — never a
+   terminal "not resolved" verdict.
 4. **Empty patches are filtered by the harness itself**
    (`get_dataset_from_preds`): an empty/`None` `model_patch` instance is
    *skipped* — no container is created, no report is written, and the final
@@ -53,18 +64,21 @@ Estimate: S (1 pt).
    catches `EvaluationError` (and any exception), prints it, and returns
    `None` — the process still **exits 0** and no `report.json` is written.
    The definitive typed signals are harness-written markers, **by the file
-   the pinned harness writes them to** (`run_evaluation.py:376` et al.):
-   `>>>>> Patch Apply Failed` (`APPLY_PATCH_FAIL`) in `run_instance.log`
-   after the 4-command git-apply chain fails; `Timeout error: N seconds
-   exceeded` in `test_output.txt` (the harness appends exactly that —
-   *anchored*: `EvaluationTimeoutError` is terminal in WP3 while
+   the pinned harness writes / the test output it grades** (`
+   run_evaluation.py:376-381`, `grading.py:130-141`): `>>>>> Patch Apply
+   Failed` (`APPLY_PATCH_FAIL`) in `run_instance.log` after the 4-command
+   git-apply chain fails; in `test_output.txt`: the **tail-anchored**
+   `Timeout error: N seconds exceeded.` the harness appends as the file's
+   final write, and the dataset eval-script's `>>>>> Tests Timed Out`
+   marker (graded *inside* the test output — never written to
+   `run_instance.log`); in `run_instance.log`: the harness's `Test timed
+   out after N seconds` `EvaluationError` message. *Anchored +
+   file-specific*: `EvaluationTimeoutError` is terminal in WP3 while
    `HarnessFailedError` is the retried `eval_error` class, so a loose
    substring in the wrong file must not convert a retryable infra flake
-   into a terminal `timeout`); and the harness's `Test timed out after N
-   seconds` `EvaluationError` message / `>>>>> Tests Timed Out` logger line
-   in `run_instance.log`. evaluate.py triages *only* these markers (plus
-   the `exclude_completed` stale-report protection, fact 6 / step 3) — it
-   never re-implements apply/grade.
+   into a terminal `timeout`. evaluate.py triages *only* these markers
+   (plus the `exclude_completed` stale-report protection, fact 6 / step 3)
+   — it never re-implements apply/grade.
 6. **`exclude_completed` (stale-report protection):** `get_dataset_from_preds`
    treats a pre-existing per-run `report.json` as *already run* and silently
    skips the instance — a re-used (workdir, run_id) pair would return the
@@ -72,7 +86,16 @@ Estimate: S (1 pt).
    stale container id in `logs.container`). evaluate.py never trusts a
    pre-existing report: it unlinks one before the spawn (best effort; on an
    unlink failure it records the pre-run mtime and requires the post-run
-   report to be newer), and a non-zero exit is always an error (step 4).
+   report to be strictly newer — a missing pre-run mtime or an unreadable
+   post-run mtime makes freshness unverifiable → reject), and a non-zero
+   exit is always an error (step 4). (The second skip path — `run_instance`
+   itself early-returning a pre-existing report, `run_evaluation.py:272` —
+   is covered by the same unlink.) The same re-use risk for the
+   *terminal-class triage markers*: a pre-existing `run_instance.log` /
+   `test_output.txt` whose mtime this run did not update is stale — its
+   markers are not this run's verdict; triage downgrades them to the
+   retryable `HarnessFailedError` class (an unreadable baseline or mtime is
+   treated as stale — the safe direction).
 7. **Fresh-container mechanics (AC2):** the harness's `create_container` runs
    `client.containers.create(image=<instance eval image>, name=
    "sweb.eval.<instance_id>.<run_id>")` — a brand-new container from the
@@ -155,7 +178,7 @@ Flow:
    double-resolve (`workdir/workdir/…`). All pre-spawn filesystem work
    (tempdir / resolve / mkdir / predictions write) is wrapped in typed
    `HarnessFailedError` (ENOSPC / EACCES / ENAMETOOLONG never escape raw —
-   PLAN §7 names disk exhaustion an expected mid-benchmark risk), and the
+   PLAN §7 disk management / §9 risk table: "500 images exhaust disk"), and the
    artifact paths are known from here on, so every typed error after this
    point carries them.
 3. **Stale-report protection + predictions file + the delegation (AC1)** — a
@@ -169,10 +192,12 @@ Flow:
    "-t", <timeout>, "--report_dir", <workdir>]`, run with `cwd=workdir`
    (fact 2). No custom apply/grade flags; no other harness touch. A runner
    spawn failure (missing `python` → `FileNotFoundError`, fork/exec
-   `OSError`), the outer watchdog firing (`subprocess.TimeoutExpired`), a
-   failure an injected runner raises, or a malformed process result (no
-   usable `returncode`) is a typed `HarnessFailedError`, never a raw
-   traceback escape (typed errors an injected runner raises *stay typed* —
+   `OSError`), the outer watchdog firing (`subprocess.TimeoutExpired` — the
+   typed error surfaces the possibly-still-running eval container name for
+   `docker rm -f` and the partial output), a failure an injected runner
+   raises, or a malformed process result (no usable `returncode`) is a typed
+   `HarnessFailedError`, never a raw traceback escape (typed errors an
+   injected runner raises *stay typed* —
    `except EvaluationError: raise` before the broad catch).
 4. **Outcome resolution — reading only what the harness wrote (AC3):**
    * exit ≠ 0 → `HarnessFailedError` **always — even when a report
@@ -187,12 +212,15 @@ Flow:
    * no `report.json` (exit 0) → triage on harness-written markers only,
      by file (fact 5): `APPLY_PATCH_FAIL` in `run_instance.log` →
      `PatchCorruptionError` (wins over a timeout marker — a corrupt patch
-     is terminal and a retry would just re-fail the apply); the anchored
-     `Timeout error: N seconds exceeded` in `test_output.txt`, or the
-     `Test timed out after …` / `>>>>> Tests Timed Out` lines in
+     is terminal and a retry would just re-fail the apply); the
+     tail-anchored `Timeout error: N seconds exceeded.` or `>>>>> Tests
+     Timed Out` in `test_output.txt`, or `Test timed out after …` in
      `run_instance.log` → `EvaluationTimeoutError`; anything else →
      `HarnessFailedError` (Docker/infra — the WP3 `eval_error` retry
-     class; combined stdout + stderr tail in the message).
+     class; combined labeled tail in the message).
+   * a `report.json` with `resolved: false` + `infra_failure: true` (the
+     harness's own environment-fault classification, fact 3) →
+     `HarnessFailedError` — the WP3 retry class, never a terminal verdict.
    * a `report.json` that is unreadable (non-UTF-8 / invalid JSON) or not a
      JSON object is a typed `HarnessFailedError`, never a raw
      `UnicodeDecodeError` / `AttributeError` escape.
@@ -201,7 +229,9 @@ Flow:
    * A typed error carries `instance_id`, the log paths, and a combined tail
      of the harness output — a clean typed error, never a traceback escape.
 5. **Return contract (AC3; typed — `EvaluationResult` / `EvaluationLogs`
-   `TypedDict`, the codebase's structured-result convention):**
+   `TypedDict` — the repo's first `TypedDict`; the sibling structured
+   results are `@dataclass`, and this JSON-shaped contract is the fit; the
+   key set is test-enforced, the repo has no type checker in CI):**
 
    ```python
    {"resolved": bool,
@@ -233,7 +263,7 @@ EvaluationError(Exception)
 ├── EvaluationTimeoutError # harness test timeout (anchored, file-specific markers)
 └── HarnessFailedError     # spawn/watchdog failure / exit ≠ 0 (always) / pre-spawn FS /
                            #   infra (no report, no marker) / unreadable or non-object
-                           #   report / non-bool verdict / stale report
+                           #   report / non-bool verdict / harness infra_failure / stale report
 ```
 
 A small operator CLI (`python bench/evaluate.py --instance-id … --patch-file …
@@ -293,11 +323,14 @@ unresolved) with the JSON result on stdout, 2 `InvalidInputError`, 3
 * **Validation matrix** — empty/non-str/charset-violating `instance_id`
   (slash / `..` / tab / space / NUL / leading dot), non-str `model_patch`
   (bytes/dict), run_id charset (whitespace / `/` / `..` / non-str), model
-  name (empty / `..` / `.` / NUL), bad timeout, empty/non-str `dataset` /
-  `split`, empty / non-path `workdir`, empty / non-str `python`, non-
-  callable `harness_runner`, bad `overall_timeout` → `InvalidInputError`,
-  typed before any side effect (injected runner not called **and** no
-  `predictions.jsonl` written — zero FS side effects).
+  name (empty / `..` / `.` / NUL), bad timeout, empty/non-str/NUL-carrying
+  `dataset` / `split` / `workdir` / `python` (the argv-carrying strings),
+  non-callable `harness_runner`, bad `overall_timeout` (incl. **nan/inf**)
+  → `InvalidInputError`, typed before any side effect (injected runner not
+  called **and** no `predictions.jsonl` written — zero FS side effects).
+* **No bespoke harness import (AST)** — `evaluate` must not import `swebench`
+  (a direct import would be the seam for re-implementing the harness's
+  apply/grade path); checked structurally, not by string match.
 * **Corruption guard (unit, fabricated tree)** — every non-empty patch
   (incl. header-less garbage — the forms a header check would have wrongly
   rejected) reaches the harness; the fabricated `APPLY_PATCH_FAIL` marker →
@@ -308,29 +341,46 @@ unresolved) with the JSON result on stdout, 2 `InvalidInputError`, 3
   is surfaced in `logs.workdir` (caller-owned cleanup); a pre-spawn
   filesystem failure (workdir whose parent is a file — deterministic
   regardless of privileges) → typed `HarnessFailedError` before the spawn;
-  a runner spawn failure (`FileNotFoundError` / `OSError`) and a process
-  object without a usable `returncode` → typed `HarnessFailedError`, never
-  a raw traceback; `overall_timeout` flows through the runner seam; a
-  non-object or non-UTF-8 `report.json` → typed `HarnessFailedError`.
+  a runner spawn failure (`FileNotFoundError` / `OSError`), the outer
+  watchdog firing (`subprocess.TimeoutExpired` — the typed error surfaces
+  the eval container name + the partial output) and a process object
+  without a usable `returncode` → typed `HarnessFailedError`, never a raw
+  traceback; a typed error an injected runner raises *stays typed*;
+  `overall_timeout` flows through the runner seam; the default runner's own
+  wiring is tested directly (trivial success + a real watchdog fire);
+  a non-object or non-UTF-8 `report.json` → typed `HarnessFailedError`.
 * **Stale-report protection** — a pre-existing per-run `report.json` is
   unlinked before the spawn (a harness that "skips" the instance then gets
   a typed no-report triage, never the stale verdict); on a forced unlink
   failure (monkeypatched), an un-updated report is a typed stale-report
-  failure (fact 6).
+  failure and a demonstrably-updated (newer-mtime) report is accepted
+  (fact 6).
 * **Negative control (docker-free)** — `""` and `None` patch →
   `resolved is False`, `empty_patch: True`, **no harness spawn**, the same
-  key set with None run-identity values.
+  key set with None run-identity values; validation still precedes the
+  short-circuit (an empty patch with a bad `instance_id` →
+  `InvalidInputError`).
 * **Post-harness triage against fabricated harness trees** (no Docker — the
   tree is the exact CWD-relative layout of fact 2): `report.json` present
-  (resolved true / false) → passthrough of the harness value; no report +
-  `APPLY_PATCH_FAIL` in `run_instance.log` → `PatchCorruptionError` (and it
-  *wins* when a timeout marker is present too); the timeout markers
-  parametrized over all markers × the file the pinned harness writes them
-  to → `EvaluationTimeoutError`, the same text in the *wrong* file → the
+  (resolved true / false) → passthrough of the harness value; a
+  `resolved: false` + `infra_failure: true` report (with / without
+  `infra_failure_reason`) → `HarnessFailedError` (the harness's own
+  environment-fault class — fact 3) while a plain `resolved: false` stays a
+  verdict; no report + `APPLY_PATCH_FAIL` in `run_instance.log` →
+  `PatchCorruptionError` (and it *wins* when a timeout marker is present
+  too; the same marker in `test_output.txt` is *not* corruption); the
+  timeout markers parametrized over all markers × the file the pinned
+  harness writes / the test output it grades (tail-anchored `Timeout error:
+  N seconds exceeded.` in `test_output.txt`, `>>>>> Tests Timed Out` in
+  `test_output.txt`, `Test timed out after …` in `run_instance.log`) →
+  `EvaluationTimeoutError`, the same text in the *wrong* file → the
   retryable `HarnessFailedError` class (anchored + file-specific);
+  a marker that survived from a *previous* run (its file not updated by
+  this run — the stale-log guard) → the retryable class, while the same
+  marker in an updated file stays terminal;
   no report, no marker → `HarnessFailedError`; exit ≠ 0 →
-  `HarnessFailedError` with the **combined stdout + stderr tail — even when
-  a report exists** (the exit-≠ 0-always-error rule); a non-bool
+  `HarnessFailedError` with the **combined labeled tail — even when a
+  report exists** (the exit-≠ 0-always-error rule); a non-bool
   `resolved` verdict / a missing instance entry / an unreadable or
   non-object `report.json` → typed `HarnessFailedError`.
 * **Container-id extraction** — from a fixture `run_instance.log` (the
@@ -338,8 +388,11 @@ unresolved) with the JSON result on stdout, 2 `InvalidInputError`, 3
   `None` (never a crash; a warning is logged).
 * **CLI** — `--help`; bad input (missing / directory / non-UTF-8 patch
   file) → exit 2; success (injected runner) → JSON with `resolved` on
-  stdout; `--overall-timeout` flows through; the typed error classes →
-  exit 3/4/5.
+  stdout; **every flag** (`--model-name` / `--dataset` / `--split` /
+  `--workdir` / `--run-id` / `--python` / `--timeout` /
+  `--overall-timeout`) flows through to `evaluate`; the typed error
+  classes → exit 3/4/5; an *unexpected* exception (a bug) → exit 5 with a
+  typed message, never a traceback.
 
 **Integration (CI — public images, zero quota; auto-skip without a Docker
 daemon, which this dev workspace lacks, so these run in CI; both carry a
