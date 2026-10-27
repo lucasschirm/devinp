@@ -55,6 +55,7 @@ from pathlib import Path
 import pytest
 
 import acp_client as ac
+from mock_server import make_mock
 from mock_devin import CANNED_CONTENT, CANNED_FILE, VALID_MODES
 
 MOCK_PATH = str(Path(__file__).resolve().parent.parent / "mock_devin.py")
@@ -581,8 +582,11 @@ def _read_line(p, timeout: float = 10.0) -> str:
 def test_wire_conformance_rpc_errors(tmp_path):
     """The mock keeps serving through wire errors, exactly like the real
     server in the WP0 negative control: non-JSON line -> ``-32700``
-    parse error (not a crash); unknown method with an id -> ``-32601``;
-    unknown notifications are ignored (never block)."""
+    parse error (id null, ``data.line`` echoing the line; a blank line
+    too, with ``data.line == ""`` — the capture's framing-canary
+    separator, round 7 [minor]); unknown method with an id ->
+    ``-32601`` (capture-verbatim message); unknown notifications are
+    ignored (never block)."""
     w, state = _wrapper(tmp_path, "ok")
     p = subprocess.Popen([w, "acp"], stdin=subprocess.PIPE,
                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -594,11 +598,19 @@ def test_wire_conformance_rpc_errors(tmp_path):
             assert n["method"] == "_cognition.ai/mcp/serversChanged"
             assert "id" not in n
 
-        # a blank line is tolerated (not a message)
+        # blank line -> -32700 with data.line == "" (the capture's
+        # framing-canary separator line — the real server answers it
+        # rather than skipping it, round 7 [minor])
         p.stdin.write(b"\n")
         p.stdin.flush()
+        obj = json.loads(_read_line(p))
+        assert obj["error"]["code"] == -32700
+        assert obj["error"]["message"] == "Parse error"
+        assert obj.get("id") is None
+        assert obj["error"]["data"]["line"] == ""
 
-        # unknown method with an id -> -32601, the server keeps serving
+        # unknown method with an id -> -32601 (capture-verbatim
+        # message), the server keeps serving
         p.stdin.write(json.dumps(
             {"jsonrpc": "2.0", "id": 7, "method": "bogus/method",
              "params": {}}).encode() + b"\n")
@@ -606,13 +618,16 @@ def test_wire_conformance_rpc_errors(tmp_path):
         obj = json.loads(_read_line(p))
         assert obj.get("id") == 7
         assert obj["error"]["code"] == -32601
+        assert obj["error"]["message"] == "Method not found"
 
         # non-JSON line -> -32700 parse error, not a crash
         p.stdin.write(b"this is not json\n")
         p.stdin.flush()
         obj = json.loads(_read_line(p))
         assert obj["error"]["code"] == -32700
+        assert obj["error"]["message"] == "Parse error"
         assert obj.get("id") is None
+        assert obj["error"]["data"]["line"] == "this is not json"
 
         # the server still serves after both errors: initialize answers
         p.stdin.write(json.dumps(
@@ -695,6 +710,42 @@ def test_wire_conformance_rpc_errors(tmp_path):
             p.kill()
             p.wait()
     assert _read_state(state)  # the event file was written
+
+
+def test_wp1_mock_serves_parse_error_frame(tmp_path):
+    """Round 7 [nit]: the WP1 mock's new -32700 send (round 6) was
+    exercised by no test — pin it here against the spawned WP1 mock
+    (make_mock): a non-JSON line gets the capture-verbatim frame and
+    the server keeps serving."""
+    wrapper, state = make_mock(tmp_path, "ok")
+    p = subprocess.Popen([wrapper], stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        # the two startup vendor notifications (WP0: unsolicited at boot)
+        n1 = json.loads(_read_line(p))
+        n2 = json.loads(_read_line(p))
+        for n in (n1, n2):
+            assert n["method"] == "_cognition.ai/mcp/serversChanged"
+        # non-JSON line -> -32700 (id null, data.line echo), verbatim
+        p.stdin.write(b"not json at all\n")
+        p.stdin.flush()
+        obj = json.loads(_read_line(p))
+        assert obj == {"jsonrpc": "2.0", "id": None,
+                      "error": {"code": -32700, "message": "Parse error",
+                               "data": {"line": "not json at all"}}}
+        # the server keeps serving: initialize still answers
+        p.stdin.write(json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+             "params": {}}).encode() + b"\n")
+        p.stdin.flush()
+        obj = json.loads(_read_line(p))
+        assert obj.get("id") == 1
+        assert obj["result"]["protocolVersion"] == 1
+        assert p.poll() is None  # still alive
+    finally:
+        p.kill()
+        p.wait()
+    assert _read_state(state)  # the event file was written (bad_line)
 
 
 # ---------------------------------------------------------------------------

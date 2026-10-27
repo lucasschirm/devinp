@@ -242,8 +242,11 @@ while True:
     while b"\n" in buf:
         line, buf = buf.split(b"\n", 1)
         line = line.strip()
-        if not line:
-            continue
+        # A blank line is not a message — but the WP0 capture shows the
+        # real server answers a blank separator line with a -32700
+        # parse error (data.line == "") rather than skipping it, so
+        # blank lines take the same parse-error path (round 7
+        # [minor]: capture fidelity).
         try:
             handle(json.loads(line))
         except json.JSONDecodeError:
