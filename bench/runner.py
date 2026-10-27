@@ -1028,7 +1028,12 @@ def _repair_checkpoint_file(path: str) -> None:
             return  # clean — a complete record, newline-terminated
         with open(path, "ab") as f:
             f.write(b"\n")  # complete the record — it survives the resume
-        return
+            f.flush()
+            os.fsync(f.fileno())  # same crash-durability discipline as the
+                                  # truncate path (round-5 finding — a lost
+                                  # \n self-heals on the next open, but the
+                                  # function's documented discipline is
+                                  # "every write is fsync'd")
     # A non-record last line — truncate at the byte-exact boundary.
     with open(path, "r+b") as f:
         f.truncate(boundary_b)  # ftruncate — the preserved prefix is intact

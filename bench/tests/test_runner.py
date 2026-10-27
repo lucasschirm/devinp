@@ -2322,9 +2322,12 @@ def test_checkpoint_resume_non_ascii_prefix_byte_boundary(tmp_path):
 
 def test_checkpoint_resume_torn_tail_mid_multibyte_sequence_dropped(tmp_path):
     """A foreign torn tail ending mid-multibyte-sequence is a
-    droppable tail, not a bare UnicodeDecodeError: the reader drops it
-    (``errors="replace"`` — U+FFFD fails the record shape) and the
-    repair truncates it."""
+    droppable tail, not a bare UnicodeDecodeError: the reader's strict
+    per-line decode fails on the torn last line (the historical
+    round-3 bug was that a whole-file ``errors="replace"`` decode
+    masked it; f5eca02 moved the drop to the strict-decode torn-tail
+    branch — ``UnicodeDecodeError`` on the last line → dropped) and
+    the repair truncates it byte-exactly."""
     p = str(tmp_path / "run-1.jsonl")
     with open(p, "wb") as f:
         f.write(b'{"instance_id": "i0", "status": "resolved", "meta": {}, "ts": 1.0}\n')
