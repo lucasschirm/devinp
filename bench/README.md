@@ -203,19 +203,23 @@ WP3b (issue #15, PLAN §2.4–2.7):
   usage in `meta`, timestamp); a killed mid-write run leaves a torn
   last line, which `load_checkpoint` **drops, not fatal** (a corrupted
   mid-file line fails loud) and which `JsonlCheckpoint`'s open
-  **repairs on the write side** (`_repair_checkpoint_file`):
-  a torn fragment is *truncated* to the last clean boundary, and a
-  complete record missing only its trailing newline is *completed*
-  (newline written) — so a resumed run never glues its first record
-  onto the torn tail (mid-file corruption on the next load, or a
-  silently dropped *completed* record — a re-run of a finished
-  instance, a pass@1 violation). `resume_queue` (pure) splits the full
-  instance list into `to_run` / `skipped`: `resolved` / `failed_test`
-  / `timeout` / `no_patch` (and `agent_error` — a terminal agent
-  outcome) are **never re-run**; `quota_limited` / `eval_error` /
-  `preflight_failed` and a host-crash partial state (a missing line)
-  **retry — the only retry class**; a duplicated line resolves to the
-  last line, so no instance runs twice.
+  **repairs on the write side** (`_repair_checkpoint_file`): the
+  **last line** — whether or not newline-terminated (the reader's
+  contract blesses a non-record *last* line with a trailing newline as
+  a droppable torn tail too) — if a complete record missing only its
+  trailing newline is *completed* (newline written), otherwise
+  *truncated* via `ftruncate` (atomic w.r.t. the preserved prefix — a
+  kill mid-repair cannot destroy fsync'd records) — so a resumed run
+  never glues its first record onto the tail (mid-file corruption on
+  the next load, or a silently dropped *completed* record — a re-run
+  of a finished instance, a pass@1 violation). `resume_queue` (pure)
+  splits the full instance list into `to_run` / `skipped`:
+  `resolved` / `failed_test` / `timeout` / `no_patch` (and
+  `agent_error` — a terminal agent outcome) are **never re-run**;
+  `quota_limited` / `eval_error` / `preflight_failed` and a
+  host-crash partial state (a missing line) **retry — the only retry
+  class**; a duplicated line resolves to the last line, so no instance
+  runs twice.
 - **Startup cost-tier model gate** (PLAN §2.4, fail-closed):
   `gate_cost_tier` / `parse_models_list` allow only `cost_tier ==
   "Free"` variants of `devin models list --format json` (the allowlist
@@ -227,12 +231,17 @@ WP3b (issue #15, PLAN §2.4–2.7):
   `--allow-paid`, `--token-budget`, `--models-json` / `--devin-bin`;
   a refusal exits 2 before the batch starts; the gate flags without
   `--model` exit 2 too — the gate is a no-op there, and a silent
-  no-op that "validated" nothing is a footgun). The Runner's default
-  clock is **wall time** (`time.time`): the backoff target is the next
-  *epoch* UTC midnight (WP0 §4 "calendar basis"), so a monotonic
-  (boot-relative) clock would align the sleep ~24 h off the real quota
-  reset (the WP3a default, review finding — WP3b's per-window
-  pre-flight makes the phase alignment load-bearing).
+  no-op that "validated" nothing is a footgun; `--models-json` and
+  `--devin-bin` are mutually exclusive (the gate's input is the file
+  OR the live binary — a silently inert `--devin-bin` is the same
+  footgun class). The Runner's default clock is **wall time**
+  (`time.time`): the backoff target is the next *epoch* UTC midnight
+  (WP0 §4 "calendar basis"), so a monotonic (boot-relative) clock
+  would align the sleep ~24 h off the real quota reset (the WP3a
+  default, review finding — WP3b's per-window pre-flight makes the
+  phase alignment load-bearing); wall-clock step-backs (NTP / VM
+  snapshots) clamp to 0.0 at the measurement sites — a negative wall
+  would be subtracted from the budget's `wall_used_s`.
 - **Zero-quota pre-flight** (PLAN §2.7): `Preflight` runs the ordered,
   short-circuiting legs — `devin auth status` ok → Docker daemon
   responsive (bounded — a hung daemon is a failure, not a wait) →

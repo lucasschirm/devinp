@@ -90,6 +90,8 @@ WP3b acceptance mapping (issue #15, PLAN §2.4–§2.7):
   :func:`test_checkpoint_resume_torn_tail_repaired`,
   :func:`test_checkpoint_resume_torn_tail_complete_json_no_newline`,
   :func:`test_checkpoint_resume_mid_file_corruption_refuses_repair`,
+  :func:`test_checkpoint_resume_newline_terminated_non_record_last_line_repaired`,
+  :func:`test_checkpoint_resume_blank_last_line_repaired`,
   :func:`test_resume_queue_non_dict_record_is_typed`
 * AC2 — pass@1 retry classes → :func:
   `test_resume_never_rerun_agent_outcomes`, :func:
@@ -113,7 +115,9 @@ WP3b acceptance mapping (issue #15, PLAN §2.4–§2.7):
   `test_cli_gate_paid_override_without_budget`, :func:
   `test_cli_gate_live_devin_bin`, :func:
   `test_cli_gate_flags_without_model_refused`, :func:
+  `test_cli_models_json_and_devin_bin_mutually_exclusive`, :func:
   `test_fetch_models_list_none_stdout_fail_closed`, :func:
+  `test_fetch_models_list_missing_stdout_attr_fail_closed`, :func:
   `test_gate_inf_token_budget_refused`, :func:
   `test_next_quota_window_wall_clock_alignment`
 * AC4 — zero-quota pre-flight before every batch and each instance →
@@ -128,7 +132,8 @@ WP3b acceptance mapping (issue #15, PLAN §2.4–§2.7):
   `test_preflight_instance_failure_marks_releases_claim_aborts`,
   :func:`test_preflight_batch_reruns_each_window`, :func:
   `test_preflight_failure_resume_cycle`, :func:
-  `test_preflight_wall_excluded_from_session_wall`
+  `test_preflight_wall_excluded_from_session_wall`, :func:
+  `test_wall_clock_step_back_clamps_to_zero`
 """
 
 from __future__ import annotations
@@ -2159,3 +2164,100 @@ def test_preflight_wall_excluded_from_session_wall():
     ev = [ev for ev in e.reporter.events if ev[0] == "instance"][0]
     assert ev[3]["wall_s"] == 2.0  # the session wall, not 2.0 + 5.0
     assert runner.budget.wall_used_s == 2.0
+
+
+# ---------------------------------------------------------------------------
+# WP3b review round 2 (PR #30, commit ab6a436) — review-finding regressions
+# ---------------------------------------------------------------------------
+
+
+def test_checkpoint_resume_newline_terminated_non_record_last_line_repaired(tmp_path):
+    """Review round 2 [minor]: a newline-terminated *non-record* last
+    line (the reader's contract blesses it as a droppable torn tail —
+    test-pinned by ``test_load_checkpoint_last_line_wrong_shape_dropped``)
+    must also be removed by the *write-side* repair, or the first
+    appended record glues it into a mid-file line →
+    ``RunnerProtocolError`` on the next load (the round-1 blocker's
+    failure signature, new input class)."""
+    p = str(tmp_path / "run-1.jsonl")
+    with open(p, "w", encoding="utf-8") as f:
+        f.write('{"instance_id": "i0", "status": "resolved", "meta": {}, "ts": 1.0}\n')
+        f.write("GARBAGE-NOT-JSON\n")  # newline-terminated non-record last line
+    # the reader half drops it
+    records, dropped = r.load_checkpoint(p)
+    assert dropped is True
+    assert [rec["instance_id"] for rec in records] == ["i0"]
+    # the writer half truncates it (no early return on the trailing \n)
+    e = Env()
+    ckpt = r.JsonlCheckpoint(p, clock=e.clock)
+    r.Runner(["i1"], lambda inst: FakeSession(e.registry, "resolved",
+                                             clock=e.clock),
+             clock=e.clock, sleeper=e.sleeper, reporter=ckpt).run()
+    ckpt.close()
+    # the next load is clean — the glued line did not happen
+    recs2, dropped2 = r.load_checkpoint(p)
+    assert dropped2 is False
+    assert [(rec["instance_id"], rec["status"]) for rec in recs2] == [
+        ("i0", "resolved"), ("i1", "resolved")]
+    # the raw file is clean: two newline-terminated lines, no garbage
+    raw = open(p, encoding="utf-8").read()
+    assert "GARBAGE" not in raw and raw.count("\n") == 2
+
+
+def test_checkpoint_resume_blank_last_line_repaired(tmp_path):
+    """A trailing blank line (newline-terminated empty last line) is
+    dropped by the reader and truncated by the repair — the appended
+    record must not glue onto it either."""
+    p = str(tmp_path / "run-1.jsonl")
+    with open(p, "w", encoding="utf-8") as f:
+        f.write('{"instance_id": "i0", "status": "resolved", "meta": {}, "ts": 1.0}\n')
+        f.write("\n")  # a trailing blank line
+    records, dropped = r.load_checkpoint(p)
+    assert [rec["instance_id"] for rec in records] == ["i0"]
+    e = Env()
+    ckpt = r.JsonlCheckpoint(p, clock=e.clock)
+    r.Runner(["i1"], lambda inst: FakeSession(e.registry, "resolved",
+                                             clock=e.clock),
+             clock=e.clock, sleeper=e.sleeper, reporter=ckpt).run()
+    ckpt.close()
+    recs2, dropped2 = r.load_checkpoint(p)
+    assert dropped2 is False
+    assert [rec["instance_id"] for rec in recs2] == ["i0", "i1"]
+
+
+def test_fetch_models_list_missing_stdout_attr_fail_closed():
+    """A stubbed ``run`` returning an object *without* a ``stdout``
+    attribute is a fail-closed typed refusal (the round-2 finding — a
+    leaked AttributeError would traceback in ``main()`` instead of
+    exiting 2)."""
+    def run(cmd, timeout_s):
+        return types.SimpleNamespace(returncode=0)  # no .stdout / .stderr
+    with pytest.raises(r.ModelGateError, match="fail-closed"):
+        r.fetch_models_list("whatever", run=run)
+
+
+def test_cli_models_json_and_devin_bin_mutually_exclusive(capsys):
+    """The gate's input is the file OR the live binary — the
+    combination is refused (``--models-json`` would silently win; a
+    silently inert ``--devin-bin`` is the same footgun class as the
+    flags-without-``--model`` refusal)."""
+    assert r.main(["--model", "swe-1-7", "--models-json", "x.json",
+                  "--devin-bin", "somedevin"]) == 2
+    assert "mutually exclusive" in capsys.readouterr().err
+
+
+def test_wall_clock_step_back_clamps_to_zero():
+    """A backward wall-clock step (NTP / VM snapshot) never records a
+    negative wall: the measurement sites clamp to 0.0 (a negative
+    ``wall_s`` would be subtracted from the budget's ``wall_used_s``).
+    A negative ``hold_s`` simulates the step."""
+    e = Env()
+    runner = e.make(["i0"], {"i0": "resolved"},
+                   factory=lambda inst: FakeSession(e.registry,
+                                                  "resolved",
+                                                  clock=e.clock,
+                                                  hold_s=-10.0))
+    runner.run()
+    ev = [ev for ev in e.reporter.events if ev[0] == "instance"][0]
+    assert ev[3]["wall_s"] == 0.0  # clamped
+    assert runner.budget.wall_used_s == 0.0  # nothing subtracted

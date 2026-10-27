@@ -639,7 +639,12 @@ def fetch_models_list(devin_bin: str = "devin", timeout_s: float = 30.0,
             f"{tail[-200:].decode('utf-8', 'replace').strip()!r}"
         )
     try:
-        return json.loads(proc.stdout)
+        # ``getattr`` (not direct attribute access): a stubbed ``run``
+        # returning an object without a ``stdout`` attribute must also
+        # be a fail-closed typed refusal, not a leaked AttributeError
+        # (None → ``json.loads`` TypeError — both wrapped below; the
+        # seam exists for tests).
+        return json.loads(getattr(proc, "stdout", None))
     except (ValueError, TypeError) as exc:
         # ValueError covers JSONDecodeError (a str subclass); TypeError
         # covers a non-str/bytes stdout (e.g. None from a stubbed
@@ -936,18 +941,30 @@ def _repair_checkpoint_file(path: str) -> None:
     mid-file corruption on the next load — or a silently dropped
     *completed* record, i.e. a re-run of a finished instance).
 
-    * the file ends with a newline → clean, nothing to do.
-    * the trailing segment (after the last newline) is a **complete
-      record** missing only the trailing newline (a kill after the JSON
-      but before the ``"\\n"``) → complete it (write the newline — the
-      record is preserved, and it is what the reader keeps).
-    * the trailing segment is a torn fragment (truncated JSON / wrong
-      shape — indistinguishable from a torn write) → **truncate** it to
-      the last clean boundary. (Appending a ``"\\n"`` would *not* fix
-      it — the fragment would remain a mid-file line and still fail on
-      the next load; it must be removed.)
+    * the file is clean (the last line is a complete record, or the
+      file is empty) → nothing to do.
+    * the **last line** (whether or not newline-terminated — the
+      reader's contract blesses a non-record *last* line with a
+      trailing newline as a droppable torn tail too, and leaving such
+      a line in place would have the first appended record glue it
+      into a *mid-file* line) is a **complete record** missing only
+      the trailing newline (a kill after the JSON but before the
+      ``"\\n"``) → complete it (write the newline — the record is
+      preserved, and it is what the reader keeps).
+    * the last line is a **non-record** (a torn fragment — truncated
+      JSON / wrong shape, indistinguishable from a torn write — or a
+      blank / non-JSON line) → **truncate** it to the last clean
+      boundary. (Appending a ``"\\n"`` would *not* fix it — the
+      fragment would remain a mid-file line and still fail on the
+      next load; it must be removed.)
     * a corrupted line *anywhere else* → :class:
       `RunnerProtocolError` (fail-loud, before the file is touched).
+
+    The truncation uses ``ftruncate`` (open ``"r+b"``) — atomic w.r.t.
+    the preserved prefix: a kill (or a write error, e.g. ENOSPC) can
+    no longer destroy previously-fsync'd durable records (the round-1
+    ``open("w")`` rewrite truncated to 0 on open — a silent pass@1
+    violation; the round-2 fix).
     """
     if not os.path.exists(path):
         return
@@ -959,21 +976,28 @@ def _repair_checkpoint_file(path: str) -> None:
     # even when the tail is clean (a corrupted line anywhere else was
     # fsync'd complete; garbage there is not a kill artifact).
     _scan_checkpoint_lines(raw)
-    if raw.endswith("\n"):
-        return  # clean — every record line is newline-terminated
-    seg = raw[raw.rfind("\n") + 1:]  # the trailing segment (the kill zone)
+    # The kill zone is the **last line** — whether or not it is
+    # newline-terminated (see the docstring; a newline-terminated
+    # non-record last line is droppable per the reader's contract and
+    # must not survive the repair).
+    body = raw[:-1] if raw.endswith("\n") else raw
+    last_line = body.rsplit("\n", 1)[-1]
+    boundary = len(raw) - len(last_line) - (1 if raw.endswith("\n") else 0)
     complete = False
-    try:
-        complete = _is_checkpoint_record(json.loads(seg))
-    except json.JSONDecodeError:
-        pass
+    if last_line.strip():
+        try:
+            complete = _is_checkpoint_record(json.loads(last_line))
+        except json.JSONDecodeError:
+            pass
     if complete:
+        if raw.endswith("\n"):
+            return  # clean — a complete record, newline-terminated
         with open(path, "a", encoding="utf-8") as f:
             f.write("\n")  # complete the record — it survives the resume
         return
-    # A torn fragment — truncate to the last clean boundary.
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(raw[: len(raw) - len(seg)])
+    # A non-record last line — truncate to the last clean boundary.
+    with open(path, "r+b") as f:
+        f.truncate(boundary)  # ftruncate — the preserved prefix is intact
         f.flush()
         os.fsync(f.fileno())
 
@@ -1684,7 +1708,7 @@ class Runner:
                 self._preflight(inst)
             except PreflightFailed as exc:
                 self._handle_preflight_failure(
-                    inst, str(exc), self._clock() - t0)
+                    inst, str(exc), max(0.0, self._clock() - t0))
                 return
         t0 = self._clock()  # the session wall excludes the pre-flight
         try:
@@ -1725,7 +1749,7 @@ class Runner:
         finally:
             if guard_held:
                 self._guard.release()
-        wall = self._clock() - t0
+        wall = max(0.0, self._clock() - t0)
         self._handle(inst, status, wall)
 
     # -- status handling ---------------------------------------------------
@@ -1861,7 +1885,7 @@ class Runner:
             aborted_reason=self._abort_reason,
             backoffs=self._backoffs,
             sessions_completed=self._sessions_completed,
-            wall_s=round(self._clock() - t0, 3),
+            wall_s=round(max(0.0, self._clock() - t0), 3),
             transition_log=list(self._transition_log),
         )
 
@@ -1954,6 +1978,15 @@ def main(argv: "Sequence[str] | None" = None) -> int:
         print("runner: --allow-paid / --token-budget / --models-json / "
               "--devin-bin require --model (the startup model gate does "
               "not run without a configured model)", file=sys.stderr)
+        return 2
+    # The gate's input is one of the file or the live binary — the
+    # combination is refused (``--models-json`` would silently win, and
+    # a silently inert ``--devin-bin`` is the same footgun class as
+    # the flags-without-``--model`` refusal above).
+    if args.models_json is not None and args.devin_bin != "devin":
+        print("runner: --models-json and --devin-bin are mutually "
+              "exclusive (the gate's input is the file OR the live "
+              "binary)", file=sys.stderr)
         return 2
     # WP3b (issue #15 AC3, PLAN §2.4): the startup model gate — a
     # refusal exits 2 before the batch starts (fail-closed).
