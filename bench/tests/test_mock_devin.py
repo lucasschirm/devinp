@@ -606,7 +606,7 @@ def test_wire_conformance_rpc_errors(tmp_path):
         obj = json.loads(_read_line(p))
         assert obj["error"]["code"] == -32700
         assert obj["error"]["message"] == "Parse error"
-        assert obj.get("id") is None
+        assert obj["id"] is None  # explicit null, per the capture frame
         assert obj["error"]["data"]["line"] == ""
 
         # unknown method with an id -> -32601 (capture-verbatim
@@ -626,7 +626,7 @@ def test_wire_conformance_rpc_errors(tmp_path):
         obj = json.loads(_read_line(p))
         assert obj["error"]["code"] == -32700
         assert obj["error"]["message"] == "Parse error"
-        assert obj.get("id") is None
+        assert obj["id"] is None  # explicit null, per the capture frame
         assert obj["error"]["data"]["line"] == "this is not json"
 
         # the server still serves after both errors: initialize answers
@@ -733,6 +733,15 @@ def test_wp1_mock_serves_parse_error_frame(tmp_path):
         assert obj == {"jsonrpc": "2.0", "id": None,
                       "error": {"code": -32700, "message": "Parse error",
                                "data": {"line": "not json at all"}}}
+        # blank line -> the same frame with data.line == "" (the
+        # blank-line path changed in mock_server.py this round —
+        # round 8 [nit])
+        p.stdin.write(b"\n")
+        p.stdin.flush()
+        obj = json.loads(_read_line(p))
+        assert obj == {"jsonrpc": "2.0", "id": None,
+                      "error": {"code": -32700, "message": "Parse error",
+                               "data": {"line": ""}}}
         # the server keeps serving: initialize still answers
         p.stdin.write(json.dumps(
             {"jsonrpc": "2.0", "id": 1, "method": "initialize",
