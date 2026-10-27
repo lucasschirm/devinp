@@ -324,7 +324,10 @@ unresolved) with the JSON result on stdout, 2 `InvalidInputError`, 3
   (slash / `..` / tab / space / NUL / leading dot), non-str `model_patch`
   (bytes/dict), run_id charset (whitespace / `/` / `..` / non-str), model
   name (empty / `..` / `.` / NUL), bad timeout, empty/non-str/NUL-carrying
-  `dataset` / `split` / `workdir` / `python` (the argv-carrying strings),
+  `dataset` / `split` / `workdir` / `python` (the argv-carrying strings;
+  `workdir` also as a path-like — an empty path-like would resolve to the
+  caller's CWD, a NUL-carrying PurePath is the same malformed input as
+  the str case),
   non-callable `harness_runner`, bad `overall_timeout` (incl. **nan/inf**)
   → `InvalidInputError`, typed before any side effect (injected runner not
   called **and** no `predictions.jsonl` written — zero FS side effects).
@@ -338,12 +341,16 @@ unresolved) with the JSON result on stdout, 2 `InvalidInputError`, 3
 * **Delegation robustness edges** — a relative `workdir` is resolved to an
   absolute path before the spawn (`-p` / `--report_dir` / cwd all
   absolute); `workdir=None` creates a fresh `swebench-eval-…` tempdir that
-  is surfaced in `logs.workdir` (caller-owned cleanup); a pre-spawn
+  is surfaced in `logs.workdir` (success) **and** `error.workdir` (every
+  typed error raised after the workdir is resolved — the caller-owned
+  cleanup stays reachable on failure paths, not just success);
+  a pre-spawn
   filesystem failure (workdir whose parent is a file — deterministic
   regardless of privileges) → typed `HarnessFailedError` before the spawn;
   a runner spawn failure (`FileNotFoundError` / `OSError`), the outer
   watchdog firing (`subprocess.TimeoutExpired` — the typed error surfaces
-  the eval container name + the partial output) and a process object
+  the eval container name + the partial output, *decoded readably* when
+  the runner's output is bytes) and a process object
   without a usable `returncode` → typed `HarnessFailedError`, never a raw
   traceback; a typed error an injected runner raises *stays typed*;
   `overall_timeout` flows through the runner seam; the default runner's own

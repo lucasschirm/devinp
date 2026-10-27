@@ -181,7 +181,9 @@ Return contract (AC3; :class:`EvaluationResult` — the key set is pinned by
 
 Paths, not contents: the WP5 report / WP3 checkpoint consume artifact paths;
 embedding multi-MB test output in memory is not the contract. Errors carry
-``instance_id``, the log paths, and a combined tail of the harness output.
+``instance_id``, the log paths, the workdir (so an auto-created tempdir is
+findable for the caller's cleanup on failure paths too) and a combined tail
+of the harness output.
 """
 
 from __future__ import annotations
@@ -196,7 +198,7 @@ import subprocess
 import sys
 import tempfile
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any, Callable, Optional, TypedDict
 
 __all__ = [
@@ -303,6 +305,11 @@ class EvaluationError(Exception):
     ``EvaluationTimeoutError`` / ``HarnessFailedError`` — the same classes
     the CLI maps to exit codes 2/3/4/5); the message text is for humans.
 
+    ``workdir`` is set on every error raised after the workdir is resolved
+    (with ``workdir=None`` that is the auto-created tempdir) — so the
+    caller-owned cleanup stays reachable on failure paths, not just the
+    success path (``logs.workdir``).
+
     Note the ``report`` key's two meanings: in ``log_paths`` (and in
     ``_instance_paths``) it is the report.json *path*; in the result's
     ``logs`` dict (``EvaluationLogs.report``) it is the *parsed, verbatim*
@@ -316,12 +323,19 @@ class EvaluationError(Exception):
         instance_id: Optional[str] = None,
         log_paths: Optional[dict[str, Optional[str]]] = None,
         output_tail: Optional[str] = None,
+        workdir: Optional[str] = None,
     ) -> None:
         super().__init__(message)
         self.message = message
         self.instance_id = instance_id
         self.log_paths = dict(log_paths or {})
         self.output_tail = output_tail
+        # the workdir (the harness cwd / artifact root) once it is known —
+        # with workdir=None the module creates an auto tempdir, and on a
+        # typed failure the caller must be able to *find* it to honor the
+        # caller-owned-cleanup contract (an unreachable tempdir is a leak):
+        # every typed error raised after the workdir is resolved carries it.
+        self.workdir = workdir
 
     def __str__(self) -> str:
         if self.instance_id:
@@ -335,6 +349,10 @@ class EvaluationError(Exception):
         )
         if shown:
             parts.append(f"Check ({shown}) for more information.")
+        if self.workdir:
+            parts.append(
+                f"Workdir: {self.workdir} (the caller owns its cleanup)."
+            )
         if self.output_tail:
             parts.append(self.output_tail)
         return "\n".join(parts)
@@ -378,13 +396,17 @@ class HarnessFailedError(EvaluationError):
 
 
 def _tail(text: Any, limit: int = _ERROR_TAIL_CHARS) -> Optional[str]:
-    """The last ``limit`` characters of a harness output. Non-str (a bytes
-    stdout/stderr from a runner) is coerced — never a TypeError inside a
-    typed error's ``__str__``. Slicing clamps, so short text passes through
-    as-is."""
+    """The last ``limit`` characters of a harness output. bytes (a
+    ``TimeoutExpired.output`` / a runner's bytes stdout/stderr — bytes even
+    under ``text=True`` on POSIX) is decoded with replacement, never a
+    ``b'…'`` repr with escaped newlines; any other non-str is ``str()``
+    coerced — never a TypeError inside a typed error's ``__str__``.
+    Slicing clamps, so short text passes through as-is."""
     if text is None:
         return None
-    if not isinstance(text, str):
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", errors="replace")
+    elif not isinstance(text, str):
         text = str(text)
     text = text.strip()
     return text[-limit:] if text else None
@@ -493,15 +515,39 @@ def _validate_inputs(
     if not isinstance(split, str) or not split.strip() or "\x00" in split:
         raise InvalidInputError(f"split must be a non-empty NUL-free str, got {split!r}")
     if workdir is not None:
-        if isinstance(workdir, str) and (not workdir.strip() or "\x00" in workdir):
-            raise InvalidInputError(
-                "workdir must be a non-empty NUL-free str/path (or None for a "
-                f"fresh tempdir), got {workdir!r}"
-            )
-        if not isinstance(workdir, (str, os.PathLike)):
+        if isinstance(workdir, str):
+            workdir_str = workdir
+        elif isinstance(workdir, os.PathLike):
+            # a path-like gets the *same* checks as a str: an *empty*
+            # path-like (PurePath("") — its fsdecode is "." and would
+            # silently resolve to the caller's CWD, the harness writing
+            # its whole artifact tree into an unintended directory) is
+            # refused explicitly; a broken PathLike's __fspath__ raising
+            # is a typed refusal, not a raw escape; and a NUL-carrying
+            # PurePath is the same malformed input as the str case.
+            if isinstance(workdir, PurePath) and not workdir.parts:
+                raise InvalidInputError(
+                    "workdir must be a non-empty NUL-free str/path (or None "
+                    "for a fresh tempdir) — an empty path-like resolves to "
+                    f"the caller's CWD, got {workdir!r}"
+                )
+            try:
+                workdir_str = os.fsdecode(workdir)
+            except (OSError, ValueError, TypeError) as e:
+                raise InvalidInputError(
+                    f"workdir path-like is not usable: {e!r}"
+                ) from e
+        else:
             raise InvalidInputError(
                 "workdir must be a str/path (or None for a fresh tempdir), "
                 f"got {type(workdir).__name__}"
+            )
+        if not workdir_str.strip() or "\x00" in workdir_str:
+            raise InvalidInputError(
+                "workdir must be a non-empty NUL-free str/path (or None for "
+                "a fresh tempdir) — an empty path resolves to the caller's "
+                f"CWD and a NUL would surface as a raw ValueError, got "
+                f"{workdir_str!r}"
             )
     if overall_timeout is not None and (
         isinstance(overall_timeout, bool)
@@ -706,6 +752,7 @@ def _result_from_report(
             "harness/infra failure",
             instance_id=instance_id,
             log_paths=log_paths,
+            workdir=str(workdir),
         ) from e
     if not isinstance(report, dict):
         raise HarnessFailedError(
@@ -713,6 +760,7 @@ def _result_from_report(
             f"(got {type(report).__name__}) — harness/infra failure",
             instance_id=instance_id,
             log_paths=log_paths,
+            workdir=str(workdir),
         )
     entry = report.get(instance_id)
     if not isinstance(entry, dict) or "resolved" not in entry:
@@ -721,6 +769,7 @@ def _result_from_report(
             "harness/infra failure",
             instance_id=instance_id,
             log_paths=log_paths,
+            workdir=str(workdir),
         )
     resolved = entry["resolved"]
     if not isinstance(resolved, bool):
@@ -730,6 +779,7 @@ def _result_from_report(
             "verdict",
             instance_id=instance_id,
             log_paths=log_paths,
+            workdir=str(workdir),
         )
     if resolved is False and entry.get("infra_failure"):
         # The harness's own classification, not a re-grade: on unparseable
@@ -750,6 +800,7 @@ def _result_from_report(
             log_paths=log_paths,
             output_tail=_tail(_read_log(paths["instance"]))
             or _tail(_read_log(paths["test_output"])),
+            workdir=str(workdir),
         )
     instance_log = _read_log(paths["instance"]) or ""
     container = _extract_container_id(instance_log, instance_id)
@@ -823,6 +874,7 @@ def _triage_no_report(
     stdout: Any,
     stderr: Any,
     pre_log_mtimes: dict[str, int | bool],
+    workdir: Optional[str] = None,
 ) -> EvaluationError:
     """A harness run that exited 0 without producing a report.json (the
     harness swallows per-instance failures — it prints, it does not raise).
@@ -884,6 +936,7 @@ def _triage_no_report(
             instance_id=instance_id,
             log_paths=log_paths,
             output_tail=_tail(instance_log),
+            workdir=workdir,
         )
     if (
         (timeout_test_output and not _stale("test_output", paths["test_output"]))
@@ -899,6 +952,7 @@ def _triage_no_report(
                 stdout_label="test_output",
                 stderr_label="run_instance.log",
             ),
+            workdir=workdir,
         )
     if apply_fail or timeout_test_output or timeout_instance_log:
         # the marker(s) exist but survived from a previous run (the file was
@@ -913,6 +967,7 @@ def _triage_no_report(
             instance_id=instance_id,
             log_paths=log_paths,
             output_tail=_combined_tail(stdout, stderr),
+            workdir=workdir,
         )
     return HarnessFailedError(
         "the harness exited 0 without a report and without a known failure "
@@ -920,6 +975,7 @@ def _triage_no_report(
         instance_id=instance_id,
         log_paths=log_paths,
         output_tail=_combined_tail(stdout, stderr),
+        workdir=workdir,
     )
 
 
@@ -989,8 +1045,10 @@ def evaluate(
     ``workdir`` is the per-instance artifact directory (the harness cwd);
     with None a fresh ``swebench-eval-…`` directory is created and the
     *caller* owns its cleanup (the artifacts are the point) — the path is
-    surfaced in ``logs.workdir`` so it is never unreachable. ``run_id``
-    defaults to a per-call unique id so the eval container name
+    surfaced in ``logs.workdir`` (success) and in ``error.workdir``
+    (every typed error raised after the workdir is resolved) so it is never
+    unreachable. ``run_id`` defaults to a per-call unique id so the eval
+    container name
     (``sweb.eval.<iid>.<run_id>``) is always distinct from the agent
     container's (``sweb.eval.<iid>``) — AC2. ``overall_timeout`` is the
     optional outer watchdog in seconds (the project's hang policy: a hung
@@ -1054,7 +1112,8 @@ def evaluate(
         # TypeError (a broken PathLike's fspath() returning a non-str) are
         # all pre-spawn infra/refusal failures — typed, never raw.
         raise HarnessFailedError(
-            f"pre-spawn filesystem failure resolving workdir: {e!r}",
+            f"pre-spawn filesystem failure resolving workdir ({workdir!r}): "
+            f"{e!r}",
             instance_id=instance_id,
         ) from e
     log_paths = _existing_log_paths(paths)
@@ -1122,6 +1181,7 @@ def evaluate(
             f"under {workdir_abs}): {e!r}",
             instance_id=instance_id,
             log_paths=log_paths,
+            workdir=str(workdir_abs),
         ) from e
 
     argv = _harness_argv(
@@ -1166,6 +1226,7 @@ def evaluate(
                 getattr(e, "output", None),
                 getattr(e, "stderr", None),
             ),
+            workdir=str(workdir_abs),
         ) from e
     except Exception as e:
         # a spawn failure (missing python → FileNotFoundError, fork/exec
@@ -1177,6 +1238,7 @@ def evaluate(
             instance_id=instance_id,
             log_paths=log_paths,
             output_tail=_tail(str(e)),
+            workdir=str(workdir_abs),
         ) from e
     exit_code = getattr(proc, "returncode", None)
     if not isinstance(exit_code, int):
@@ -1185,6 +1247,7 @@ def evaluate(
             f"({exit_code!r})",
             instance_id=instance_id,
             log_paths=log_paths,
+            workdir=str(workdir_abs),
         )
     stdout = getattr(proc, "stdout", None)
     stderr = getattr(proc, "stderr", None)
@@ -1199,6 +1262,7 @@ def evaluate(
             instance_id=instance_id,
             log_paths=_existing_log_paths(paths),
             output_tail=_combined_tail(stdout, stderr),
+            workdir=str(workdir_abs),
         )
 
     if report_path.is_file():
@@ -1224,6 +1288,7 @@ def evaluate(
                     "pre-existing report, run_evaluation.py:272)",
                     instance_id=instance_id,
                     log_paths=log_paths,
+                    workdir=str(workdir_abs),
                 )
         return _result_from_report(
             instance_id=instance_id,
@@ -1240,6 +1305,7 @@ def evaluate(
         stdout=stdout,
         stderr=stderr,
         pre_log_mtimes=pre_log_mtimes,
+        workdir=str(workdir_abs),
     )
 
 

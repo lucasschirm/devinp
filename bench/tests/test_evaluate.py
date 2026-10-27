@@ -93,7 +93,15 @@ Acceptance mapping (issue #17, ``bench/PLAN-WP4.md``):
     ``test_non_object_report_is_harness_failed``,
     ``test_non_utf8_report_is_harness_failed``,
     ``test_default_harness_runner_watchdog_fires`` (the real runner's
-    ``overall_timeout`` wiring);
+    ``overall_timeout`` wiring),
+    ``test_tail_decodes_bytes_readably`` (a bytes partial output is decoded
+    readably, never a ``b'…'`` repr),
+    ``test_auto_tempdir_is_surfaced_on_typed_failure`` (the auto tempdir is
+    reachable via ``error.workdir`` on failure paths — the caller-owned
+    cleanup stays reachable),
+    ``test_pathlike_workdir_is_validated_like_a_str`` (an empty path-like
+    would resolve to the caller's CWD — refused; a NUL-carrying PurePath
+    is the same malformed input as the str case);
   * isolation: asserted inside ``test_integration_positive_control`` (eval
     container id ≠ agent container id; the eval container id is a real
     container id from the harness's own log).
@@ -113,7 +121,7 @@ import json
 import shutil
 import subprocess
 import sys
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Callable, Optional
 
 import pytest
@@ -910,7 +918,8 @@ def test_timeout_expired_from_runner_is_typed_with_partial_output(tmp_path):
     def boom(argv, cwd, overall_timeout=None):
         raise subprocess.TimeoutExpired(
             cmd="harness", timeout=overall_timeout,
-            output="partial stdout…", stderr="partial stderr…",
+            output=b"partial stdout line one\npartial stdout line two\n",
+            stderr=b"partial stderr line one\npartial stderr line two\n",
         )
 
     with pytest.raises(ev.HarnessFailedError) as e:
@@ -920,6 +929,8 @@ def test_timeout_expired_from_runner_is_typed_with_partial_output(tmp_path):
     assert "sweb.eval.iid.rid9" in m  # the eval container name for cleanup
     tail = e.value.output_tail or ""
     assert "partial stdout" in tail and "partial stderr" in tail  # both tails, labeled
+    assert "\n" in tail  # decoded readably — not a single-line b'…' repr
+    assert "b'" not in tail
 
 
 @pytest.mark.parametrize(
@@ -962,6 +973,50 @@ def test_default_harness_runner_success_watchdog_fires():
             cwd=".",
             overall_timeout=0.5,
         )
+
+
+def test_tail_decodes_bytes_readably():
+    """A bytes output (a TimeoutExpired.output / a runner's bytes
+    stdout/stderr — bytes even under text=True on POSIX) is decoded
+    readably in _tail, never a b'…' repr with escaped newlines."""
+    assert ev._tail(b"line one\nline two") == "line one\nline two"
+    long_tail = ev._tail(b"a\n" * 100000)
+    assert long_tail is not None and "b'" not in long_tail
+    assert ev._tail(None) is None
+
+
+def test_auto_tempdir_is_surfaced_on_typed_failure():
+    """workdir=None: the auto-created tempdir must be reachable on the
+    typed *failure* paths too (error.workdir + __str__) — the documented
+    caller-owned-cleanup contract can't be honored for a directory the
+    caller can neither find nor remove (a silent tempdir leak)."""
+    fake = FakeHarness()  # no tree → exit 0, no report → no-report triage
+    with pytest.raises(ev.HarnessFailedError) as e:
+        ev.evaluate("iid", _WELLFORMED_PATCH, harness_runner=fake)
+    wd = e.value.workdir
+    assert wd is not None
+    assert Path(wd).name.startswith("swebench-eval-iid-")
+    assert wd in str(e.value)  # the directory is in the error text
+    assert (Path(wd) / "predictions.jsonl").is_file()  # the workdir was used
+    shutil.rmtree(wd)  # the caller owns the cleanup — now reachable
+
+
+def test_pathlike_workdir_is_validated_like_a_str(tmp_path):
+    """A path-like workdir gets the same validation as a str: a valid
+    Path works; an *empty* path-like (which would resolve to the caller's
+    CWD — the harness writing its whole artifact tree into an unintended
+    directory) is refused; and a NUL-carrying PurePath is the same
+    malformed input as the str case (InvalidInputError, not a raw
+    ValueError at resolve)."""
+    fake = FakeHarness(tree=_report_tree("rid", "devin", "iid", resolved=False))
+    ev.evaluate("iid", _WELLFORMED_PATCH, workdir=Path(tmp_path), run_id="rid", harness_runner=fake)
+    assert fake.calls  # a valid Path flows through
+
+    for bad in (Path(""), PurePath("w\x00d")):
+        fake2 = FakeHarness()
+        with pytest.raises(ev.InvalidInputError):
+            ev.evaluate("iid", _WELLFORMED_PATCH, workdir=bad, run_id="rid", harness_runner=fake2)
+        assert fake2.calls == []  # typed before any side effect
 
 
 def test_overall_timeout_flows_to_the_runner(tmp_path):

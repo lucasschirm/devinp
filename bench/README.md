@@ -320,7 +320,11 @@ contract — never a traceback with exit 1).
   pre-spawn filesystem work, a spawn failure and the watchdog firing (its
   typed error surfaces the possibly-still-running eval container name +
   the partial output) are typed `HarnessFailedError`, never a raw escape.
-  Typed errors an injected runner raises *stay typed*.
+  Typed errors an injected runner raises *stay typed*. Every typed error
+  raised after the workdir is resolved carries `error.workdir` (with
+  `workdir=None` that is the auto-created tempdir), so the caller-owned
+  cleanup stays reachable on failure paths — not just via `logs.workdir`
+  on success.
 - **Fresh container (AC2):** the harness creates the eval container itself
   (`containers.create` on the published eval image, ghost-removing any
   same-name container first); the per-call unique `run_id` default makes
@@ -340,7 +344,8 @@ contract — never a traceback with exit 1).
   class), never a terminal verdict; `logs` carries the harness artifact
   paths (`instance`, `test_output`, `final_report`), the verbatim
   per-instance `report`, `container`, and the run identity (`workdir` — a
-  fresh tempdir when the caller passed None, surfaced so the caller-owned
+  fresh tempdir when the caller passed None, surfaced in `logs.workdir`
+  (success) and `error.workdir` (typed failures) so the caller-owned
   cleanup is never unreachable — `run_id`, `predictions`). A non-zero
   harness exit is always an error, *even when a report exists* (the
   harness writes the per-instance report before the final-report leg).
