@@ -8,7 +8,10 @@ Pilot-A pre-flights). **WP1 (client core, issue #11) complete** —
 isolation. **WP2 (mock test double, issue #13) complete** —
 `mock_devin.py` (canned ACP agent + failure modes + `models list`
 fixture) + integration tests driven through the real WP1 client
-(zero quota, CI).
+(zero quota, CI). **WP3a (issue #14) complete** — `runner.py`
+(sequential queue, quota-budget state machine, overlap guard +
+concurrency flag contract, abort on 2 consecutive `agent_error`)
++ unit tests against instrumented fake sessions (zero quota, CI).
 
 ## Layout
 
@@ -23,7 +26,8 @@ fixture) + integration tests driven through the real WP1 client
 | `probes/acp_probe.py` | NDJSON JSON-RPC probe for `devin acp` (4 modes) |
 | `acp_client.py` | **WP1** — NDJSON JSON-RPC 2.0 client core (pure stdlib) |
 | `mock_devin.py` | **WP2** — `mock_devin` test double: a fake `devin` binary (canned ACP agent, modes `ok`/`no_patch`/`hang`/`quota`/`crash`, canned `models list` fixture) |
-| `tests/` | **WP1** — unit tests + in-process mock `devin` server; **WP2** — `mock_devin` integration tests (driven through the real WP1 client) |
+| `runner.py` | **WP3a** — sequential queue (concurrency 1 by default), quota-budget state machine (`running → budget_exhausted → sleeping → resume`), overlap guard + concurrency flag contract, abort on 2 consecutive `agent_error` (pure stdlib) |
+| `tests/` | **WP1** — unit tests + in-process mock `devin` server; **WP2** — `mock_devin` integration tests (driven through the real WP1 client); **WP3a** — `runner` unit tests (instrumented fake sessions) |
 | `conftest.py` | pytest path shim for the flat layout |
 | `pyproject.toml` / `requirements.lock` | Python ≥3.11; `swebench==5.0.2` pinned |
 
@@ -126,6 +130,61 @@ python -m pytest tests/          # zero-cost, mock only, no quota
 - **WP0 wire conformance:** `-32601` for unknown methods, `-32700`
   parse errors for non-JSON lines — the server keeps serving, never
   crashes (the WP0 negative-control behavior).
+
+## The runner (WP3a, issue #14)
+
+`runner.py` — the sequential queue, quota-budget state machine and
+overlap guard (PLAN.md §2.1–2.3, §5 WP3; checkpoint/JSONL + cost-tier
+gate + pre-flight are WP3b, issue #15; pruning is WP3c, issue #16):
+
+```bash
+cd bench
+python3 runner.py                        # validates the flag contract (exit 0)
+python3 runner.py --concurrency 3        # exit 2 — refused by default
+python3 runner.py --concurrency 3 --i-know-about-quota
+python -m pytest tests/test_runner.py    # zero-cost, fake sessions only
+```
+
+- **Sequential by default** (concurrency 1): a FIFO of instance ids is
+  executed one at a time; the `OverlapGuard` asserts no two agent
+  sessions ever overlap (fail-loud `OverlapViolation`, not a silent
+  wait), and an opt-in `ProcessLock` (`flock`) extends the guarantee to
+  sibling runner processes (PLAN §2.1 "process-level lock + assert").
+- **Flag contract:** `--concurrency N>1` is refused (typed error; CLI
+  exit 2) unless `--i-know-about-quota`; a granted N>1 runs N worker
+  threads with guard cap N (the user's quota risk).
+- **Backoff state machine** (pure, table-driven —
+  `running → budget_exhausted → sleeping (until window) → resume →
+  running`, terminal `aborted`/`done`, every other (state, event) pair
+  a typed `InvalidTransition`): both the local daily budget cap
+  (`max_sessions_per_day`, `max_wall_per_session` × cap) and an external
+  rate-limit signal (a session's `quota_limited` terminal status,
+  PLAN §2.3) converge on `budget_exhausted`.
+- **Rate-limit → stop the batch:** the instance is marked
+  `quota_limited`, no further instance starts, the checkpoint hook
+  fires (exactly once per backoff — a double quota stop under a
+  granted N>1 is one stop; the checkpoint carries the stop reason,
+  `rate_limited` or `budget_exhausted`), the run sleeps to the next
+  quota reset window (next UTC midnight — WP0 §4 "calendar basis"
+  reset; the sleep's *duration* is the remainder of the current
+  window — the nominal 12 h `daily_pause` is the default config, not a
+  guarantee of the realized pause), resumes with the budget reset, and
+  the `quota_limited` instance is **not** re-queued in this run (its
+  re-run is the WP3b checkpoint-resume retry class, PLAN §2.5).
+- **Abort on 2 consecutive `agent_error`** (environment-drift
+  suspicion; "consecutive" = completion order, reset by any other
+  terminal status **or a window reset** — a new day is a fresh
+  suspicion, a deliberate, documented deviation from AC5's literal
+  reset rule, pinned by
+  `test_window_reset_breaks_agent_error_chain`).
+- **Session contract** (the WP3b adapter seam): `factory(id) ->
+  session.start() -> session.run() -> status` (a terminal status from
+  the WP5 taxonomy — unknown statuses fail loud) `-> session.close()`;
+  a factory/`start()` failure releases the budget claim, a
+  `run()`/`close()` failure stands (partial session — PLAN §2.5
+  host-crash class, the exception propagates); the `run_finished` hook
+  fires on normal completion and is *not* reported on a propagated
+  failure.
 
 ## SWE-bench pin (WP0 result)
 

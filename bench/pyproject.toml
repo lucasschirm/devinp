@@ -19,7 +19,7 @@ testpaths = ["tests", "probes"]
 
 [tool.setuptools]
 # Explicit flat-layout declaration: the only importable modules are
-# acp_client + mock_devin (conftest.py / probes / tests are dev-only,
-# notes/ is recon data). Without this, setuptools flat-layout discovery
-# fails on the multiple top-level directories.
-py-modules = ["acp_client", "mock_devin"]
+# acp_client + mock_devin + runner (conftest.py / probes / tests are
+# dev-only, notes/ is recon data). Without this, setuptools flat-layout
+# discovery fails on the multiple top-level directories.
+py-modules = ["acp_client", "mock_devin", "runner"]
