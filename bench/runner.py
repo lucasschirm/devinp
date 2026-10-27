@@ -1,11 +1,14 @@
-"""``runner.py`` — WP3a (issue #14): sequential queue, quota-budget state
-machine, overlap guard.
+"""``runner.py`` — WP3a (issue #14) + WP3b (issue #15): sequential
+queue, quota-budget state machine, overlap guard, checkpoint/resume
+with pass@1-correct retry semantics, the dynamic cost-tier model
+gate, and the zero-quota pre-flight.
 
 Scope (PLAN.md §5 WP3 "WP3a" split, issue #14; checkpoint/resume +
-cost-tier gate + pre-flight are WP3b, issue #15; post-eval pruning is
-WP3c, issue #16). The module is pure stdlib — no SDK dependency, no real
-``devin`` binary — and is unit-tested against instrumented fake sessions
-(``tests/test_runner.py``), zero quota.
+cost-tier gate + pre-flight are WP3b, issue #15 — this release;
+post-eval pruning is WP3c, issue #16). The module is pure stdlib — no
+SDK dependency, no real ``devin`` binary — and is unit-tested against
+instrumented fake sessions + fixtures (``tests/test_runner.py``), zero
+quota.
 
 Acceptance criteria (issue #14) and where they live:
 
@@ -58,7 +61,55 @@ Acceptance criteria (issue #14) and where they live:
    ends in ``aborted`` with a reason; no further instance starts;
    in-flight sessions (N>1) finish.
 
-Session contract (the pluggable seam WP3b's adapter fills):
+Acceptance criteria (issue #15, PLAN §2.4–§2.7) and where they live:
+
+6. **Resume from ``run-<id>.jsonl``** — a partial line at EOF is
+   dropped, not fatal; no instance runs twice → :func:`load_checkpoint`
+   (the EOF torn-line rule; a mid-file corruption is fail-loud),
+   :class:`JsonlCheckpoint` (one fsync'd line per finished instance —
+   the line is on disk before the runner proceeds), :func:`resume_queue`
+   / :func:`resume_from_checkpoint` (the pass@1 retry-class rules).
+7. **pass@1 retry classes (PLAN §2.5)** → the :data:`NEVER_RERUN_
+   STATUSES` / :data:`RETRY_STATUSES` split, enforced by
+   :func:`resume_queue`: ``resolved`` / ``failed_test`` / ``timeout`` /
+   ``no_patch`` — and ``agent_error`` (a legitimate agent outcome: a
+   policy refusal is *terminal*, PLAN §3.4; the systemic case is the
+   2-consecutive abort, AC5, not a per-instance re-run) — are **never
+   re-run**; ``quota_limited`` / ``eval_error`` / a host-crash partial
+   state (an instance with *no* line — the line is written only on
+   completion) are **retried — the only retry class**.
+   ``preflight_failed`` sits in the retry class too: an infra state that
+   burned no session (PLAN §2.7's "stop before burning a session"
+   exists precisely so the re-run is free — the check re-runs on resume),
+   so it cannot inflate pass@1.
+8. **Startup model gate (PLAN §2.4)** → :func:`gate_cost_tier` +
+   :func:`parse_models_list` (fail-closed): the allowlist is *dynamic*
+   (recomputed from ``devin models list --format json`` every startup);
+   a configured paid (or unverified/absent-tier) model is refused; a
+   model missing from the list is refused (its tier cannot be
+   verified); any JSON *shape* change is a typed refusal
+   (:class:`ModelGateError`; the CLI exits 2 and the batch never
+   starts).
+   A paid override requires **both** an explicit ``allow_paid`` config
+   **and** a positive numeric token budget (the CLI ``--allow-paid`` +
+   ``--token-budget``).
+9. **Zero-quota pre-flight (PLAN §2.7)** → :class:`Preflight` +
+   :func:`run_preflight_checks` (ordered, short-circuiting): ``devin
+   auth status`` ok → Docker daemon responsive (bounded — a hung daemon
+   is a failure, not a wait) → instance image present (per instance) →
+   free disk ≥ **2 × the largest expected image** (the PLAN §7 floor).
+   Run before **every batch** (the per-window batch phase of
+   :meth:`Runner.run` — a new quota window is a new batch) **and**
+   before **each instance**. Any failure raises :class:`PreflightFailed`
+   naming the leg; the runner records the instance ``preflight_failed``
+   (the reason lands in the JSONL meta; a batch-phase failure records an
+   ``instance_id: null`` marker line that consumes no queue slot),
+   releases the budget claim (no session was ever started), and aborts
+   the run (``aborted`` — an infra failure is not a quota window to
+   sleep for; the operator fixes it and resumes, where the instance is
+   retry-eligible, AC2/AC7).
+
+Session contract (the pluggable seam the adapter fills):
 
 * ``session_factory(instance_id) -> AgentSession`` — builds the session
   object (no live process yet).
@@ -89,21 +140,38 @@ from __future__ import annotations
 import abc
 import argparse
 import fcntl
+import json
 import math
 import os
+import shutil
+import subprocess
 import sys
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Final, Protocol, Sequence
+from typing import Any, Callable, Final, Iterable, Protocol, Sequence
 
 __all__ = [
     "TERMINAL_STATUSES",
     "AGENT_ERROR",
     "QUOTA_LIMITED",
     "ABORT_AFTER_CONSECUTIVE_AGENT_ERRORS",
+    "NEVER_RERUN_STATUSES",
+    "RETRY_STATUSES",
+    "resume_queue",
+    "resume_from_checkpoint",
+    "load_checkpoint",
+    "JsonlCheckpoint",
+    "ModelGateError",
+    "ModelGateResult",
+    "gate_cost_tier",
+    "parse_models_list",
+    "fetch_models_list",
+    "PreflightFailed",
+    "Preflight",
+    "run_preflight_checks",
     "BackoffState",
     "TERMINAL_STATES",
     "TRANSITIONS",
@@ -172,6 +240,25 @@ class ProcessLockBusy(RunnerError):
     def __init__(self, path: str) -> None:
         super().__init__(f"process lock is held by a sibling runner: {path}")
         self.path = path
+
+
+class ModelGateError(RunnerError):
+    """The startup model gate refused the batch (fail-closed, PLAN
+    §2.4 / issue #15 AC3): a paid model without a valid override, a
+    model that cannot be verified against ``devin models list --format
+    json``, or a JSON shape change ("If the startup check fails or the
+    JSON shape changes, the runner aborts the batch")."""
+
+
+class PreflightFailed(RunnerError):
+    """A pre-flight health check failed (PLAN §2.7: "stop before
+    burning a session"). :attr:`check` names the failed leg (auth /
+    docker_daemon / docker_image / disk) for the JSONL reason."""
+
+    def __init__(self, check: str, detail: str) -> None:
+        super().__init__(f"preflight failed ({check}): {detail}")
+        self.check = check
+        self.detail = detail
 
 
 # ---------------------------------------------------------------------------
@@ -380,6 +467,177 @@ class DailyBudget:
 
 
 # ---------------------------------------------------------------------------
+# the dynamic cost-tier model gate (WP3b, issue #15 AC3, PLAN §2.4)
+# ---------------------------------------------------------------------------
+
+
+def parse_models_list(models_json: object) -> "dict[str, str]":
+    """The strict, fail-closed shape check of ``devin models list
+    --format json`` (the WP0 capture, ``notes/models-list.json``):
+    ``{"families": [{ "variants": [{ "model_uid": str, "cost_tier":
+    str? }, …] }, …]}``.
+
+    Returns ``{model_uid: cost_tier}`` — a variant with an *absent*
+    ``cost_tier`` (the WP0 ``adaptive`` router) maps to ``"unknown"``
+    (an unverified tier is **not** Free — the gate keys on ``cost_tier``,
+    never on model names/prefixes). Any structural deviation (wrong top
+    level, missing/wrong-typed ``families`` / ``variants`` / 
+    ``model_uid``, a non-string ``cost_tier``) raises :class:`
+    ModelGateError` — a shape change is a refusal, not an interpretation
+    (fail-closed, issue #15 AC3). Duplicated uids: the last occurrence
+    wins (the file order's record of truth).
+    """
+    if not isinstance(models_json, dict):
+        raise ModelGateError(
+            f"shape change: top level is not a JSON object "
+            f"(got {type(models_json).__name__}) — fail-closed"
+        )
+    if "families" not in models_json \
+            or not isinstance(models_json["families"], list):
+        raise ModelGateError(
+            "shape change: `families` is missing or not a list — "
+            "fail-closed"
+        )
+    out: dict = {}
+    for fam in models_json["families"]:
+        if not isinstance(fam, dict):
+            raise ModelGateError(
+                f"shape change: a family entry is not a JSON object "
+                f"(got {type(fam).__name__}) — fail-closed"
+            )
+        variants = fam.get("variants")
+        if not isinstance(variants, list):
+            raise ModelGateError(
+                "shape change: a family's `variants` is missing or not a "
+                "list — fail-closed"
+            )
+        for v in variants:
+            if not isinstance(v, dict):
+                raise ModelGateError(
+                    f"shape change: a variant entry is not a JSON object "
+                    f"(got {type(v).__name__}) — fail-closed"
+                )
+            uid = v.get("model_uid")
+            if not isinstance(uid, str):
+                raise ModelGateError(
+                    f"shape change: a variant's `model_uid` is missing or "
+                    f"not a string (got {uid!r}) — fail-closed"
+                )
+            tier = v.get("cost_tier")
+            if tier is not None and not isinstance(tier, str):
+                raise ModelGateError(
+                    f"shape change: a variant's `cost_tier` is not a string "
+                    f"(got {tier!r}) — fail-closed"
+                )
+            out[uid] = tier if tier is not None else "unknown"
+    return out
+
+
+@dataclass(frozen=True)
+class ModelGateResult:
+    """The startup gate's verdict for one configured model."""
+
+    allowed: bool
+    model: str
+    cost_tier: "str | None"  # the listed tier ("unknown" if absent; None if unlisted)
+    free_models: "tuple"  # the selectable set under the free policy
+    reason: "str | None"  # the refusal reason (None when allowed)
+    paid_override: bool = False  # True only when a paid model was granted
+
+
+def _valid_token_budget(budget: object) -> bool:
+    """The paid override's token-budget leg: a positive number — a bool
+    is not a budget (the house validation style)."""
+    return isinstance(budget, (int, float)) \
+        and not isinstance(budget, bool) and budget > 0
+
+
+def gate_cost_tier(models_json: object, configured_model: str, *,
+                  allow_paid: bool = False,
+                  token_budget: "int | float | None" = None
+                  ) -> ModelGateResult:
+    """The startup model gate (PLAN §2.4, issue #15 AC3) — pure.
+
+    * ``cost_tier == "Free"`` → allowed. The allowlist is *dynamic*:
+      it is recomputed from the live list on every startup; nothing is
+      hardcoded (PLAN §2.4: ``swe-1-6``/``swe-1-7`` paid, all
+      ``*-lightning`` variants paid — verified per startup, not per
+      release).
+    * a listed **paid** tier (or an unverified/absent tier — fail-
+      closed) → refused — unless **both** ``allow_paid`` (the explicit
+      config override) **and** a valid positive token budget are given
+      (PLAN §2.4: "A paid model requires an explicit config override
+      **plus** a token budget check").
+    * a model **missing from the list** → refused (its tier cannot be
+      verified — the override cannot bless it either).
+    * a JSON **shape change** → refused (``parse_models_list`` raises
+      :class:`ModelGateError` before this returns — the batch never
+      starts).
+    """
+    tiers = parse_models_list(models_json)
+    free = tuple(sorted(uid for uid, tier in tiers.items() if tier == "Free"))
+    tier = tiers.get(configured_model)
+    if tier is None:
+        return ModelGateResult(
+            False, configured_model, None, free,
+            f"{configured_model!r} is not in the models list — its cost "
+            "tier cannot be verified; fail-closed (PLAN §2.4)",
+        )
+    if tier == "Free":
+        return ModelGateResult(True, configured_model, tier, free, None)
+    # A paid (or unverified/absent) tier.
+    if allow_paid and _valid_token_budget(token_budget):
+        return ModelGateResult(True, configured_model, tier, free, None,
+                              paid_override=True)
+    if allow_paid:
+        return ModelGateResult(
+            False, configured_model, tier, free,
+            f"{configured_model!r} is {tier!r} (not Free) and the paid "
+            "override is invalid: a positive numeric token budget is "
+            f"required (got {token_budget!r}) — PLAN §2.4",
+        )
+    return ModelGateResult(
+        False, configured_model, tier, free,
+        f"{configured_model!r} is {tier!r} (not Free) under the free "
+        "policy — refused; a paid model requires an explicit override "
+        "(allow_paid) **plus** a token budget (PLAN §2.4)",
+    )
+
+
+def fetch_models_list(devin_bin: str = "devin", timeout_s: float = 30.0,
+                     run: "Callable | None" = None) -> object:
+    """Run ``devin models list --format json`` and parse it (the gate's
+    live input). **Fail-closed**: an unrunnable binary, a non-zero
+    exit, or unparseable output raises :class:`ModelGateError` — the
+    batch is refused, never started on an unverified allowlist. 
+    ``run`` is injectable (tests stub the subprocess; the default is
+    ``subprocess.run``)."""
+    do_run = run if run is not None else subprocess.run
+    try:
+        proc = do_run([devin_bin, "models", "list", "--format", "json"],
+                     capture_output=True, timeout=timeout_s)
+    except Exception as exc:
+        raise ModelGateError(
+            f"fail-closed: `devin models list --format json` could not be "
+            f"run: {type(exc).__name__}: {exc}"
+        ) from exc
+    if getattr(proc, "returncode", 1) != 0:
+        tail = getattr(proc, "stderr", b"") or b""
+        if isinstance(tail, str):
+            tail = tail.encode("utf-8", "replace")
+        raise ModelGateError(
+            f"fail-closed: `devin models list --format json` exited "
+            f"{proc.returncode}: "
+            f"{tail[-200:].decode('utf-8', 'replace').strip()!r}"
+        )
+    try:
+        return json.loads(proc.stdout)
+    except ValueError as exc:
+        raise ModelGateError(
+            f"fail-closed: the models list output is not valid JSON: {exc}"
+        ) from exc
+
+# ---------------------------------------------------------------------------
 # overlap guard + process lock (PLAN §2.1)
 # ---------------------------------------------------------------------------
 
@@ -486,12 +744,173 @@ class ProcessLock:
 
 
 # ---------------------------------------------------------------------------
+# checkpoint / resume with pass@1-correct retry semantics
+# (WP3b, issue #15 AC1 + AC2, PLAN §2.5)
+# ---------------------------------------------------------------------------
+
+#: The terminal statuses that are **never re-run** on resume (PLAN
+#: §2.5). ``resolved`` / ``failed_test`` / ``timeout`` / ``no_patch``
+#: are legitimate agent outcomes — re-running them would turn pass@1
+#: into a filtered pass@k and inflate scores (the PLAN §2.5 / risk-
+#: table guard). ``agent_error`` is terminal too: a policy refusal is a
+#: *terminal* ``agent_error`` for that instance (PLAN §3.4 — no silent
+#: model switch, no retry); the systemic environment-drift case is the
+#: 2-consecutive abort (issue #14 AC5), not a per-instance re-run.
+NEVER_RERUN_STATUSES: Final[frozenset] = frozenset({
+    "resolved",
+    "failed_test",
+    "timeout",
+    "no_patch",
+    "agent_error",
+})
+
+#: The **only** retry class (PLAN §2.5): states that interrupted
+#: *before* a legitimate agent outcome, so nothing was burned and the
+#: re-run is free for pass@1. ``quota_limited`` — the session was
+#: refused; ``eval_error`` — a Docker/harness failure, not an agent
+#: outcome; ``preflight_failed`` — an infra check failed *before* the
+#: session (PLAN §2.7's "stop before burning a session" exists precisely
+#: so this re-run is free; the check re-runs before every batch and
+#: every instance on resume). A host-crash partial state is the same
+#: class with no line at all — the instance is simply absent from the
+#: checkpoint (the line is written only on completion) and therefore
+#: re-run.
+RETRY_STATUSES: Final[frozenset] = frozenset({
+    "quota_limited",
+    "eval_error",
+    "preflight_failed",
+})
+
+
+def resume_queue(instances: Sequence[str],
+                records: "Iterable[dict]") -> "tuple[list, dict]":
+    """The pass@1-correct resume decision (pure, issue #15 AC1 + AC2).
+
+    Given the full instance list (queue order) and the checkpoint
+    records, returns ``(to_run, skipped)``:
+
+    * an instance with a :data:`NEVER_RERUN_STATUSES` line → **skipped**
+      (never re-run).
+    * an instance with a :data:`RETRY_STATUSES` line → **re-run** (the
+      only retry class).
+    * an instance with **no line** (never ran, or a host-crash partial
+      state) → **re-run**.
+    * a record with ``instance_id: null`` (a batch-level pre-flight
+      marker) → ignored (it consumes no queue slot).
+    * a record whose ``instance_id`` is not in ``instances`` (a stale
+      line from an earlier run configuration) → ignored.
+    * a record with a status outside :data:`TERMINAL_STATUSES` →
+      :class:`RunnerProtocolError` (fail-loud, the WP3a contract
+      philosophy).
+    * a **duplicated** line for one instance (a double-write) → the
+      *last* line wins; the instance appears at most once in ``to_run``
+      ("no instance runs twice", issue #15 AC1).
+    """
+    known = set(instances)
+    last: dict = {}
+    for rec in records:
+        iid = rec.get("instance_id")
+        if iid is None:
+            continue
+        status = rec.get("status")
+        if status not in TERMINAL_STATUSES:
+            raise RunnerProtocolError(
+                f"checkpoint record for {iid!r} carries unknown status "
+                f"{status!r} (valid: {sorted(TERMINAL_STATUSES)})"
+            )
+        if iid in known:
+            last[iid] = status  # duplicate: the last line wins
+    to_run: list = []
+    skipped: dict = {}
+    for iid in instances:
+        status = last.get(iid)
+        if status is None or status in RETRY_STATUSES:
+            to_run.append(iid)
+        else:
+            skipped[iid] = status
+    return to_run, skipped
+
+
+def load_checkpoint(path: str) -> "tuple[list, bool]":
+    """Read a progress file ``run-<id>.jsonl`` → ``(records,
+    dropped_last)``.
+
+    The **last** line that is not a complete record (a truncated JSON,
+    or a complete JSON with the wrong shape) is **dropped, not fatal**
+    — a kill mid-write leaves a torn line at EOF (issue #15 AC1). A
+    corrupted line *anywhere else* raises :class:`RunnerProtocolError`
+    (fail-loud: a mid-file line was fsync'd complete by the writer —
+    garbage there is not a kill artifact). A missing file is a fresh
+    run (no records, nothing dropped).
+    """
+    if not os.path.exists(path):
+        return [], False
+    with open(path, "r", encoding="utf-8") as f:
+        raw = f.read()
+    lines = raw.split("\n")
+    if lines and lines[-1] == "":
+        lines = lines[:-1]  # the final newline is not a line
+    records: list = []
+    dropped = False
+    for i, line in enumerate(lines):
+        is_last = i == len(lines) - 1
+        if line.strip() == "":
+            if is_last:
+                continue  # a degenerate empty EOF — not a torn record
+            raise RunnerProtocolError(
+                f"corrupted checkpoint line {i + 1} (blank) — not a kill "
+                f"artifact; fail-loud"
+            )
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            if is_last:
+                dropped = True
+                continue
+            raise RunnerProtocolError(
+                f"corrupted checkpoint line {i + 1} (not JSON) — not a "
+                f"kill artifact; fail-loud"
+            )
+        if not _is_checkpoint_record(obj):
+            if is_last:
+                dropped = True
+                continue
+            raise RunnerProtocolError(
+                f"corrupted checkpoint line {i + 1} (not a record) — not a "
+                f"kill artifact; fail-loud"
+            )
+        records.append(obj)
+    return records, dropped
+
+
+def _is_checkpoint_record(obj: object) -> bool:
+    """The record shape (a kill can tear the line at any byte offset, so
+    a torn *shape* at EOF is indistinguishable from a torn JSON — both
+    are the drop zone)."""
+    if not isinstance(obj, dict):
+        return False
+    if "instance_id" not in obj or "status" not in obj:
+        return False
+    iid = obj["instance_id"]
+    if iid is not None and not isinstance(iid, str):
+        return False
+    return obj["status"] in TERMINAL_STATUSES
+
+
+def resume_from_checkpoint(path: str,
+                          instances: Sequence[str]) -> "tuple[list, dict]":
+    """The convenience path: :func:`load_checkpoint` then
+    :func:`resume_queue`. A missing file = a fresh run (everything is
+    re-run)."""
+    records, _ = load_checkpoint(path)
+    return resume_queue(instances, records)
+# ---------------------------------------------------------------------------
 # session + reporter contracts
 # ---------------------------------------------------------------------------
 
 
 class AgentSession(abc.ABC):
-    """One instance's agent session (the seam WP3b's adapter fills).
+    """One instance's agent session (the seam the adapter fills).
 
     The runner drives ``start() -> run() -> close()`` inside an
     :class:`OverlapGuard` slot; the session is *live* (and therefore
@@ -521,10 +940,12 @@ class Reporter(Protocol):
     def run_started(self, meta: dict) -> None:
         """The run begins (meta: concurrency, budget, queue size)."""
 
-    def record_instance(self, instance_id: str, status: str,
+    def record_instance(self, instance_id: "str | None", status: str,
                        meta: dict) -> None:
         """An instance reached a terminal status (the ``quota_limited``
-        "mark" of issue #14 AC4)."""
+        "mark" of issue #14 AC4). ``instance_id=None`` is a batch-level
+        marker (a pre-flight failure before the first instance, WP3b) —
+        it is recorded but consumes no queue slot on resume."""
 
     def checkpoint(self, reason: str, meta: dict) -> None:
         """Persist progress (WP3b: the JSONL flush). Fired on the
@@ -544,7 +965,7 @@ class RecordingReporter:
     def run_started(self, meta: dict) -> None:
         self.events.append(("run_started", dict(meta)))
 
-    def record_instance(self, instance_id: str, status: str,
+    def record_instance(self, instance_id: "str | None", status: str,
                        meta: dict) -> None:
         self.events.append(("instance", instance_id, status, dict(meta)))
 
@@ -553,6 +974,218 @@ class RecordingReporter:
 
     def run_finished(self, result: "RunResult") -> None:
         self.events.append(("run_finished", result.final_state))
+
+
+class JsonlCheckpoint:
+    """The progress file ``run-<id>.jsonl`` (PLAN §2.5) — one line per
+    finished instance: ``{"instance_id", "status", "meta" (the artifact
+    paths / usage the adapter passes in), "ts"}``.
+
+    Implements the WP3a :class:`Reporter` hooks: ``record_instance``
+    appends the line and makes it durable (write + flush + fsync — the
+    line is on disk *before* the runner proceeds: the WP2
+    artifact-atomicity guarantee, "files are complete on disk before
+    the JSONL summary line is appended"); ``checkpoint`` is a no-op
+    (the per-line flush *is* the checkpoint flush — a rate-limit stop
+    checkpoint therefore loses nothing); ``run_started`` /
+    ``run_finished`` are run-level events, not instance lines, and are
+    not written.
+
+    ``instance_id=None`` marks a batch-level pre-flight failure (before
+    the first instance — it consumes no queue slot; the resume logic
+    ignores the line, the reason stays in the file for the report).
+
+    Durable across kills: append mode (a resume appends to the same
+    file); every line is fsync'd.
+    """
+
+    def __init__(self, path: str,
+                 clock: "Callable[[], float]" = time.time,
+                 _file: "Any | None" = None) -> None:
+        self._path = path
+        self._clock = clock
+        if _file is None:
+            d = os.path.dirname(path)
+            if d:
+                os.makedirs(d, exist_ok=True)
+            _file = open(path, "a", encoding="utf-8")
+        self._file = _file
+        self._closed = False
+
+    @property
+    def path(self) -> str:
+        return self._path
+
+    def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            self._file.close()
+
+    def __enter__(self) -> "JsonlCheckpoint":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def record_instance(self, instance_id: "str | None", status: str,
+                       meta: dict) -> None:
+        if status not in TERMINAL_STATUSES:
+            raise RunnerProtocolError(
+                f"record_instance with unknown status {status!r} "
+                f"(valid: {sorted(TERMINAL_STATUSES)})"
+            )
+        line = {"instance_id": instance_id, "status": status,
+                "meta": dict(meta), "ts": self._clock()}
+        self._file.write(json.dumps(line) + "\n")
+        self._file.flush()
+        os.fsync(self._file.fileno())
+
+    def checkpoint(self, reason: str, meta: dict) -> None:
+        # The per-line flush is the checkpoint: everything that finished
+        # is already on disk; there is nothing extra to persist.
+        pass
+
+    def run_started(self, meta: dict) -> None:
+        pass  # run-level — not an instance line
+
+    def run_finished(self, result: "RunResult") -> None:
+        pass  # run-level — not an instance line
+# ---------------------------------------------------------------------------
+# zero-quota pre-flight (WP3b, issue #15 AC4, PLAN §2.7)
+# ---------------------------------------------------------------------------
+
+
+def run_preflight_checks(
+        checks: "Sequence[tuple[str, Callable[[], None]]]" ) -> None:
+    """Run the pre-flight legs in order; the **first** failure raises
+    (short-circuit — "any check fails → stop", PLAN §2.7: a failed leg
+    means the session would not start, so the later legs — and their
+    cost / noise — are not spent). A non-``PreflightFailed`` exception
+    from a leg is wrapped (it *is* that leg's failure)."""
+    for name, fn in checks:
+        try:
+            fn()
+        except PreflightFailed:
+            raise
+        except Exception as exc:
+            raise PreflightFailed(
+                name, f"{type(exc).__name__}: {exc}"
+            ) from exc
+
+
+class Preflight:
+    """The concrete zero-quota health check (PLAN §2.7 / issue #15
+    AC4), run before **every batch** and **before each instance**
+    (``instance_id`` is None in the batch phase).
+
+    The legs, in order (short-circuiting — see
+    :func:`run_preflight_checks`):
+
+    1. ``auth`` — ``devin auth status`` exits 0 (the "auth status ok").
+    2. ``docker_daemon`` — the daemon is **responsive**: ``docker
+       info`` exits 0 within ``timeout_s`` (a hung daemon is a
+       failure, not a wait).
+    3. ``docker_image`` — (per instance only) ``docker image inspect
+       <image>`` exits 0 (the image is present).
+    4. ``disk`` — free disk ≥ ``min_free_bytes`` = **2 × the largest
+       expected image** (the PLAN §7 floor; the AC4 "≥ 2 × largest
+       expected image").
+
+    Any failure raises :class:`PreflightFailed` naming the leg; the
+    runner records the reason into the checkpoint JSONL as
+    ``preflight_failed``. ``run`` / ``disk_usage_fn`` / ``image_for``
+    are injectable (the unit tests stub-fail each leg — zero quota).
+    """
+
+    def __init__(self,
+                 devin_bin: str = "devin",
+                 docker: str = "docker",
+                 *,
+                 disk_path: str = "/",
+                 largest_image_bytes: "int | float",
+                 timeout_s: float = 15.0,
+                 image_for: "Callable[[str], str] | None" = None,
+                 run: "Callable[[list, float], Any] | None" = None,
+                 disk_usage_fn: "Callable[[str], Any] | None" = None
+                 ) -> None:
+        if isinstance(largest_image_bytes, bool) \
+                or not (isinstance(largest_image_bytes, (int, float))
+                       and largest_image_bytes > 0):
+            raise RunnerConfigError(
+                f"largest_image_bytes must be a number > 0, "
+                f"got {largest_image_bytes!r}"
+            )
+        if isinstance(timeout_s, bool) \
+                or not (isinstance(timeout_s, (int, float)) and timeout_s > 0):
+            raise RunnerConfigError(
+                f"timeout_s must be a number > 0, got {timeout_s!r}"
+            )
+        self._devin = devin_bin
+        self._docker = docker
+        self._disk_path = disk_path
+        self._timeout_s = timeout_s
+        # PLAN §7: the pre-flight disk check is sized against the
+        # largest expected image × 2.
+        self.min_free_bytes = 2.0 * largest_image_bytes
+        self._image_for = image_for if image_for is not None \
+            else (lambda iid: f"sweb.eval.x86_64.{iid}")
+        self._run = run if run is not None else self._default_run
+        self._disk_usage = disk_usage_fn if disk_usage_fn is not None \
+            else shutil.disk_usage
+
+    @staticmethod
+    def _default_run(cmd: list, timeout_s: float) -> Any:
+        return subprocess.run(cmd, capture_output=True, timeout=timeout_s)
+
+    def _cmd(self, name: str, cmd: list) -> None:
+        try:
+            proc = self._run(cmd, self._timeout_s)
+        except Exception as exc:
+            raise PreflightFailed(
+                name, f"{cmd[0]!r} could not be run: "
+                     f"{type(exc).__name__}: {exc}"
+            ) from exc
+        if getattr(proc, "returncode", 1) != 0:
+            tail = getattr(proc, "stderr", b"") or b""
+            if isinstance(tail, str):
+                tail = tail.encode("utf-8", "replace")
+            raise PreflightFailed(
+                name, f"{cmd[0]!r} exited {proc.returncode}: "
+                      f"{tail[-200:].decode('utf-8', 'replace').strip()!r}"
+            )
+
+    def __call__(self, instance_id: "str | None") -> None:
+        checks: "list" = [
+            ("auth",
+             lambda: self._cmd("auth", [self._devin, "auth", "status"])),
+            ("docker_daemon",
+             lambda: self._cmd("docker_daemon", [self._docker, "info"])),
+        ]
+        if instance_id is not None:
+            img = self._image_for(instance_id)
+            checks.append(
+                ("docker_image",
+                 lambda: self._cmd("docker_image",
+                                  [self._docker, "image", "inspect", img])))
+        checks.append(("disk", self._disk_check))
+        run_preflight_checks(checks)
+
+    def _disk_check(self) -> None:
+        try:
+            usage = self._disk_usage(self._disk_path)
+        except Exception as exc:
+            raise PreflightFailed(
+                "disk", f"disk usage of {self._disk_path!r} could not be "
+                f"measured: {type(exc).__name__}: {exc}"
+            ) from exc
+        free = getattr(usage, "free", None)
+        if not isinstance(free, (int, float)) or free < self.min_free_bytes:
+            raise PreflightFailed(
+                "disk",
+                f"free {getattr(usage, 'free', 'unknown')} < required "
+                f"{self.min_free_bytes:.0f} (2 × the largest expected "
+                f"image, PLAN §7)"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -616,14 +1249,23 @@ def check_concurrency_flag(concurrency: int, i_know_about_quota: bool) -> int:
 
 
 class Runner:
-    """The WP3a runner: sequential queue + quota-budget state machine +
-    overlap guard (issue #14).
+    """The WP3a + WP3b runner: sequential queue + quota-budget state
+    machine + overlap guard (issue #14) + checkpoint/resume, the
+    startup cost-tier model gate, and the zero-quota pre-flight
+    (issue #15).
 
-    Construct with the instance queue, a ``session_factory`` (WP3b's
-    adapter seam) and — for tests — injectable ``clock`` / ``sleeper`` /
-    ``next_window``. ``lock_file`` enables the cross-process guard
-    (PLAN §2.1); it is off by default so parallel test runs never
-    collide, and the CLI exposes an explicit path.
+    Construct with the instance queue, a ``session_factory`` (the
+    adapter seam), a ``reporter`` (a :class:`JsonlCheckpoint` for the
+    ``run-<id>.jsonl`` progress file, issue #15 AC1) and — for tests —
+    injectable ``clock`` / ``sleeper`` / ``next_window``. ``lock_file``
+    enables the cross-process guard (PLAN §2.1); it is off by default
+    so parallel test runs never collide, and the CLI exposes an
+    explicit path. ``preflight`` (PLAN §2.7, issue #15 AC4) is the
+    per-batch + per-instance health hook — it must raise
+    :class:`PreflightFailed` naming the failed leg; a failure marks the
+    instance ``preflight_failed``, releases the budget claim, and aborts
+    the run (the batch-phase failure records an ``instance_id: None``
+    marker line).
 
     * The default concurrency is **1** (sequential); a granted N>1 runs
       N worker threads (the user's quota risk).
@@ -633,6 +1275,10 @@ class Runner:
       adapter / ``AcpSession`` 45-min cap, WP1) — the runner does not
       impose a second timeout (a hung session is an adapter contract
       breach, not a runner condition).
+    * The **batch pre-flight runs before every worker round** (a new
+      quota window is a new batch, PLAN §2.7), and the per-instance
+      pre-flight runs before every session; both short-circuit on the
+      first failed leg.
     * A propagated session failure (host-crash class, PLAN §2.5) re-
       raises out of ``run()``; the partial state is the resume class's,
       and ``run_finished`` is *not* reported (the run did not finish).
@@ -650,6 +1296,7 @@ class Runner:
         sleeper: Callable[[float], None] = time.sleep,
         next_window: "Callable[[float], float] | None" = None,
         reporter: "Reporter | None" = None,
+        preflight: "Callable[[str | None], None] | None" = None,
         lock_file: "str | None" = None,
     ) -> None:
         check_concurrency_flag(concurrency, i_know_about_quota)  # AC2, in depth
@@ -668,6 +1315,7 @@ class Runner:
             else next_quota_window
         self._reporter = reporter if reporter is not None \
             else RecordingReporter()
+        self._preflight = preflight
         self._lock = threading.Lock()
         self._queue: deque = deque(instances)
         self._budget = DailyBudget(self._config)
@@ -762,6 +1410,7 @@ class Runner:
             # processed in the new window (the 500 run is one process
             # across days, PLAN §6 WP6.3).
             while True:
+                self._batch_preflight()  # per window — a new batch (PLAN §2.7)
                 if self._concurrency == 1:
                     self._worker_body()  # inline — the sequential default
                 else:
@@ -780,6 +1429,61 @@ class Runner:
             # one-shot (its queue is consumed by the first run() — a
             # second run() would double-schedule; use a fresh Runner, or
             # WP3b's checkpoint/resume for partial state).
+
+    # -- pre-flight (WP3b, issue #15 AC4, PLAN §2.7) ----------------------
+
+    def _batch_preflight(self) -> None:
+        """The per-window batch phase of the pre-flight (PLAN §2.7:
+        "before every batch" — a new quota window is a new batch: the
+        auth / daemon / disk state may have changed since the last
+        one). On a failure: the reason is recorded into the checkpoint
+        JSONL as a ``preflight_failed`` line (``instance_id: None`` — a
+        batch-level marker that consumes no queue slot), no session is
+        ever started, and the run **aborts** (an infra failure is not a
+        quota window to sleep for — the operator fixes it and resumes,
+        where the affected instances are retry-eligible, AC2). A
+        non-``PreflightFailed`` exception from the hook propagates as a
+        fatal (a broken hook is a runner bug, not a check failure)."""
+        if self._preflight is None:
+            return
+        with self._lock:
+            if self._state in TERMINAL_STATES:
+                return
+        try:
+            self._preflight(None)
+        except PreflightFailed as exc:
+            self._reporter.record_instance(
+                None, "preflight_failed",
+                {"reason": str(exc), "phase": "batch"})
+            with self._lock:
+                if self._state in (BackoffState.RUNNING,
+                                  BackoffState.BUDGET_EXHAUSTED):
+                    self._abort_reason = f"preflight_failed (batch): {exc}"
+                    self._emit(EVENT_ABORT)  # running -> aborted
+
+    def _handle_preflight_failure(self, inst: str, reason: str,
+                                 wall_s: float) -> None:
+        """A per-instance pre-flight failure (PLAN §2.7): record the
+        ``preflight_failed`` mark, release the budget claim (no session
+        was ever started — the WP3a claim lifecycle), and **stop the
+        batch with an abort** (an infra failure is not a quota signal:
+        no sleep-to-window; the operator resumes after fixing the infra
+        — the instance is then retry-eligible, AC2). A pre-flight
+        failure is a clean boundary for the drift-suspicion counter
+        (like a quota stop). Not counted in ``sessions_completed``
+        (no session ran) and no wall recorded (the claim is released)."""
+        with self._lock:
+            self._results.append((inst, "preflight_failed"))
+            self._reporter.record_instance(
+                inst, "preflight_failed",
+                {"reason": reason, "wall_s": wall_s, "phase": "instance"})
+            self._budget.release_claim()
+            self._consecutive_errors = 0
+            if self._state in (BackoffState.RUNNING,
+                              BackoffState.BUDGET_EXHAUSTED):
+                self._stop_new = True
+                self._abort_reason = f"preflight_failed: {reason}"
+                self._emit(EVENT_ABORT)  # (running|budget_exhausted) -> aborted
 
     # -- worker layer ----------------------------------------------------
 
@@ -845,17 +1549,28 @@ class Runner:
     def _execute(self, inst: str) -> None:
         """One instance, inside the overlap-guard slot.
 
-        Budget-claim lifecycle: a factory/``start()`` failure releases
-        the claim (no session ever started); a ``run()``/``close()``
-        failure stands (the partial session consumed the work). The
-        guard slot is released on *all* paths (finally), and a
-        half-started session is best-effort closed on every failure
-        path (PLAN §1 hygiene).
+        The pre-flight (WP3b, PLAN §2.7: "before each instance") runs
+        **before** any session is built — on a failure the budget claim
+        is released (no session ever started), the instance is marked
+        ``preflight_failed`` (the reason lands in the JSONL meta), and
+        the batch stops with an abort. Budget-claim lifecycle:
+        a factory/``start()`` failure releases the claim (no session
+        ever started); a ``run()``/``close()`` failure stands (the
+        partial session consumed the work). The guard slot is released
+        on *all* paths (finally), and a half-started session is
+        best-effort closed on every failure path (PLAN §1 hygiene).
         """
         s = None
         started = False
         guard_held = False
         t0 = self._clock()
+        if self._preflight is not None:
+            try:
+                self._preflight(inst)
+            except PreflightFailed as exc:
+                self._handle_preflight_failure(
+                    inst, str(exc), self._clock() - t0)
+                return
         try:
             try:
                 s = self._session_factory(inst)
@@ -1041,18 +1756,26 @@ class Runner:
 
 
 def main(argv: "Sequence[str] | None" = None) -> int:
-    """The runner CLI (WP3a).
+    """The runner CLI (WP3a + WP3b).
 
-    WP3a owns the flag contract + budget configuration; the adapter +
-    checkpoint JSONL wiring (and thus an actual batch run from the CLI)
-    lands in WP3b (issue #15). Until then the CLI validates the flags,
-    prints the resulting configuration, and exits 0 — the execution path
-    is exercised programmatically by ``tests/test_runner.py``.
+    WP3a owns the flag contract + budget configuration; WP3b adds the
+    **startup model gate** (issue #15 AC3, PLAN §2.4): with
+    ``--model`` the batch is gated against the ``devin models list
+    --format json`` payload — a local file (``--models-json``, the
+    fixture / offline path) or a live ``--devin-bin`` invocation — and
+    a refusal exits 2 before anything starts (fail-closed). The
+    adapter + real session factory wiring (an actual batch run from
+    the CLI) lands with the adapter WP; the checkpoint JSONL, resume
+    and pre-flight are available now (the programmatic API + this
+    gate), and the execution path is exercised programmatically by
+    ``tests/test_runner.py``.
     """
     p = argparse.ArgumentParser(
         prog="runner.py",
-        description="devinp bench runner (WP3a, issue #14): sequential queue, "
-                    "quota-budget state machine, overlap guard.",
+        description="devinp bench runner (WP3a issue #14 + WP3b issue "
+                    "#15): sequential queue, quota-budget state machine, "
+                    "overlap guard, cost-tier model gate, checkpoint/"
+                    "resume, pre-flight.",
     )
     p.add_argument(
         "--concurrency", type=int, default=1,
@@ -1076,6 +1799,23 @@ def main(argv: "Sequence[str] | None" = None) -> int:
     p.add_argument("--lock-file", default=None,
                    help="cross-process flock path (default: none — the "
                         "in-process overlap guard is always on)")
+    # WP3b (issue #15 AC3, PLAN §2.4) — the startup model gate.
+    p.add_argument("--model", default=None,
+                   help="the model to run the batch on — gated at startup "
+                        "by cost tier (PLAN §2.4); without it the gate "
+                        "does not run (WP3a behavior)")
+    p.add_argument("--allow-paid", action="store_true",
+                   help="the explicit paid-model override (requires "
+                        "--token-budget; PLAN §2.4)")
+    p.add_argument("--token-budget", type=float, default=None,
+                   help="the positive token budget that permits "
+                        "--allow-paid")
+    p.add_argument("--models-json", default=None,
+                   help="a file with the `devin models list --format json` "
+                        "payload (fixture / offline gate); default: run "
+                        "the CLI via --devin-bin")
+    p.add_argument("--devin-bin", default="devin",
+                   help="the devin binary for the startup model gate")
     args = p.parse_args(argv)
     try:
         check_concurrency_flag(args.concurrency, args.i_know_about_quota)
@@ -1087,7 +1827,33 @@ def main(argv: "Sequence[str] | None" = None) -> int:
     except (ConcurrencyRefusedError, RunnerConfigError) as exc:
         print(f"runner: {exc}", file=sys.stderr)
         return 2
-    print("runner (WP3a, issue #14) — configuration:")
+    # WP3b (issue #15 AC3, PLAN §2.4): the startup model gate — a
+    # refusal exits 2 before the batch starts (fail-closed).
+    if args.model is not None:
+        try:
+            if args.models_json is not None:
+                with open(args.models_json, "r", encoding="utf-8") as f:
+                    models_json = json.load(f)
+            else:
+                models_json = fetch_models_list(args.devin_bin)
+            gate = gate_cost_tier(
+                models_json, args.model,
+                allow_paid=args.allow_paid,
+                token_budget=args.token_budget,
+            )
+        except (ModelGateError, OSError, ValueError) as exc:
+            print(f"runner: model gate refused the batch "
+                  f"(fail-closed): {exc}", file=sys.stderr)
+            return 2
+        if not gate.allowed:
+            print(f"runner: model gate refused the batch: {gate.reason}",
+                  file=sys.stderr)
+            return 2
+        print(f"  model gate: {gate.model} = {gate.cost_tier}"
+              + (" (paid override — the token budget was accepted)"
+                 if gate.paid_override else "")
+              + f"; free models: {', '.join(gate.free_models) or 'none'}")
+    print("runner (WP3a issue #14 + WP3b issue #15) — configuration:")
     print(f"  concurrency: {args.concurrency}"
           f" (overlap guard cap {args.concurrency}; "
           f"default 1 = sequential)")
@@ -1097,8 +1863,11 @@ def main(argv: "Sequence[str] | None" = None) -> int:
           f"backoff sleep aligns to the quota reset window: the next "
           f"UTC midnight, WP0 §4)")
     print(f"  lock_file: {args.lock_file or 'none (in-process guard only)'}")
-    print("WP3a: the queue/budget/flag machinery is validated; the adapter + "
-          "checkpoint JSONL wiring is WP3b (issue #15).")
+    print("WP3b: the startup model gate is validated above; the "
+          "checkpoint JSONL (JsonlCheckpoint), resume (resume_queue / "
+          "resume_from_checkpoint) and pre-flight (Preflight) are the "
+          "programmatic API. The real adapter session factory (an "
+          "actual batch run from the CLI) lands with the adapter WP.")
     return 0
 
 
