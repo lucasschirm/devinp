@@ -199,7 +199,12 @@ def handle(obj):
         if mode in ("ok", "refusal", "bigframe"):
             sys.exit(0)
         return
-    if rid in pending:
+    if m is None and rid in pending:
+        # ``m is None``: a response, not a request — a client request
+        # whose id collides with a pending permission id (100–103) and
+        # isn't matched by an earlier method branch must get its own
+        # answer, not be consumed as the permission answer (round 4
+        # [nit]: the same guard the WP2 mock gained in round 3).
         pending.pop(rid)
         state("permission_response", id=rid, result=obj.get("result"))
         if not pending:
@@ -210,6 +215,18 @@ def handle(obj):
                                       "used": 12026, "size": 262000}}})
             finish_prompt()
         return
+    if m is not None and rid is not None:
+        # Unknown method with an id: the real server answers with a
+        # JSON-RPC error, it does not crash / drop the request (WP0
+        # negative control; parity with the WP2 mock — round 5 [minor]).
+        send({"jsonrpc": "2.0", "id": rid,
+              "error": {"code": -32601,
+                        "message": "Method not found"}})
+        # (WP0 capture verbatim: the real server's message carries no
+        # method-name suffix — round 6 [nit])
+        return
+    # Unknown notification (no id): ignore — vendor/unknown
+    # notifications never block (WP0 contract).
 
 buf = b""
 while True:
@@ -225,12 +242,23 @@ while True:
     while b"\n" in buf:
         line, buf = buf.split(b"\n", 1)
         line = line.strip()
-        if not line:
-            continue
+        # A blank line is not a message — but the WP0 capture shows the
+        # real server answers a blank separator line with a -32700
+        # parse error (data.line == "") rather than skipping it, so
+        # blank lines take the same parse-error path (round 7
+        # [minor]: capture fidelity).
         try:
             handle(json.loads(line))
         except json.JSONDecodeError:
-            state("bad_line", line=line[:200].decode("utf-8", "replace"))
+            # WP0 negative control: the real server answers a non-JSON
+            # line with a parse error (id null, data.line echoing the
+            # line) and keeps serving (round 6 [minor]: parity with the
+            # WP2 mock, which sends the same frame).
+            bad = line[:200].decode("utf-8", "replace")
+            state("bad_line", line=bad)
+            send({"jsonrpc": "2.0", "id": None,
+                  "error": {"code": -32700, "message": "Parse error",
+                           "data": {"line": bad}}})
 '''
 
 
@@ -247,7 +275,7 @@ def make_mock(root, mode: str):
     wrapper = root / f"mock-devin-{mode}"
     mock.write_text(MOCK_SOURCE)
     wrapper.write_text(
-        f"#!/bin/sh\nexec {sys.executable} {mock} {mode} {state}\n"
+        f"#!/bin/sh\nexec \"{sys.executable}\" \"{mock}\" {mode} \"{state}\"\n"
     )
     wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP
                   | stat.S_IXOTH)
@@ -273,12 +301,33 @@ def living_mock_pids():
 
     Returns ``None`` when the process table is not inspectable (no
     ``/proc``) so callers can fall back to the group-alive check.
+
+    Ancestor processes are excluded from the match: a shell wrapper
+    launched as ``bash -c "… mock_devin.py …"`` (e.g. a bench runner
+    whose own command line names the mock) is not a leaked agent.
     """
     if not os.path.isdir("/proc"):
         return None
+
+    def _ancestors() -> set:
+        out = {os.getpid()}
+        p = os.getpid()
+        while p > 1:
+            try:
+                with open(f"/proc/{p}/stat") as f:
+                    p = int(f.read().rsplit(")", 1)[1].split()[1])
+            except (OSError, ValueError, IndexError):
+                break
+            out.add(p)
+        return out
+
+    skip = _ancestors()
     pids = []
     for entry in os.listdir("/proc"):
         if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid in skip:
             continue
         try:
             with open(f"/proc/{entry}/cmdline", "rb") as f:
@@ -286,5 +335,5 @@ def living_mock_pids():
         except OSError:
             continue
         if b"mock_devin.py" in cmd:
-            pids.append(int(entry))
+            pids.append(pid)
     return pids
