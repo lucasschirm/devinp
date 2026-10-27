@@ -47,7 +47,7 @@ public images — they skip where no Docker daemon exists).
 | `evaluate.py` | **WP4** — the SWE-bench evaluation leg: a thin delegate to `python -m swebench.harness.run_evaluation` (standard predictions file, fresh harness-created container, `{resolved, logs}` return contract, typed error hierarchy `InvalidInputError`/`PatchCorruptionError`/`EvaluationTimeoutError`/`HarnessFailedError`; never imports `swebench` — the subprocess is the only harness interaction; pure stdlib + subprocess) |
 | `tests/` | **WP1** — unit tests + in-process mock `devin` server; **WP2** — `mock_devin` integration tests (driven through the real WP1 client); **WP3a** — `runner` unit tests (instrumented fake sessions); **WP3b** — resume fixtures (incl. EOF corruption + retry-class rules), cost-tier gate fixtures (paid model, shape change, paid override), pre-flight stub-failure tests; **WP4** — `evaluate` unit tests (injected harness runner + fabricated harness trees, zero quota) + CI integration tests (positive control on the public flask image, corruption guard, isolation; skip without a Docker daemon) |
 | `conftest.py` | pytest path shim for the flat layout |
-| `pyproject.toml` / `requirements.lock` | Python ≥3.11; `swebench==5.0.2` pinned |
+| `pyproject.toml` / `requirements.lock` | Python ≥3.11; `swebench==5.0.2` pinned; `pytest-timeout` (the integration tests' watchdog) |
 
 ## The probe
 
@@ -294,10 +294,15 @@ imports `swebench`):
 
 ```bash
 cd bench
-python3 evaluate.py --instance-id pallets__flask-5014 --patch-file p.diff   # exit 0; JSON on stdout
+python3 evaluate.py --instance-id pallets__flask-5014 --patch-file p.diff   # exit 0 = ran (resolved or not); JSON on stdout
 python -m pytest tests/test_evaluate.py   # unit: zero quota, no Docker (injected harness runner + fabricated harness trees)
 # the positive/corruption/isolation controls are CI integration tests (public images, no quota; skip without a Docker daemon)
 ```
+
+Exit codes: 0 = ran (resolved *or* not — the JSON on stdout carries the
+outcome), 2 `InvalidInputError`, 3 `PatchCorruptionError`,
+4 `EvaluationTimeoutError`, 5 other harness/infra failure (the documented
+contract — never a traceback with exit 1).
 
 - **Delegation (AC1):** one call = one instance; writes the standard
   predictions file (exactly `instance_id` / `model_name_or_path` /
@@ -305,9 +310,15 @@ python -m pytest tests/test_evaluate.py   # unit: zero quota, no Docker (injecte
   swebench.harness.run_evaluation -d SWE-bench/SWE-bench_Verified -s test
   -p … -i … -id … --max_workers 1 -t … --report_dir …` (WP0-verified),
   with `cwd = workdir` (the per-instance artifact dir — the harness's log
-  root is CWD-relative, so every artifact lands under one directory). The
-  argv is pinned by a unit test; the module's no-`swebench`-import
-  contract is pinned by a source test.
+  root is CWD-relative, and the pin's `make_run_report` writes the final
+  run report to `<report_dir>/<model>.<run_id>.json`, so every artifact
+  lands under one directory). The argv is pinned by a unit test; the
+  module's no-`swebench`-import contract is pinned by a source test.
+  `overall_timeout` is the optional outer watchdog (the project's hang
+  policy — `-t` bounds only the *in-container* test exec; the HF dataset
+  download, the image pull and the Docker daemon are not bound by `-t`);
+  pre-spawn filesystem work, a spawn failure and the watchdog firing are
+  typed `HarnessFailedError`, never a raw escape.
 - **Fresh container (AC2):** the harness creates the eval container itself
   (`containers.create` on the published eval image, ghost-removing any
   same-name container first); the per-call unique `run_id` default makes
@@ -316,24 +327,42 @@ python -m pytest tests/test_evaluate.py   # unit: zero quota, no Docker (injecte
   agent's (contaminated) container at all. The container id comes from the
   harness's own log line → `logs.container` (the AC4 isolation assertion:
   eval container id ≠ agent container id).
-- **`{resolved, logs}` (AC3):** `resolved` is only ever the harness's
-  `report.json` value (or the harness's own empty-patch semantics, below);
-  `logs` carries the harness artifact paths (`instance`, `test_output`),
-  the verbatim per-instance `report`, the final run report path, and
-  `container`.
+- **`{resolved, logs}` (AC3, typed — `EvaluationResult` / `EvaluationLogs`
+  `TypedDict`):** `resolved` is only ever the harness's `report.json`
+  value — **and it must be a bool** (a corrupted-but-parseable verdict is
+  a typed failure, never a silent `bool()` coercion) — or the harness's
+  own empty-patch semantics (below); `logs` carries the harness artifact
+  paths (`instance`, `test_output`, `final_report`), the verbatim
+  per-instance `report`, `container`, and the run identity (`workdir` — a
+  fresh tempdir when the caller passed None, surfaced so the caller-owned
+  cleanup is never unreachable — `run_id`, `predictions`). A non-zero
+  harness exit is always an error, *even when a report exists* (the
+  harness writes the per-instance report before the final-report leg).
+- **Stale-report protection:** the harness's own `exclude_completed` treats
+  a pre-existing per-run `report.json` as "already run" and silently skips
+  the instance — `evaluate` never trusts a pre-existing report: it unlinks
+  one before the spawn (on an unlink failure the pre-run mtime is recorded
+  and the post-run report must be newer), so a re-used (workdir, run_id)
+  pair can never return the previous run's verdict for a patch that was
+  never evaluated.
 - **Empty patches (the negative control):** the harness itself filters
   empty/`None` `model_patch` (skipped; counted in `empty_patch_ids`, never
   in `resolved_ids`); `evaluate` mirrors that exactly by short-circuiting
   to `resolved: False` with `empty_patch: True` — no harness spawn, no
-  dataset download, no Docker.
+  dataset download, no Docker, no tempdir.
 - **Corruption guard (AC4):** the harness's own 4-command git-apply chain is
   the *sole authority* on applicability, so no structural pre-check is made
   (the chain applies patch forms without `---` / `+++` file headers —
   rename-only / mode-only `diff --git` hunks, `GIT binary patch`
   sections, tab-separated `diff -u` headers, context/normal diffs — which a
   header check would wrongly reject). Every non-empty patch reaches the
-  harness; the chain's `APPLY_PATCH_FAIL` marker → `PatchCorruptionError`,
-  a timeout marker → `EvaluationTimeoutError`, anything else →
+  harness; the chain's `APPLY_PATCH_FAIL` marker in `run_instance.log` →
+  `PatchCorruptionError` (wins over a timeout marker), the anchored
+  `Timeout error: N seconds exceeded` marker in `test_output.txt` (or the
+  harness's timeout message / `>>>>> Tests Timed Out` logger line in
+  `run_instance.log`) → `EvaluationTimeoutError` (terminal in WP3 — hence
+  the loose markers are anchored and file-specific, so a docker-client
+  flake cannot zero out a retryable instance), anything else →
   `HarnessFailedError` (the WP3 `eval_error` retry class). A clean typed
   error, never a crash.
 

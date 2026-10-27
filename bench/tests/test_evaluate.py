@@ -48,26 +48,43 @@ Acceptance mapping (issue #17, ``bench/PLAN-WP4.md``):
     corruption` (unit, fabricated tree) and
     :func:`test_integration_corruption_guard_truncated_gold_patch` (real
     harness, real container);
-  * corruption triage edges: :func:`test_no_report_timeout_marker_is_
-    evaluation_timeout`, :func:`test_no_report_no_marker_is_infra_error`,
-    :func:`test_exit_nonzero_is_harness_failed_with_stderr_tail`,
+  * triage edges (fabricated trees — markers by the file the pinned harness
+    writes them to): :func:`test_no_report_timeout_marker_is_` `evaluation` `_timeout` (all markers × the file placement),
+    :func:`test_timeout_marker_in_wrong_file_is_not_terminal_timeout`
+    (anchored + file-specific), :func:`test_apply_fail_and_timeout_`
+    `markers_corruption_wins`, :func:`test_no_report_no_marker_is_infra_error`,
+    :func:`test_exit_nonzero_is_harness_failed_with_stderr_tail` (the
+    combined stdout + stderr tail), :func:`test_report_present_but_exit_` `nonzero_is_harness_failed` (the exit-≠ 0-always-error rule),
+    :func:`test_exit_nonzero_with_apply_fail_marker_is_harness_failed`,
+    :func:`test_stale_report_surviving_unlink_failure_is_not_trusted` (the
+    stale-report protection: the harness's exclude_completed would skip the
+    instance; the pre-run report is unlinked / mtime-checked),
+    :func:`test_preexisting_report_is_unlinked_and_not_trusted`,
     :func:`test_unreadable_report_is_harness_failed`,
-    :func:`test_report_missing_instance_entry_is_harness_failed`;
-  * validation matrix (typed, before any side effect):
-    :func:`test_input_validation_matrix` (instance id / patch / run_id
-    charset / model name / timeout), :func:`test_extra_input_validation_
-    matrix` (dataset / split / workdir / python / harness_runner);
-  * the delegation's robustness edges: :func:`test_relative_workdir_is_
-    resolved_to_absolute_before_spawn`, :func:`test_runner_spawn_failure_
-    is_typed_not_raw`, :func:`test_process_object_without_returncode_is_
-    typed`, :func:`test_non_object_report_is_harness_failed`,
+    :func:`test_report_missing_instance_entry_is_harness_failed`,
+    :func:`test_non_bool_resolved_verdict_is_harness_failed` (AC3 — no
+    ``bool()`` coercion of a malformed verdict);
+  * validation matrix (typed, before any side effect — the tests also assert
+    zero filesystem side effects): :func:`test_input_validation_matrix`
+    (instance id charset / patch / run_id charset / model name / timeout),
+    :func:`test_extra_input_validation_matrix` (dataset / split / workdir /
+    python / harness_runner / overall_timeout);
+  * the delegation's robustness edges: :func:`test_relative_workdir_is_`
+    `resolved_to_absolute_before_spawn`, :func:`test_workdir_none_creates_` `tempdir_and_surfaces_it` (the caller-owned-cleanup contract),
+    :func:`test_pre_spawn_filesystem_failure_is_typed`,
+    :func:`test_runner_spawn_failure_is_typed_not_raw`,
+    :func:`test_overall_timeout_flows_to_the_runner` (the outer watchdog —
+    the project's hang policy), :func:`test_process_object_without_` `returncode_is_typed`, :func:`test_non_object_report_is_harness_failed`,
     :func:`test_non_utf8_report_is_harness_failed`;
   * isolation: asserted inside :func:`test_integration_positive_control`
     (eval container id ≠ agent container id; the eval container id is a
     real container id from the harness's own log).
 
-Plus the operator CLI: :func:`test_cli_*` (exit codes 0/2/3/4/5, JSON on
-stdout).
+Plus the operator CLI: :func:`test_cli_*` (exit codes 0/2/3/4/5 — 0 = ran,
+resolved or not — JSON on stdout).
+
+The two Docker-gated integration tests carry a ``pytest.mark.timeout``
+watchdog (a wedged pull must fail the test, not hang the job).
 """
 
 from __future__ import annotations
@@ -78,6 +95,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any, Callable, Optional
 
 import pytest
 
@@ -98,17 +116,12 @@ _WELLFORMED_PATCH = (
 # ---------------------------------------------------------------------------
 
 
-class FakeCompleted:
-    def __init__(self, returncode: int, stdout: str = "", stderr: str = "") -> None:
-        self.returncode = returncode
-        self.stdout = stdout
-        self.stderr = stderr
-
-
 class FakeHarness:
-    """The injected harness_runner: records (argv, cwd); optionally builds a
-    fabricated harness tree under cwd (the harness's CWD-relative layout);
-    returns a FakeCompleted."""
+    """The injected harness_runner (seam: ``fn(argv, cwd, overall_timeout)``):
+    records the call; optionally builds a fabricated harness tree under cwd
+    (the harness's CWD-relative layout); returns a real
+    ``subprocess.CompletedProcess`` — the type ``evaluate()`` actually
+    consumes."""
 
     def __init__(
         self,
@@ -116,19 +129,23 @@ class FakeHarness:
         returncode: int = 0,
         stdout: str = "",
         stderr: str = "",
-        tree: "callable | None" = None,
+        tree: Optional[Callable[[Path], None]] = None,
     ) -> None:
         self.returncode = returncode
         self.stdout = stdout
         self.stderr = stderr
         self.tree = tree
-        self.calls: list[tuple[list[str], str]] = []
+        self.calls: list[tuple[list[str], str, object]] = []
 
-    def __call__(self, argv: list[str], cwd: str) -> FakeCompleted:
-        self.calls.append((list(argv), cwd))
+    def __call__(
+        self, argv: list[str], cwd: str, overall_timeout: Optional[float] = None
+    ) -> subprocess.CompletedProcess:
+        self.calls.append((list(argv), cwd, overall_timeout))
         if self.tree is not None:
             self.tree(Path(cwd))
-        return FakeCompleted(self.returncode, self.stdout, self.stderr)
+        return subprocess.CompletedProcess(
+            argv, self.returncode, self.stdout, self.stderr
+        )
 
 
 def _build_tree(
@@ -137,12 +154,14 @@ def _build_tree(
     model: str,
     instance_id: str,
     *,
-    report: "dict | None" = None,
-    instance_log: "str | None" = None,
-    test_output: "str | None" = None,
+    report: Optional[dict] = None,
+    instance_log: Optional[str] = None,
+    test_output: Optional[str] = None,
+    final_report: bool = False,
 ) -> None:
     """Fabricate the harness's exact CWD-relative artifact layout (the pinned
-    swebench 5.0.2 log root / filenames)."""
+    swebench 5.0.2 log root / filenames; the final report is the pin's
+    ``<report_dir>/<model>.<run_id>.json``, reporting.py:170-172)."""
     base = cwd / "logs" / "run_evaluation" / run_id / model.replace("/", "__") / instance_id
     base.mkdir(parents=True, exist_ok=True)
     if report is not None:
@@ -151,6 +170,10 @@ def _build_tree(
         (base / "run_instance.log").write_text(instance_log, encoding="utf-8")
     if test_output is not None:
         (base / "test_output.txt").write_text(test_output, encoding="utf-8")
+    if final_report:
+        (cwd / f"{model.replace('/', '__')}.{run_id}.json").write_text(
+            json.dumps({"run_id": run_id}), encoding="utf-8"
+        )
 
 
 def _report_tree(
@@ -179,24 +202,37 @@ def _report_tree(
 # ---------------------------------------------------------------------------
 
 
-def test_harness_argv_is_exactly_the_official_cli(tmp_path):
+@pytest.mark.parametrize(
+    ("python", "dataset", "split"),
+    [
+        (None, None, None),  # defaults
+        ("/usr/bin/custom-python", "org/dataset", "custom-split"),  # good values flow
+    ],
+)
+def test_harness_argv_is_exactly_the_official_cli(tmp_path, python, dataset, split):
     """The argv is *pinned* to the official CLI (WP0-verified): any bespoke
-    flag — or a missing official one — breaks this test. AC1."""
+    flag — or a missing official one — breaks this test, and good
+    python/dataset/split values actually flow (the validation matrix proves
+    bad ones are refused). AC1."""
     fake = FakeHarness(tree=_report_tree("rid1", "devin", "pallets__flask-5014", resolved=True))
     ev.evaluate(
         "pallets__flask-5014",
         _WELLFORMED_PATCH,
+        dataset=dataset or ev.DEFAULT_DATASET,
+        split=split or ev.DEFAULT_SPLIT,
         workdir=tmp_path,
         run_id="rid1",
         timeout=1234,
+        python=python,
         harness_runner=fake,
     )
-    (argv, _), = fake.calls
-    assert argv[0] == sys.executable  # the interpreter with swebench installed
+    (argv, _, _), = fake.calls
+    expected_python = python if python is not None else sys.executable
+    assert argv[0] == expected_python  # the interpreter with swebench installed
     assert argv[1:3] == ["-m", "swebench.harness.run_evaluation"]
     flags = dict(zip(argv[3::2], argv[4::2]))
-    assert flags["-d"] == "SWE-bench/SWE-bench_Verified"
-    assert flags["-s"] == "test"
+    assert flags["-d"] == (dataset if dataset is not None else ev.DEFAULT_DATASET)
+    assert flags["-s"] == (split if split is not None else ev.DEFAULT_SPLIT)
     assert flags["-p"].endswith("predictions.jsonl")
     assert flags["-i"] == "pallets__flask-5014"
     assert flags["-id"] == "rid1"
@@ -251,8 +287,15 @@ def test_no_swebench_import_in_evaluate_module():
 
 def test_model_name_slash_is_escaped_like_the_harness(tmp_path):
     """The harness escapes ``/`` → ``__`` in the log dir / report name; our
-    path derivation must match or the report is never found."""
-    fake = FakeHarness(tree=_report_tree("rid4", "devin/swe-2-high", "iid", resolved=True))
+    path derivation must match or the report is never found. (The final
+    report is the pin's ``<report_dir>/<model>.<run_id>.json`` —
+    reporting.py:170-172; ``--report_dir = workdir``.)"""
+    fake = FakeHarness(
+        tree=lambda cwd: _build_tree(
+            cwd, "rid4", "devin/swe-2-high", "iid",
+            report={"iid": {"resolved": True}}, final_report=True,
+        )
+    )
     result = ev.evaluate(
         "iid",
         _WELLFORMED_PATCH,
@@ -261,8 +304,8 @@ def test_model_name_slash_is_escaped_like_the_harness(tmp_path):
         run_id="rid4",
         harness_runner=fake,
     )
-    assert result["resolved"] is True
-    assert (tmp_path / "devin__swe-2-high.rid4.json").parent == tmp_path  # name shape only
+    assert result["resolved"] is True  # the report was only found under devin__swe-2-high/
+    assert result["logs"]["final_report"] == str(tmp_path / "devin__swe-2-high.rid4.json")
     assert result["logs"]["report"] is not None
 
 
@@ -281,7 +324,7 @@ def test_default_run_id_is_unique_per_call(tmp_path):
         fake = FakeHarness()  # no tree: the random run id has no report → infra error
         with pytest.raises(ev.HarnessFailedError):
             ev.evaluate("iid", _WELLFORMED_PATCH, workdir=tmp_path, harness_runner=fake)
-        argv, _ = fake.calls[0]
+        argv, _, _ = fake.calls[0]
         run_ids.append(argv[argv.index("-id") + 1])
     assert run_ids[0] != run_ids[1]  # per-call unique (AC2)
     assert run_ids[0].startswith("eval-iid-")
@@ -301,7 +344,7 @@ def test_eval_container_name_never_equals_agent_container_name(tmp_path):
         fake = FakeHarness()  # no tree: the random run id has no report → infra error
         with pytest.raises(ev.HarnessFailedError):
             ev.evaluate(instance_id, _WELLFORMED_PATCH, workdir=tmp_path, harness_runner=fake)
-        argv, _ = fake.calls[0]
+        argv, _, _ = fake.calls[0]
         run_id = argv[argv.index("-id") + 1]
         assert run_id  # non-empty — the whole name separation rests on this
         eval_name = f"sweb.eval.{instance_id.lower()}.{run_id}"
@@ -310,7 +353,7 @@ def test_eval_container_name_never_equals_agent_container_name(tmp_path):
     # an explicit run id: same guarantee, value taken from the emitted argv
     fake = FakeHarness(tree=_report_tree("rid-custom", "devin", instance_id, resolved=False))
     ev.evaluate(instance_id, _WELLFORMED_PATCH, workdir=tmp_path, run_id="rid-custom", harness_runner=fake)
-    argv, _ = fake.calls[0]
+    argv, _, _ = fake.calls[0]
     run_id = argv[argv.index("-id") + 1]
     assert f"sweb.eval.{instance_id.lower()}.{run_id}" != agent_name
 
@@ -339,7 +382,21 @@ def test_report_json_is_the_sole_source_of_resolved(tmp_path):
 
 
 def test_return_contract_shape(tmp_path):
-    fake = FakeHarness(tree=_report_tree("rid", "devin", "iid", resolved=False))
+    """The key set of both halves is pinned (the TypedDict contract —
+    key-drift is unrepresentable, but the literals are pinned too, for
+    both the full and the empty-patch paths — the latter in
+    :func:`test_negative_control_no_op_patch_is_unresolved`). The run-identity
+    values are surfaced (a caller-created tempdir must be reachable for
+    cleanup; a failure must be debuggable)."""
+    fake = FakeHarness(
+        tree=lambda cwd: _build_tree(
+            cwd, "rid", "devin", "iid",
+            report={"iid": {"resolved": False}},
+            instance_log="Container for iid created: abc\n",
+            test_output="ok\n",
+            final_report=True,
+        )
+    )
     result = ev.evaluate("iid", _WELLFORMED_PATCH, workdir=tmp_path, run_id="rid", harness_runner=fake)
     assert set(result) == {"resolved", "logs"}
     assert set(result["logs"]) == {
@@ -348,9 +405,25 @@ def test_return_contract_shape(tmp_path):
         "report",
         "final_report",
         "container",
+        "workdir",
+        "run_id",
+        "predictions",
         "empty_patch",
     }
     assert result["logs"]["empty_patch"] is False
+    # run identity — surfaced, never unreachable
+    assert result["logs"]["workdir"] == str(tmp_path)
+    assert result["logs"]["run_id"] == "rid"
+    assert result["logs"]["predictions"] == str(tmp_path / "predictions.jsonl")
+    # the harness artifact paths are asserted *verbatim* (a swapped key or a
+    # wrong final-report filename formula must not pass silently)
+    assert result["logs"]["instance"] == str(
+        tmp_path / "logs" / "run_evaluation" / "rid" / "devin" / "iid" / "run_instance.log"
+    )
+    assert result["logs"]["test_output"] == str(
+        tmp_path / "logs" / "run_evaluation" / "rid" / "devin" / "iid" / "test_output.txt"
+    )
+    assert result["logs"]["final_report"] == str(tmp_path / "devin.rid.json")
 
 
 def test_container_id_extracted_from_harness_log(tmp_path):
@@ -381,11 +454,20 @@ def test_negative_control_no_op_patch_is_unresolved(tmp_path):
     counted in empty_patch_ids, never in resolved_ids). Runs without Docker
     (CI and locally)."""
     for patch in ("", None):
-        fake = FakeHarness()  # would raise if called
+        fake = FakeHarness()  # must not be called (records calls; asserted below)
         result = ev.evaluate("iid", patch, workdir=tmp_path, harness_runner=fake)
         assert result["resolved"] is False
         assert result["logs"]["empty_patch"] is True
         assert result["logs"]["container"] is None
+        # the empty-patch literal carries the *same* key set (no run identity
+        # — no tempdir / run id / predictions file were created)
+        assert set(result["logs"]) == {
+            "instance", "test_output", "report", "final_report", "container",
+            "workdir", "run_id", "predictions", "empty_patch",
+        }
+        assert result["logs"]["workdir"] is None
+        assert result["logs"]["run_id"] is None
+        assert result["logs"]["predictions"] is None
         assert fake.calls == []  # no dataset download, no Docker
 
 
@@ -438,24 +520,78 @@ def test_truncated_wellformed_patch_reaches_harness_and_is_corruption(tmp_path):
             run_id="rid",
             harness_runner=fake,
         )
-    assert len(fake.calls) == 1  # the harness *was* spawned (layer 2 is definitive)
+    assert len(fake.calls) == 1  # the harness *was* spawned (the chain is definitive)
     assert e.value.instance_id == "pallets__flask-5014"
     assert e.value.log_paths["instance"]  # the log paths travel with the error
 
 
-def test_no_report_timeout_marker_is_evaluation_timeout(tmp_path):
+def _timeout_marker_tree(marker_file: str, marker: str):
+    """A no-report tree carrying exactly one timeout marker in exactly one
+    file (the other harness artifact absent)."""
+    kwargs = {marker_file: marker + "\n"}
+    return lambda cwd: _build_tree(cwd, "rid", "devin", "iid", **kwargs)
+
+
+@pytest.mark.parametrize(
+    ("marker_file", "marker"),
+    [
+        # the markers, in the file the pinned harness writes them to
+        # (run_evaluation.py:376 et al.)
+        ("test_output", "Timeout error: 1800 seconds exceeded."),
+        ("instance_log", "Test timed out after 1800 seconds."),
+        ("instance_log", ">>>>> Tests Timed Out"),
+    ],
+)
+def test_no_report_timeout_marker_is_evaluation_timeout(tmp_path, marker_file, marker):
+    """A harness timeout marker **in the file the pinned harness writes it
+    to** → EvaluationTimeoutError (parametrized over all markers × the
+    file placement)."""
+    fake = FakeHarness(tree=_timeout_marker_tree(marker_file, marker))
+    with pytest.raises(ev.EvaluationTimeoutError) as e:
+        ev.evaluate("iid", _WELLFORMED_PATCH, workdir=tmp_path, run_id="rid", harness_runner=fake)
+    assert e.value.instance_id == "iid"
+
+
+@pytest.mark.parametrize(
+    ("marker_file", "marker"),
+    [
+        # the same text in the *wrong* file is not a harness timeout marker:
+        # EvaluationTimeoutError is terminal in WP3 while
+        # HarnessFailedError is the retried eval_error class, so a
+        # docker-client/network line containing "Timeout error:" in the
+        # instance log (or test output echoing a suite's own timeout text)
+        # must convert a retryable infra flake into a terminal timeout.
+        ("instance_log", "Timeout error: 1800 seconds exceeded."),
+        ("test_output", ">>>>> Tests Timed Out"),
+        ("test_output", "Test timed out after 1800 seconds."),
+    ],
+)
+def test_timeout_marker_in_wrong_file_is_not_terminal_timeout(tmp_path, marker_file, marker):
+    """The loose markers are anchored and file-specific: the same text in
+    the wrong file is not a timeout marker → the retryable infra class."""
+    fake = FakeHarness(tree=_timeout_marker_tree(marker_file, marker))
+    with pytest.raises(ev.HarnessFailedError):
+        ev.evaluate("iid", _WELLFORMED_PATCH, workdir=tmp_path, run_id="rid", harness_runner=fake)
+
+
+def test_apply_fail_and_timeout_markers_corruption_wins(tmp_path):
+    """Both markers present (apply-fail + timeout in the instance log):
+    corruption wins — a corrupt patch is a terminal verdict and a retry
+    would just re-fail the apply."""
     fake = FakeHarness(
         tree=lambda cwd: _build_tree(
             cwd,
             "rid",
             "devin",
             "iid",
-            test_output="ran the tests\n\nTimeout error: 1800 seconds exceeded.\n",
+            instance_log=(
+                ">>>>> Patch Apply Failed:\nerror: patch failed\n"
+                ">>>>> Tests Timed Out\n"
+            ),
         )
     )
-    with pytest.raises(ev.EvaluationTimeoutError) as e:
+    with pytest.raises(ev.PatchCorruptionError):
         ev.evaluate("iid", _WELLFORMED_PATCH, workdir=tmp_path, run_id="rid", harness_runner=fake)
-    assert e.value.instance_id == "iid"
 
 
 def test_no_report_no_marker_is_infra_error(tmp_path):
@@ -473,13 +609,51 @@ def test_no_report_no_marker_is_infra_error(tmp_path):
 
 def test_exit_nonzero_is_harness_failed_with_stderr_tail(tmp_path):
     """A non-zero harness exit (unknown instance id, dataset fetch failure,
-    unreachable daemon) is a typed HarnessFailedError carrying the stderr
-    tail — the operator can triage without re-reading the logs."""
+    unreachable daemon) is a typed HarnessFailedError carrying the
+    *combined* output tail (when one stream is non-empty the other is not
+    discarded entirely) — the operator can triage without re-reading the
+    logs."""
     stderr = "Traceback (most recent call last):\nValueError: Some prediction IDs not found in dataset!\n"
-    fake = FakeHarness(returncode=1, stderr=stderr)
+    stdout = "running 1 instance…\n"
+    fake = FakeHarness(returncode=1, stdout=stdout, stderr=stderr)
     with pytest.raises(ev.HarnessFailedError) as e:
         ev.evaluate("iid", _WELLFORMED_PATCH, workdir=tmp_path, run_id="rid", harness_runner=fake)
-    assert "ValueError" in e.value.output_tail
+    assert "ValueError" in e.value.output_tail  # the stderr tail
+    assert "running 1 instance" in e.value.output_tail  # the stdout tail, not discarded
+
+
+def test_report_present_but_exit_nonzero_is_harness_failed(tmp_path):
+    """The exit-≠ 0-always-error rule: the harness writes the per-instance
+    report before the final-report leg (make_run_report), so a crash *after*
+    the report (report present + exit ≠ 0) must not be read as a completed
+    run — the stderr tail must not be silently dropped."""
+    fake = FakeHarness(
+        returncode=1,
+        stderr="crashed inside make_run_report\n",
+        tree=lambda cwd: _build_tree(
+            cwd, "rid", "devin", "iid",
+            report={"iid": {"resolved": True}},
+        ),
+    )
+    with pytest.raises(ev.HarnessFailedError) as e:
+        ev.evaluate("iid", _WELLFORMED_PATCH, workdir=tmp_path, run_id="rid", harness_runner=fake)
+    assert "crashed inside make_run_report" in e.value.output_tail
+
+
+def test_exit_nonzero_with_apply_fail_marker_is_harness_failed(tmp_path):
+    """Exit ≠ 0 wins over the markers (checked before the no-report
+    triage): a non-zero exit with an apply-fail line in the log is a
+    harness failure, not a corruption verdict — the instance's outcome is
+    unknown when the run itself failed."""
+    fake = FakeHarness(
+        returncode=1,
+        tree=lambda cwd: _build_tree(
+            cwd, "rid", "devin", "iid",
+            instance_log=">>>>> Patch Apply Failed:\nerror: patch failed\n",
+        ),
+    )
+    with pytest.raises(ev.HarnessFailedError):
+        ev.evaluate("iid", _WELLFORMED_PATCH, workdir=tmp_path, run_id="rid", harness_runner=fake)
 
 
 def test_unreadable_report_is_harness_failed(tmp_path):
@@ -495,7 +669,32 @@ def test_unreadable_report_is_harness_failed(tmp_path):
 
 
 def test_report_missing_instance_entry_is_harness_failed(tmp_path):
-    fake = FakeHarness(tree=_report_tree("rid", "devin", "other-instance", resolved=True))
+    """A report that *exists at the instance path* but lacks the instance's
+    entry (a foreign key only, or an entry without "resolved") is a typed
+    HarnessFailedError — the guard at the report-present leg (exercises the
+    entry validation branch, not the no-report triage)."""
+    for report in (
+        {"other-instance": {"resolved": True}},  # foreign key only
+        {"iid": {"patch_successfully_applied": True}},  # missing "resolved"
+    ):
+        fake = FakeHarness(
+            tree=lambda cwd, r=report: _build_tree(cwd, "rid", "devin", "iid", report=r)
+        )
+        with pytest.raises(ev.HarnessFailedError):
+            ev.evaluate("iid", _WELLFORMED_PATCH, workdir=tmp_path, run_id="rid", harness_runner=fake)
+
+
+@pytest.mark.parametrize("bad_resolved", ["false", None, 1, 0, "true"])
+def test_non_bool_resolved_verdict_is_harness_failed(tmp_path, bad_resolved):
+    """AC3 — a corrupted-but-parseable verdict (a non-bool "resolved") is a
+    typed HarnessFailedError, never a silent bool() coercion (bool("false")
+    would be True; bool(None) would hide the corruption as False)."""
+    fake = FakeHarness(
+        tree=lambda cwd: _build_tree(
+            cwd, "rid", "devin", "iid",
+            report={"iid": {"resolved": bad_resolved}},
+        )
+    )
     with pytest.raises(ev.HarnessFailedError):
         ev.evaluate("iid", _WELLFORMED_PATCH, workdir=tmp_path, run_id="rid", harness_runner=fake)
 
@@ -514,7 +713,7 @@ def test_relative_workdir_is_resolved_to_absolute_before_spawn(tmp_path, monkeyp
     (tmp_path / "rel-workdir").mkdir()
     fake = FakeHarness(tree=lambda cwd: _build_tree(cwd, "rid", "devin", "iid", report={"iid": {"resolved": False}}))
     ev.evaluate("iid", _WELLFORMED_PATCH, workdir="rel-workdir", run_id="rid", harness_runner=fake)
-    argv, cwd = fake.calls[0]
+    argv, cwd, _ = fake.calls[0]
     assert cwd == str(tmp_path / "rel-workdir")  # absolute cwd
     assert argv[argv.index("-p") + 1] == str(tmp_path / "rel-workdir" / "predictions.jsonl")
     assert argv[argv.index("--report_dir") + 1] == str(tmp_path / "rel-workdir")
@@ -524,7 +723,7 @@ def test_runner_spawn_failure_is_typed_not_raw(tmp_path):
     """A spawn failure of the harness subprocess (missing python →
     FileNotFoundError; fork/exec limits → OSError) is a typed
     HarnessFailedError, never a raw traceback escape."""
-    def boom(argv, cwd):
+    def boom(argv, cwd, overall_timeout=None):
         raise FileNotFoundError(2, "No such file or directory", "/nope")
 
     with pytest.raises(ev.HarnessFailedError) as e:
@@ -542,7 +741,100 @@ def test_process_object_without_returncode_is_typed(tmp_path):
 
     with pytest.raises(ev.HarnessFailedError):
         ev.evaluate("iid", _WELLFORMED_PATCH, workdir=tmp_path, run_id="rid",
-                    harness_runner=lambda a, c: NoReturncode())
+                    harness_runner=lambda a, c, t=None: NoReturncode())
+
+
+def test_pre_spawn_filesystem_failure_is_typed(tmp_path):
+    """Pre-spawn filesystem work (workdir mkdir / predictions write) is typed
+    — a workdir whose parent is a *file* (deterministic regardless of
+    privileges) fails with an OSError that must not escape raw (PLAN §7
+    names disk exhaustion an expected mid-benchmark risk)."""
+    (tmp_path / "blocker").write_text("i am a file", encoding="utf-8")
+    fake = FakeHarness()
+    with pytest.raises(ev.HarnessFailedError) as e:
+        ev.evaluate(
+            "iid", _WELLFORMED_PATCH,
+            workdir=tmp_path / "blocker" / "sub",
+            run_id="rid",
+            harness_runner=fake,
+        )
+    assert "pre-spawn filesystem failure" in e.value.message
+    assert fake.calls == []  # failed before the spawn
+
+
+def test_workdir_none_creates_tempdir_and_surfaces_it(tmp_path):
+    """workdir=None (the auto-tempdir path) creates a fresh
+    swebench-eval-… directory and *surfaces* it — logs.workdir / logs.
+    predictions make the caller-owned cleanup reachable (a silent tempdir
+    leak is not an option) and failures debuggable."""
+    fake = FakeHarness(
+        tree=lambda cwd: _build_tree(
+            cwd, "rid", "devin", "iid",
+            report={"iid": {"resolved": False}}, final_report=True,
+        )
+    )
+    result = ev.evaluate("iid", _WELLFORMED_PATCH, run_id="rid", harness_runner=fake)
+    wd = result["logs"]["workdir"]
+    assert wd is not None
+    created = Path(wd)
+    assert created.is_dir()
+    assert created.name.startswith("swebench-eval-iid-")
+    assert created != tmp_path  # not the caller's directory
+    assert result["logs"]["predictions"] == str(created / "predictions.jsonl")
+    assert (created / "predictions.jsonl").is_file()
+    shutil.rmtree(wd)  # the caller owns the cleanup — the contract under test
+
+
+def test_preexisting_report_is_unlinked_and_not_trusted(tmp_path):
+    """Stale-report protection: the harness's own exclude_completed treats a
+    pre-existing per-run report.json as 'already run' and silently skips
+    the instance — a re-used (workdir, run_id) pair must not return the
+    previous run's verdict for a patch that was never evaluated. The fake
+    harness 'skips' the instance like the real one would (writes nothing
+    new) → the result must be a typed no-report triage, not the stale
+    verdict."""
+    run_dir = tmp_path / "logs" / "run_evaluation" / "rid" / "devin" / "iid"
+    run_dir.mkdir(parents=True)
+    stale = run_dir / "report.json"
+    stale.write_text(json.dumps({"iid": {"resolved": True}}), encoding="utf-8")
+    fake = FakeHarness()  # returncode 0, no tree — the instance was "skipped"
+    with pytest.raises(ev.HarnessFailedError):
+        ev.evaluate("iid", _WELLFORMED_PATCH, workdir=tmp_path, run_id="rid", harness_runner=fake)
+    assert not stale.exists()  # the pre-existing report was removed before the spawn
+
+
+def test_stale_report_surviving_unlink_failure_is_not_trusted(tmp_path, monkeypatch):
+    """Stale-report protection, unlink-failure fallback: if the pre-existing
+    report cannot be removed (permissions), the pre-run mtime is recorded and
+    a post-run report that was not updated is a typed stale-report failure
+    (the harness's exclude_completed would have skipped the instance)."""
+    run_dir = tmp_path / "logs" / "run_evaluation" / "rid" / "devin" / "iid"
+    run_dir.mkdir(parents=True)
+    stale = run_dir / "report.json"
+    stale.write_text(json.dumps({"iid": {"resolved": True}}), encoding="utf-8")
+    monkeypatch.setattr(
+        Path, "unlink",
+        lambda self: (_ for _ in ()).throw(PermissionError("locked")),
+    )
+    # the fake harness "skips" the instance (writes nothing new) — the stale
+    # report survives the failed unlink with its pre-run mtime.
+    fake = FakeHarness()
+    with pytest.raises(ev.HarnessFailedError) as e:
+        ev.evaluate("iid", _WELLFORMED_PATCH, workdir=tmp_path, run_id="rid", harness_runner=fake)
+    assert "stale" in e.value.message.lower()
+
+
+def test_overall_timeout_flows_to_the_runner(tmp_path):
+    """The optional outer watchdog (the project's hang policy — the harness
+    -t bounds only the in-container test exec) flows through the runner
+    seam to the default subprocess."""
+    fake = FakeHarness(tree=_report_tree("rid", "devin", "iid", resolved=False))
+    ev.evaluate(
+        "iid", _WELLFORMED_PATCH, workdir=tmp_path, run_id="rid",
+        overall_timeout=120.5, harness_runner=fake,
+    )
+    _, _, overall_timeout = fake.calls[0]
+    assert overall_timeout == 120.5
 
 
 def test_non_object_report_is_harness_failed(tmp_path):
@@ -584,12 +876,21 @@ def test_non_utf8_report_is_harness_failed(tmp_path):
         ("", _WELLFORMED_PATCH, None, "devin", 1800),  # empty id
         (None, _WELLFORMED_PATCH, None, "devin", 1800),  # non-str id
         (42, _WELLFORMED_PATCH, None, "devin", 1800),  # non-str id
+        ("a/b", _WELLFORMED_PATCH, None, "devin", 1800),  # instance_id slash (charset)
+        ("../x", _WELLFORMED_PATCH, None, "devin", 1800),  # instance_id traversal
+        ("a\tb", _WELLFORMED_PATCH, None, "devin", 1800),  # instance_id tab (charset)
+        ("a b", _WELLFORMED_PATCH, None, "devin", 1800),  # instance_id space (charset)
+        ("a\x00b", _WELLFORMED_PATCH, None, "devin", 1800),  # instance_id NUL (charset)
+        (".lead", _WELLFORMED_PATCH, None, "devin", 1800),  # instance_id leading dot (charset)
         ("iid", 123, None, "devin", 1800),  # non-str patch (int)
         ("iid", b"a patch", None, "devin", 1800),  # non-str patch (bytes)
         ("iid", {"model_patch": "x"}, None, "devin", 1800),  # non-str patch (dict)
         ("iid", _WELLFORMED_PATCH, "has space", "devin", 1800),  # run_id whitespace
         ("iid", _WELLFORMED_PATCH, "", "devin", 1800),  # run_id empty
         ("iid", _WELLFORMED_PATCH, None, "", 1800),  # empty model name
+        ("iid", _WELLFORMED_PATCH, None, "..", 1800),  # model name log-path traversal
+        ("iid", _WELLFORMED_PATCH, None, ".", 1800),  # model name log-path traversal
+        ("iid", _WELLFORMED_PATCH, None, "a\x00b", 1800),  # model name NUL
         ("iid", _WELLFORMED_PATCH, None, "devin", 0),  # timeout 0
         ("iid", _WELLFORMED_PATCH, None, "devin", -5),  # timeout negative
         ("iid", _WELLFORMED_PATCH, None, "devin", "1800"),  # timeout str
@@ -617,21 +918,30 @@ def test_input_validation_matrix(
             harness_runner=fake,
         )
     assert fake.calls == []  # typed before any side effect
+    assert not (tmp_path / "predictions.jsonl").exists()  # zero FS side effects
 
 
 @pytest.mark.parametrize(
-    ("dataset", "split", "workdir", "python", "harness_runner"),
+    ("dataset", "split", "workdir", "python", "harness_runner", "overall_timeout"),
     [
-        ("", "test", None, None, None),  # empty dataset
-        (None, "test", None, None, None),  # non-str dataset
-        ("SWE-bench/SWE-bench_Verified", "", None, None, None),  # empty split
-        ("SWE-bench/SWE-bench_Verified", 42, None, None, None),  # non-str split
-        ("SWE-bench/SWE-bench_Verified", "test", 42, None, None),  # non-path workdir
-        ("SWE-bench/SWE-bench_Verified", "test", None, 42, None),  # non-str python
-        ("SWE-bench/SWE-bench_Verified", "test", None, None, "not-callable"),  # non-callable runner
+        ("", "test", None, None, None, None),  # empty dataset
+        (None, "test", None, None, None, None),  # non-str dataset
+        ("SWE-bench/SWE-bench_Verified", "", None, None, None, None),  # empty split
+        ("SWE-bench/SWE-bench_Verified", 42, None, None, None, None),  # non-str split
+        ("SWE-bench/SWE-bench_Verified", "test", 42, None, None, None),  # non-path workdir
+        ("SWE-bench/SWE-bench_Verified", "test", "", None, None, None),  # empty workdir
+        ("SWE-bench/SWE-bench_Verified", "test", None, "", None, None),  # empty python
+        ("SWE-bench/SWE-bench_Verified", "test", None, 42, None, None),  # non-str python
+        ("SWE-bench/SWE-bench_Verified", "test", None, None, "not-callable", None),  # non-callable runner
+        ("SWE-bench/SWE-bench_Verified", "test", None, None, None, 0),  # overall_timeout 0
+        ("SWE-bench/SWE-bench_Verified", "test", None, None, None, -5),  # overall_timeout negative
+        ("SWE-bench/SWE-bench_Verified", "test", None, None, None, "600"),  # overall_timeout str
+        ("SWE-bench/SWE-bench_Verified", "test", None, None, None, True),  # overall_timeout bool
     ],
 )
-def test_extra_input_validation_matrix(dataset, split, workdir, python, harness_runner, tmp_path):
+def test_extra_input_validation_matrix(
+    dataset, split, workdir, python, harness_runner, overall_timeout, tmp_path
+):
     """The remaining call inputs are validated typed too — the same
     'never a raw TypeError' contract as the primary matrix."""
     fake = FakeHarness()
@@ -642,10 +952,12 @@ def test_extra_input_validation_matrix(dataset, split, workdir, python, harness_
             dataset=dataset,
             split=split,
             workdir=workdir if workdir is not None else tmp_path,
+            overall_timeout=overall_timeout,
             python=python,
             harness_runner=harness_runner if harness_runner is not None else fake,
         )
     assert fake.calls == []  # typed before any side effect
+    assert not (tmp_path / "predictions.jsonl").exists()  # zero FS side effects
 
 
 # ---------------------------------------------------------------------------
@@ -665,7 +977,8 @@ def test_cli_success_prints_json_on_stdout(tmp_path, capsys):
     fixed = {
         "resolved": True,
         "logs": {"instance": None, "test_output": None, "report": None,
-                 "final_report": None, "container": None, "empty_patch": False},
+                 "final_report": None, "container": None, "workdir": None,
+                 "run_id": None, "predictions": None, "empty_patch": False},
     }
     seen = {}
 
@@ -674,13 +987,16 @@ def test_cli_success_prints_json_on_stdout(tmp_path, capsys):
         return fixed
 
     code = ev.main(
-        ["--instance-id", "iid", "--patch-file", str(patch_file)], evaluate_fn=fake_evaluate
+        ["--instance-id", "iid", "--patch-file", str(patch_file),
+         "--overall-timeout", "600"],
+        evaluate_fn=fake_evaluate,
     )
     assert code == 0
     out = json.loads(capsys.readouterr().out)
     assert out == fixed
     assert seen["args"][0] == "iid"
     assert seen["args"][1] == _WELLFORMED_PATCH
+    assert seen["args"][2]["overall_timeout"] == 600.0  # the flag flows through
 
 
 def test_cli_missing_patch_file_is_exit_2(tmp_path, capsys):
@@ -763,8 +1079,9 @@ def _truncated_gold_patch() -> str:
     """The gold patch cut mid-hunk: the hunk header declares 9 new-side
     lines, the truncation leaves 5 — a structurally well-formed truncation
     (both file headers intact) that only the harness's git-apply chain can
-    reject. (Deterministic: 13 lines total, the last 3 — the hunk tail —
-    are cut.)"""
+    reject. (Deterministic: 13 lines total; ``lines[:9]`` keeps 9, so the
+    last 4 — the `+` added line + 3 context lines — are cut; the remaining
+    5 = 3 context + 2 added.)"""
     lines = GOLD_PATCH_FLASK_5014.splitlines(keepends=True)
     assert len(lines) == 13, "the embedded gold patch changed — re-pin the truncation"
     return "".join(lines[:9])
@@ -787,6 +1104,8 @@ _DOCKER_SKIP = pytest.mark.skipif(
 
 
 @_DOCKER_SKIP
+@pytest.mark.timeout(2700)  # the integration tests' watchdog: a wedged Docker
+# pull must fail the test, not hang until the job-level timeout (CI)
 def test_integration_positive_control(tmp_path):
     """AC4 positive control — the known-resolved gold patch of the published
     Verified run resolves (public image, zero quota). Also the AC2/AC4
@@ -817,6 +1136,7 @@ def test_integration_positive_control(tmp_path):
 
 
 @_DOCKER_SKIP
+@pytest.mark.timeout(2700)  # the integration tests' watchdog (see above)
 def test_integration_corruption_guard_truncated_gold_patch(tmp_path):
     """AC4 corruption guard, full harness: the gold patch truncated mid-hunk
     → a clean typed error (the harness's own git-apply chain fails and
