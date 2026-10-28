@@ -110,17 +110,24 @@ Estimate: M (3 pts).
 3. **Terminal-status exclusion** (the issue's explicit test case):
    instances whose *final* status is in `RETRY_STATUSES` are **absent
    from the pass@1 numerator and denominator** (undecided), present in
-   the failure taxonomy, and present in `all_preds.jsonl` with
-   `model_patch: ""` (fact 5 — the harness's own empty-patch semantics
-   keeps them out of `resolved_ids`).
+   the failure taxonomy, and present in `all_preds.jsonl` — with
+   `model_patch: ""` when no patch is referenced / exists (fact 5 — the
+   harness's own empty-patch semantics keeps them out of
+   `resolved_ids`); when the line references an *existing* `patch.diff`,
+   that content is emitted regardless of status (the agent's work is
+   preserved — on a resume re-evaluation, that is exactly the patch
+   that will be graded).
 4. **`all_preds.jsonl`** (AC4): one line **per deduped instance** (all
    8 final statuses, incl. pending retry-class), **sorted by
    `instance_id`** (deterministic; byte-stable across regenerations),
    exactly the harness field set (fact 5). `model_patch` = the full
    contents (UTF-8) of the referenced `patch.diff` when the reference is
    present and the file exists (AC5 guarantees existence on the
-   generate path); `""` otherwise (no reference, or a status that
-   produced no patch). `model_name_or_path` = meta-file
+   generate path), else ``""`` (no reference / no file — the harness's
+   own empty-patch semantics keeps it out of ``resolved_ids``); a
+   referenced, existing patch is emitted for *any* status (the agent's
+   work is preserved for a resume re-evaluation). `model_name_or_path`
+   = meta-file
    `model_name_or_path` → meta-file `model` → `"devin"` (the WP4
    `DEFAULT_MODEL_NAME`).
 5. **`trajs/<instance_id>.jsonl`** (AC4): for each deduped instance with
@@ -179,9 +186,10 @@ Estimate: M (3 pts).
    sessions used, the dropped-tail note when `load_checkpoint` dropped
    one), a **Per-repo pass@1** table (sorted by repo key; `n/a` for
    zero-terminal repos), the **Failure taxonomy** table (all 8 statuses,
-   zeros included, sorted in the issue's listed order: `resolved`,
-   `failed_test`, `timeout`, `no_patch`, `agent_error`,
-   `quota_limited`, `eval_error`, `preflight_failed`) + the batch-marker
+   zeros included, sorted in the issue's listed order — `timeout`,
+   `no_patch`, `quota_limited`, `agent_error`, `resolved`,
+   `failed_test`, `preflight_failed`, `eval_error` (issue #18 AC2;
+   PLAN.md §5 WP5 agrees) + the batch-marker
    count, the **Methodology** block (every AC3 field, one per line), and
    an **Artifacts** section (all_preds line count, trajs file count,
    cross-check status `PASS` + the per-check detail). Deterministic
@@ -242,14 +250,17 @@ by the test — every expected number is asserted **exactly**:
 * **F2 resume-dedup** — the `flask-5015` pair (retry-class line followed
   by the terminal line → final = `failed_test`, *last line wins* —
   asserted including a line whose later `ts` is *older* than the
-  superseded line's, pinning file-order authority); a second pair
-  `eval_error → resolved`; batch-marker lines never appear as instance
+  superseded line's, pinning file-order authority); batch-marker lines
+  never appear as instance
   records (and cannot shadow an `i0`-style instance).
 * **F3 terminal-status exclusion (AC1/AC6)** — the four
   retry-class finals (`astropy-12907`, `sympy-123`,
   `scikit-learn-99`, `matplotlib-2870`) are in the taxonomy but
   **absent from the pass@1 denominator** (the 6, not 10); they are in
-  `all_preds.jsonl` with `model_patch: ""` (fact 5).
+  `all_preds.jsonl` with `model_patch: ""` (no patch referenced in the
+  fixture — fact 5; a referenced, existing patch is emitted regardless
+  of status — `test_all_preds_preserves_referenced_patch_for_retry_
+  class_final`).
 * **F4 artifact cross-check (AC5)** — positive: all referenced files
   exist → `PASS`, the generate path completes; negative (each a typed
   `ArtifactCheckError`, exit 3): a referenced file missing; a

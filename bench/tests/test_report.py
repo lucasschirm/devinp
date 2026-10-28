@@ -24,6 +24,19 @@ built with **exact expected numbers** (issue #18 "Testable by"):
 * F7 — determinism (byte-stable) + the torn-EOF drop (noted, not
   fatal) + the mid-file corruption (fail-loud);
 * F8 — the CLI exit-code contract (0 / 2 / 3 / 4) via subprocess.
+* F9 — the schema-boundary contract (the review round's pins): the
+  taxonomy order is exactly the issue's listed order; an unreadable
+  run JSONL is a typed `InvalidInputError` (exit 2); a non-finite
+  `ts` fails loud (exit 4); `meta.artifacts_dir` is validated (a
+  non-string fails loud; a relative one resolves against the run
+  JSONL's directory, never the cwd); a malformed `meta` (a non-object
+  meta / a non-string reference) is a *protocol* error at **any** line
+  position (exit 4 — uniform in file position, never a collected
+  exit-3 finding); an `instance_id` outside the SWE-bench id charset
+  (a `../..` traversal) fails loud before any artifact is written;
+  a retry-class final with an existing `patch_diff` reference emits
+  the patch content in `all_preds.jsonl` (the agent's work is
+  preserved for a resume re-evaluation).
 
 Acceptance mapping (issue #18): AC1 → ``test_pass1_overall_and_per_
 repo_exactly``, ``test_repo_of_mapping``, ``test_terminal_status_
@@ -704,6 +717,153 @@ def test_unknown_status_fails_loud(tmp_path):
     ])
     with pytest.raises(ReportProtocolError):
         report.generate(str(jsonl), str(out))
+
+
+# ---------------------------------------------------------------------------
+# F9 — the schema-boundary contract (review round pins)
+# ---------------------------------------------------------------------------
+
+
+def test_taxonomy_order_is_the_issue_order():
+    """AC2: the table order is the issue's listed order (issue #18 /
+    PLAN.md §5 WP5) — not a re-sorted variant."""
+    assert list(report.TAXONOMY_ORDER) == [
+        "timeout",
+        "no_patch",
+        "quota_limited",
+        "agent_error",
+        "resolved",
+        "failed_test",
+        "preflight_failed",
+        "eval_error",
+    ]
+
+
+def test_taxonomy_table_renders_in_the_issue_order(tmp_path):
+    jsonl, out = _build_fixture(tmp_path)
+    report.generate(str(jsonl), str(out))
+    md = (Path(out) / "report.md").read_text(encoding="utf-8")
+    positions = [md.index(f"| {s} |") for s in report.TAXONOMY_ORDER]
+    assert positions == sorted(positions)
+
+
+def test_unreadable_jsonl_is_invalid_input(tmp_path):
+    """A *directory* as ``--jsonl`` (IsADirectoryError) is a typed
+    ``InvalidInputError`` (exit 2), not a raw traceback."""
+    d = tmp_path / "adir"
+    d.mkdir()
+    with pytest.raises(InvalidInputError):
+        report.generate(str(d), str(tmp_path / "out"))
+
+
+def test_nonfinite_ts_fails_loud(tmp_path):
+    """``ts: 1e999`` (``json.loads`` → ``inf``) fails loud (exit 4)
+    rather than crashing ``datetime.fromtimestamp`` with an uncaught
+    ``OverflowError``."""
+    p = tmp_path / "run.jsonl"
+    with open(p, "w", encoding="utf-8") as f:
+        f.write('{"instance_id": "a__b-1", "status": "resolved", '
+                '"meta": {}, "ts": 1e999}\n')
+        f.write('{"instance_id": "a__b-2", "status": "timeout", '
+                '"meta": {}, "ts": 1000.0}\n')
+    with pytest.raises(ReportProtocolError):
+        report.generate(str(p), str(tmp_path / "out"))
+
+
+def test_nan_ts_fails_loud(tmp_path):
+    p = tmp_path / "run.jsonl"
+    with open(p, "w", encoding="utf-8") as f:
+        f.write('{"instance_id": "a__b-1", "status": "resolved", '
+                '"meta": {}, "ts": NaN}\n')
+        f.write('{"instance_id": "a__b-2", "status": "timeout", '
+                '"meta": {}, "ts": 1000.0}\n')
+    with pytest.raises(ReportProtocolError):
+        report.generate(str(p), str(tmp_path / "out"))
+
+
+def test_artifacts_dir_nonstring_fails_loud(tmp_path):
+    lines = [
+        ("a__b-1", "resolved", {"artifacts_dir": 5, "patch_diff": "p1.diff"}),
+    ]
+    jsonl, out = _build_fixture(tmp_path, lines=lines,
+                               artifacts={"p1.diff": P1})
+    with pytest.raises(ReportProtocolError):
+        report.generate(str(jsonl), str(out))
+
+
+def test_relative_artifacts_dir_resolves_against_jsonl_dir(tmp_path):
+    """A relative ``artifacts_dir`` resolves against the run JSONL's
+    directory — never the process cwd (which a pre-fix run would have
+    silently used)."""
+    lines = [
+        ("pallets__flask-5014", "resolved",
+         {"artifacts_dir": "art", "patch_diff": "p1.diff"}),
+    ]
+    jsonl, out = _build_fixture(tmp_path, lines=lines,
+                               artifacts={"art/p1.diff": P1})
+    res = report.generate(str(jsonl), str(out))
+    assert res["artifacts"]["crosscheck"] == "PASS"
+    lines_out = _read_jsonl(Path(out) / "all_preds.jsonl")
+    assert lines_out[0]["model_patch"] == P1
+
+
+def test_instance_id_traversal_fails_loud_before_any_write(tmp_path):
+    """An ``instance_id`` outside the SWE-bench id charset (a
+    ``../../escape``) fails loud (exit 4) in the dedup — before any
+    artifact is written, so a trajectory reference on that line can
+    never write outside the out dir."""
+    lines = [
+        ("../../escape", "resolved", {"trajectory": "t1.jsonl"}),
+        ("a__b-1", "resolved", {}),
+    ]
+    jsonl, out = _build_fixture(tmp_path, lines=lines,
+                               artifacts={"t1.jsonl": T1})
+    with pytest.raises(ReportProtocolError) as e:
+        report.generate(str(jsonl), str(out))
+    assert "charset" in str(e.value)
+    # nothing was written (the failure precedes the write)
+    assert not (tmp_path / "escape.jsonl").exists()
+    assert not (tmp_path / "out").exists()
+
+
+def test_malformed_meta_is_protocol_error_on_a_superseded_line(tmp_path):
+    """A non-string reference on a *superseded* line is a protocol
+    error (exit 4) — uniform in file position (pre-fix it was a
+    collected exit-3 finding on a superseded line but an exit-4 raise
+    on a final line)."""
+    lines = [
+        ("a__b-1", "quota_limited", {"patch_diff": 5}),  # malformed
+        ("a__b-1", "resolved", {"patch_diff": "p1.diff"}),
+    ]
+    jsonl, out = _build_fixture(tmp_path, lines=lines,
+                               artifacts={"p1.diff": P1})
+    with pytest.raises(ReportProtocolError):
+        report.generate(str(jsonl), str(out))
+
+
+def test_nonobject_meta_is_protocol_error(tmp_path):
+    lines = [
+        ("a__b-1", "resolved", 5),  # meta is not an object
+    ]
+    jsonl, out = _build_fixture(tmp_path, lines=lines)
+    with pytest.raises(ReportProtocolError):
+        report.generate(str(jsonl), str(out))
+
+
+def test_all_preds_preserves_referenced_patch_for_retry_class_final(tmp_path):
+    """An ``eval_error`` final whose line references an *existing*
+    ``patch.diff`` emits the patch content in ``all_preds.jsonl``
+    (the agent's work is preserved — on a resume re-evaluation that is
+    exactly the patch that will be graded); only a *missing*
+    reference/file yields the harness empty-patch ``""``."""
+    lines = [
+        ("a__b-1", "eval_error", {"patch_diff": "p1.diff"}),
+    ]
+    jsonl, out = _build_fixture(tmp_path, lines=lines,
+                               artifacts={"p1.diff": P1})
+    report.generate(str(jsonl), str(out))
+    out_lines = _read_jsonl(Path(out) / "all_preds.jsonl")
+    assert out_lines[0]["model_patch"] == P1
 
 
 def test_missing_jsonl_is_invalid_input(tmp_path):

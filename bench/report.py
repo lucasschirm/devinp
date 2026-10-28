@@ -94,7 +94,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from typing import Any, Final, Sequence
@@ -129,17 +131,30 @@ __all__ = [
     "main",
 ]
 
-# The failure taxonomy in the issue's listed order (AC2) — zeros
+# The failure taxonomy in the issue's listed order (AC2 — issue #18:
+# "timeout, no_patch, quota_limited, agent_error, resolved, failed_test,
+# preflight_failed, eval_error"; PLAN.md §5 WP5 agrees) — zeros
 # included, so the table is complete for a partial (pilot) run.
 TAXONOMY_ORDER: Final[tuple] = (
-    "resolved",
-    "failed_test",
     "timeout",
     "no_patch",
-    "agent_error",
     "quota_limited",
-    "eval_error",
+    "agent_error",
+    "resolved",
+    "failed_test",
     "preflight_failed",
+    "eval_error",
+)
+
+#: The ``instance_id`` character set (mirrors ``evaluate.py``
+#: ``_charset_ok`` — the same id seeds a container name there and a
+#: ``trajs/<instance_id>.jsonl`` filename here): a str of the Docker
+#: container-name charset ``[A-Za-z0-9._-]`` starting alphanumeric,
+#: without ``..`` (a traversal in the id would write the trajectory
+#: copy outside the out dir; real SWE-bench ids ``owner__repo-N``
+#: always satisfy it).
+_IID_CHARSET: Final[re.Pattern] = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._-]*\Z"
 )
 
 #: The pass@1 *outcome* set — the legitimate agent outcomes (PLAN §2.5):
@@ -207,11 +222,14 @@ def load_jsonl(path: str) -> "tuple[list, bool]":
     and its torn-EOF rule): a torn **last** line is dropped, not fatal;
     a corrupted **mid-file** line raises (→ :class:
     `ReportProtocolError`, fail-loud); a missing file is a fresh run (no
-    records)."""
+    records); an existing-but-unreadable file (permissions / a directory
+    path) is a typed :class:`InvalidInputError`, not a raw traceback."""
     try:
         return load_checkpoint(path)
     except RunnerProtocolError as e:
         raise ReportProtocolError(str(e)) from e
+    except OSError as e:
+        raise InvalidInputError(f"run JSONL unreadable: {e!r}") from e
 
 
 def dedupe(records: "Sequence[dict]") -> "tuple[dict, list]":
@@ -222,7 +240,11 @@ def dedupe(records: "Sequence[dict]") -> "tuple[dict, list]":
     ``finals`` maps ``instance_id → record``; ``markers`` is the list of
     ``instance_id: null`` batch-level lines (they are counted in the
     taxonomy section — never as instance records, and they can never
-    shadow or be shadowed by an instance line)."""
+    shadow or be shadowed by an instance line). An ``instance_id`` that
+    is not a non-empty str of the :data:`_IID_CHARSET` character set
+    (no ``..``) is a schema violation (fail-loud — the id becomes a
+    ``trajs/<instance_id>.jsonl`` filename; a traversal would write
+    outside the out dir)."""
     finals: "dict[str, dict]" = {}
     markers: "list[dict]" = []
     for rec in records:
@@ -230,11 +252,17 @@ def dedupe(records: "Sequence[dict]") -> "tuple[dict, list]":
         iid = rec.get("instance_id")
         if iid is None:
             markers.append(rec)
-        elif isinstance(iid, str) and iid:
+        elif (
+            isinstance(iid, str)
+            and iid
+            and ".." not in iid
+            and _IID_CHARSET.fullmatch(iid) is not None
+        ):
             finals[iid] = rec  # the last line wins
         else:
             raise ReportProtocolError(
-                f"instance_id must be a non-empty string or null "
+                "instance_id must be a non-empty string of the SWE-bench "
+                f"id charset [A-Za-z0-9][A-Za-z0-9._-]* without '..' "
                 f"(got {iid!r})"
             )
     return finals, markers
@@ -258,11 +286,17 @@ def repo_of(instance_id: str) -> str:
 
 
 def _parse_ts(value: object) -> float:
-    """The ``ts`` field is a float epoch (WP3b ``JsonlCheckpoint``) —
-    a non-numeric ``ts`` is a schema violation (fail-loud)."""
+    """The ``ts`` field is a float epoch (WP3b ``JsonlCheckpoint``) — a
+    non-numeric or **non-finite** ``ts`` is a schema violation
+    (fail-loud: ``json.loads`` accepts ``1e999`` → ``inf``, which would
+    otherwise crash ``datetime.fromtimestamp`` with an uncaught
+    ``OverflowError``)."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ReportProtocolError(f"ts must be a number (got {value!r})")
-    return float(value)
+    v = float(value)
+    if not math.isfinite(v):
+        raise ReportProtocolError(f"ts must be a finite number (got {value!r})")
+    return v
 
 
 def date_range(records: "Sequence[dict]") -> "tuple[str, str] | None":
@@ -367,16 +401,27 @@ def taxonomy(finals: "dict[str, dict]", markers: "list[dict]") -> "dict":
 
 
 def _ref_path(rec: "dict", base_dir: "str | os.PathLike") -> "dict[str, str | None]":
-    """The instance's referenced artifact paths, resolved: relative
-    references resolve against ``meta.artifacts_dir`` when present,
-    else against ``base_dir`` (the run JSONL's directory)."""
+    """The instance's referenced artifact paths, resolved: a
+    non-``null`` ``meta.artifacts_dir`` must be a non-empty string
+    (fail-loud), and a **relative** ``artifacts_dir`` resolves against
+    ``base_dir`` (the run JSONL's directory) — never the process cwd;
+    relative references then resolve against that base (absent
+    ``artifacts_dir`` → directly against ``base_dir``)."""
     meta = rec.get("meta") or {}
     if not isinstance(meta, dict):
         raise ReportProtocolError(
             f"meta must be an object (got {type(meta).__name__})"
         )
-    base = meta.get("artifacts_dir")
-    base = base if base else str(base_dir)
+    ad = meta.get("artifacts_dir")
+    if ad is None:
+        base = str(base_dir)
+    elif isinstance(ad, str) and ad:
+        base = ad if os.path.isabs(ad) else os.path.join(str(base_dir), ad)
+    else:
+        raise ReportProtocolError(
+            f"meta.artifacts_dir must be a non-empty string or null "
+            f"(got {ad!r})"
+        )
     out: "dict[str, str | None]" = {}
     for key in _REFERENCE_KEYS:
         val = meta.get(key)
@@ -398,8 +443,15 @@ def crosscheck(records: "Sequence[dict]", base_dir: "str | os.PathLike") -> "lis
     superseded line's artifacts are part of the run record too, WP2
     artifact atomicity), plus the semantic rule: a **``resolved`` /
     ``failed_test`` final status must reference an existing
-    ``patch.diff``** (a graded verdict requires a patch). Returns the
-    violation list (empty = PASS)."""
+    ``patch.diff``** (a graded verdict requires a patch). A
+    **non-object ``meta`` or a non-string reference** is a *schema*
+    violation — it raises :class:`ReportProtocolError` (fail-loud,
+    exit 4) at **any** line position (a malformed record is not a
+    collectable artifact finding — the classification is uniform in
+    file position); the *collectable* findings (exit 3) are the
+    data-level ones: a referenced file that is missing, a graded
+    verdict without an existing ``patch.diff``, and (R2) the content
+    mismatch. Returns the violation list (empty = PASS)."""
     violations: "list[str]" = []
     finals, _ = dedupe(records)
     graded = {
@@ -407,18 +459,13 @@ def crosscheck(records: "Sequence[dict]", base_dir: "str | os.PathLike") -> "lis
         if rec["status"] in ("resolved", "failed_test")
     }
     for i, rec in enumerate(records):
-        meta = rec.get("meta") or {}
-        if not isinstance(meta, dict):
-            violations.append(
+        meta = rec.get("meta")
+        if meta is not None and not isinstance(meta, dict):
+            raise ReportProtocolError(
                 f"line {i + 1}: meta must be an object "
                 f"(got {type(meta).__name__})"
             )
-            continue
-        try:
-            refs = _ref_path(rec, base_dir)
-        except ReportProtocolError as e:
-            violations.append(f"line {i + 1}: {e}")
-            continue
+        refs = _ref_path(rec, base_dir)
         iid = rec.get("instance_id")
         label = iid if iid is not None else "<batch>"
         for key in _REFERENCE_KEYS:
