@@ -114,9 +114,11 @@ repository `lucasschirm/devinp`, workflow `publish.yml`.
 
 `bench/` is a separate Python package, so `publish.yml` ignores `bench/**`
 (`paths-ignore`) — bench-only pushes never trigger a release. CI
-(`.github/workflows/ci.yml`, `pack` job → `scripts/check-pack.js`) additionally
-asserts on every push/PR that `npm pack` contents exclude `bench/` and still
-ship `bin/` + `data/`.
+(`.github/workflows/ci.yml`, `pack` job → `scripts/check-pack.js`) asserts on
+pushes to `main` and on every PR that `npm pack` contents exclude `bench/`
+and still ship `bin/` + `data/`. The release path itself is gated on the
+same check — `publish.yml` runs it before the version bump and
+`npm publish`, so a bad tarball can never be published.
 
 ## License
 

@@ -45,6 +45,10 @@ jobs:
       - run: npm test
       - run: npm run build # bundle src → bin/ (also runs via prepack)
 
+      # Gate the release on the tarball check: never publish a tarball that
+      # ships bench/ or drops a built bin//data/ file (bench/PLAN.md §8.1).
+      - run: node scripts/check-pack.js
+
       - name: Bump patch version
         run: |
           git config user.name "github-actions[bot]"
