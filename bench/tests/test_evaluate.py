@@ -1013,14 +1013,26 @@ def test_runner_spawn_failure_is_typed_not_raw(tmp_path):
 def test_process_object_without_returncode_is_typed(tmp_path):
     """A process object without a usable returncode (a malformed runner
     result) is a typed HarnessFailedError — proc.returncode is never
-    accessed bare."""
+    accessed bare. Like the watchdog and runner-failure legs, this arm
+    re-reads the log paths at error time: a runner that wrote artifacts
+    before returning the malformed process must surface them."""
     class NoReturncode:
         stdout = ""
         stderr = ""
 
-    with pytest.raises(ev.HarnessFailedError):
+    def boom(argv, cwd, overall_timeout=None):
+        base = Path(cwd) / "logs" / "run_evaluation" / "rid" / "devin" / "iid"
+        base.mkdir(parents=True, exist_ok=True)
+        (base / "run_instance.log").write_text("harness started...\n", encoding="utf-8")
+        return NoReturncode()
+
+    with pytest.raises(ev.HarnessFailedError) as e:
         ev.evaluate("iid", _WELLFORMED_PATCH, workdir=tmp_path, run_id="rid",
-                    harness_runner=lambda a, c, t=None: NoReturncode())
+                    harness_runner=boom)
+    assert e.value.log_paths["instance"]  # re-read post-spawn — the runner-written log
+    assert e.value.log_paths["instance"] == str(
+        (tmp_path / "logs" / "run_evaluation" / "rid" / "devin" / "iid" / "run_instance.log").resolve()
+    )
 
 
 def test_pre_spawn_filesystem_failure_is_typed(tmp_path):

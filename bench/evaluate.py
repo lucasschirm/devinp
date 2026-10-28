@@ -1004,7 +1004,7 @@ def _triage_no_report(
     log_paths: dict[str, Optional[str]],
     stdout: Any,
     stderr: Any,
-    pre_log_mtimes: dict[str, "int | bool"],
+    pre_log_mtimes: dict[str, int | bool],
     timeout: int,
     workdir: Optional[str] = None,
 ) -> EvaluationError:
@@ -1212,7 +1212,8 @@ def evaluate(
     from it) — a wedged dataset download, multi-GB image pull, or Docker
     daemon must not hang the sequential benchmark forever (the rest of the
     package uses bounded defaults for subprocess calls, e.g. ``runner.py``
-    ``timeout_s=30/15``); pass an explicit value to override. ``harness_runner`` is the test injection seam:
+    ``timeout_s=30/15``); pass an explicit value to override.
+    ``harness_runner`` is the test injection seam:
     a ``fn(argv, cwd, overall_timeout) -> CompletedProcess-like`` replacing
     the real subprocess (any failure it raises — or of the real spawn — is
     converted to a typed :class:`HarnessFailedError`, never a traceback).
@@ -1322,7 +1323,7 @@ def evaluate(
     # unreadable (freshness unverifiable → treated as stale — the safe
     # direction, since a wrong terminal verdict is worse than a retried
     # infra class).
-    pre_log_mtimes: dict[str, "int | bool"] = {}
+    pre_log_mtimes: dict[str, int | bool] = {}
     for _key in ("instance", "test_output"):
         _p = paths[_key]
         if _p.is_file():

@@ -319,7 +319,8 @@ contract — never a traceback with exit 1).
   project's hang policy: `-t` bounds only the *in-container* test exec;
   the HF dataset download, the image pull and the Docker daemon are not
   bound by `-t`, and a wedged one must not hang the sequential benchmark
-  — with `None`, the default, the watchdog is `timeout + 1800` s; pass an
+  — with `None`, the default, the watchdog is `timeout +
+  DEFAULT_OVERALL_TIMEOUT_MARGIN_S` s; pass an
   explicit value to override); pre-spawn filesystem work, a spawn failure
   and the watchdog firing (its typed error surfaces the
   possibly-still-running eval container name + the partial output, and
