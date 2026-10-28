@@ -614,6 +614,32 @@ def test_timeout_marker_in_wrong_file_is_not_terminal_timeout(tmp_path, marker_f
         ev.evaluate("iid", _WELLFORMED_PATCH, workdir=tmp_path, run_id="rid", harness_runner=fake)
 
 
+def test_bare_instance_log_timeout_substring_is_not_terminal(tmp_path):
+    """The instance-log timeout marker is anchored on the number + trailing
+    period: the harness echoes the applied patch's ``git diff`` (context
+    lines included) into run_instance.log, so a patch whose text merely
+    contains the bare substring "Test timed out after" (no number — e.g.
+    a docstring or comment) must not be triaged as the harness's own
+    timeout verdict when the run then exits 0 with no report (a swallowed
+    post-apply infra error) → the retryable infra class, never a
+    terminal EvaluationTimeoutError."""
+    fake = FakeHarness(
+        tree=lambda cwd: _build_tree(
+            cwd,
+            "rid",
+            "devin",
+            "iid",
+            instance_log=(
+                "Git diff before:\n"
+                "+    # Test timed out after the suite ran — see docs.\n"
+                "error: post-apply infra failure swallowed by the harness\n"
+            ),
+        )
+    )
+    with pytest.raises(ev.HarnessFailedError):
+        ev.evaluate("iid", _WELLFORMED_PATCH, workdir=tmp_path, run_id="rid", harness_runner=fake)
+
+
 def test_apply_fail_and_timeout_markers_corruption_wins(tmp_path):
     """Both markers present (apply-fail + the timeout message, both in the
     instance log): corruption wins — a corrupt patch is a terminal verdict
@@ -1021,10 +1047,35 @@ def test_pathlike_workdir_is_validated_like_a_str(tmp_path):
         assert fake2.calls == []  # typed before any side effect
 
 
+def test_symlink_loop_workdir_is_typed_not_raw(tmp_path):
+    """Path(workdir).resolve() raises RuntimeError ("Maximum symlink depth
+    exceeded") on a symlink loop — a pre-spawn filesystem condition. It
+    must be typed (HarnessFailedError), never a raw traceback escape:
+    the module's "typed, never a traceback escape" contract covers it.
+    (Platform probe: this Python's resolve() only raises on a loop on the
+    versions where CPython enforces the symlink-depth limit — skipped
+    elsewhere, where the pre-spawn clause is unreachable for a loop.)"""
+    loop_a, loop_b = tmp_path / "loop-a", tmp_path / "loop-b"
+    loop_a.symlink_to(loop_b)
+    loop_b.symlink_to(loop_a)
+    try:
+        loop_a.resolve()
+    except RuntimeError:
+        pass  # this Python raises on a loop — the contract is under test
+    except Exception:
+        pytest.skip("this Python's Path.resolve() raises a non-RuntimeError on a symlink loop")
+    else:
+        pytest.skip("this Python's Path.resolve() does not raise on a symlink loop")
+    fake = FakeHarness()
+    with pytest.raises(ev.HarnessFailedError) as e:
+        ev.evaluate("iid", _WELLFORMED_PATCH, workdir=loop_a, run_id="rid", harness_runner=fake)
+    assert "pre-spawn" in e.value.message.lower()
+    assert fake.calls == []  # typed before the spawn
+
+
 def test_overall_timeout_flows_to_the_runner(tmp_path):
-    """The optional outer watchdog (the project's hang policy — the harness
-    -t bounds only the in-container test exec) flows through the runner
-    seam to the default subprocess."""
+    """An explicit outer watchdog value flows through the runner seam to
+    the default subprocess unchanged."""
     fake = FakeHarness(tree=_report_tree("rid", "devin", "iid", resolved=False))
     ev.evaluate(
         "iid",
@@ -1036,6 +1087,47 @@ def test_overall_timeout_flows_to_the_runner(tmp_path):
     )
     _, _, overall_timeout = fake.calls[0]
     assert overall_timeout == 120.5
+
+
+def test_default_overall_watchdog_is_bounded_and_scales_with_timeout(tmp_path):
+    """overall_timeout=None (the default, including the CLI default) must
+    NOT leave the spawned harness unbounded: a wedged dataset download,
+    multi-GB image pull, or Docker daemon must not hang the sequential
+    benchmark forever (the rest of the package uses bounded defaults for
+    subprocess calls — runner.py timeout_s=30/15). The bounded default is
+    timeout + DEFAULT_OVERALL_TIMEOUT_MARGIN_S — it scales with the
+    in-container test cap the caller chose, so a raised -t cannot make the
+    watchdog fire before the test exec can finish."""
+    default_case = FakeHarness(
+        tree=_report_tree("rid", "devin", "iid", resolved=False)
+    )
+    ev.evaluate("iid", _WELLFORMED_PATCH, workdir=tmp_path, run_id="rid", harness_runner=default_case)
+    _, _, default_watchdog = default_case.calls[0]
+    assert default_watchdog == ev.DEFAULT_TIMEOUT_S + ev.DEFAULT_OVERALL_TIMEOUT_MARGIN_S
+
+    raised_case = FakeHarness(tree=_report_tree("rid", "devin", "iid", resolved=False))
+    ev.evaluate(
+        "iid",
+        _WELLFORMED_PATCH,
+        workdir=tmp_path,
+        run_id="rid",
+        timeout=600,
+        harness_runner=raised_case,
+    )
+    _, _, raised_watchdog = raised_case.calls[0]
+    assert raised_watchdog == 600 + ev.DEFAULT_OVERALL_TIMEOUT_MARGIN_S
+    # …and a *larger* explicit watchdog still flows through unchanged.
+    explicit = FakeHarness(tree=_report_tree("rid", "devin", "iid", resolved=False))
+    ev.evaluate(
+        "iid",
+        _WELLFORMED_PATCH,
+        workdir=tmp_path,
+        run_id="rid",
+        timeout=600,
+        overall_timeout=9999.0,
+        harness_runner=explicit,
+    )
+    assert explicit.calls[0][2] == 9999.0
 
 
 def test_non_object_report_is_harness_failed(tmp_path):

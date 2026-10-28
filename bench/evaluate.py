@@ -53,7 +53,10 @@ harness's own artifacts to resolve the outcome:
   final write, or the dataset eval-script's ``>>>>> Tests Timed Out`` marker
   (graded *inside* the test output — never written to ``run_instance.log``);
   in ``run_instance.log``: the harness's own ``Test timed out after <n>
-  seconds`` EvaluationError message → :class:`EvaluationTimeoutError`
+  seconds.`` EvaluationError message (anchored on the number + trailing
+  period — the harness echoes the applied patch's ``git diff`` into the
+  instance log, so a bare substring could be the patch's own text)
+  → :class:`EvaluationTimeoutError`
   (*terminal* in WP3 — hence the loose markers are anchored and
   file-specific: a docker-client/network line containing ``Timeout error:``
   in the instance log must not convert a retryable infra flake into a
@@ -225,6 +228,13 @@ DEFAULT_DATASET = "SWE-bench/SWE-bench_Verified"
 DEFAULT_SPLIT = "test"
 DEFAULT_MODEL_NAME = "devin"
 DEFAULT_TIMEOUT_S = 1800  # the harness's own per-instance test timeout (-t)
+# The margin the bounded-by-default outer watchdog adds on top of the
+# in-container test cap: the pre-test dataset download, image pull, and
+# container setup/cleanup window. The rest of the package uses bounded
+# defaults for subprocess calls (runner.py timeout_s=30/15); a wedged
+# dataset download, multi-GB image pull, or Docker daemon must not hang
+# the sequential benchmark forever.
+DEFAULT_OVERALL_TIMEOUT_MARGIN_S = 1800
 
 # Harness log layout — verified against the pinned swebench==5.0.2 source
 # (harness/constants/__init__.py: RUN_EVALUATION_LOG_DIR, LOG_REPORT,
@@ -245,8 +255,11 @@ _APPLY_PATCH_FAIL_MARKER = ">>>>> Patch Apply Failed"  # run_instance.log
 # hence tail-anchored), and ">>>>> Tests Timed Out" is the dataset
 # eval-script's timeout marker, which grading reads *inside* the test output
 # (grading.py:137) — it is never written to run_instance.log. The
-# instance-log marker is the harness's own "Test timed out after <n> seconds"
-# EvaluationError message via the logger. Markers are anchored and
+# instance-log marker is the harness's own "Test timed out after <n> seconds."
+# EvaluationError message via the logger (the traceback's last line) —
+# anchored on the number + trailing period: the harness echoes the applied
+# patch's ``git diff`` (context lines included) into run_instance.log, so a
+# bare substring could be the patch's own text. Markers are anchored and
 # file-specific because EvaluationTimeoutError is terminal in WP3 while
 # HarnessFailedError is the retried eval_error class — a loose substring in
 # the wrong file must not convert a retryable infra flake into a terminal
@@ -255,7 +268,7 @@ _TIMEOUT_MARKER_TEST_OUTPUT_TAIL = re.compile(
     r"Timeout error: \d+ seconds exceeded\.\s*$"
 )
 _TIMEOUT_MARKER_TEST_OUTPUT = ">>>>> Tests Timed Out"
-_TIMEOUT_MARKER_INSTANCE_LOG = "Test timed out after"
+_TIMEOUT_MARKER_INSTANCE_LOG = re.compile(r"Test timed out after \d+ seconds\.")
 
 # The shared name character-set check (instance_id / run_id): the Docker
 # container-name charset, starting alphanumeric, without ".." (they become
@@ -602,7 +615,7 @@ def _validate_inputs(
                 )
             try:
                 workdir_str = os.fsdecode(workdir)
-            except (OSError, ValueError, TypeError) as e:
+            except (OSError, ValueError, TypeError, RuntimeError) as e:
                 raise InvalidInputError(
                     f"workdir path-like is not usable: {e!r}"
                 ) from e
@@ -627,7 +640,8 @@ def _validate_inputs(
     ):
         raise InvalidInputError(
             "overall_timeout must be a positive finite number of seconds (or "
-            f"None for no outer watchdog), got {overall_timeout!r}"
+            f"None for the bounded default — timeout + "
+            f"{DEFAULT_OVERALL_TIMEOUT_MARGIN_S} s), got {overall_timeout!r}"
         )
     if python is not None:
         if not isinstance(python, str) or not python.strip() or "\x00" in python:
@@ -711,9 +725,10 @@ def _default_harness_runner(
     watchdog — the project's hang policy (a hung run is a failure, not a
     wait, ``runner.py``): the harness's own ``-t`` bounds only the
     *in-container* test exec; the HF dataset download, the multi-GB image
-    pull and the Docker daemon are not bound by ``-t``, so an unbounded
-    default would let one stuck instance stall the whole sequential
-    benchmark silently."""
+    pull and the Docker daemon are not bound by ``-t``. ``evaluate()``
+    always passes a bounded watchdog (its default is ``timeout + margin``)
+    so one stuck instance cannot stall the whole sequential benchmark
+    silently; a direct ``None`` here is a deliberate caller opt-out."""
     return subprocess.run(
         argv,
         cwd=cwd,
@@ -901,8 +916,11 @@ def _triage_no_report(
       ``>>>>> Tests Timed Out`` in test_output.txt (the dataset
       eval-script's timeout marker — graded inside the test output,
       ``grading.py:137``; never written to run_instance.log), or the
-      harness's ``Test timed out after <n> seconds`` EvaluationError message
-      in run_instance.log → :class:`EvaluationTimeoutError` (terminal in
+      harness's ``Test timed out after <n> seconds.`` EvaluationError
+      message in run_instance.log (anchored on the number + trailing
+      period — the harness echoes the applied patch's ``git diff`` into
+      the instance log, so a bare substring could be the patch's own text)
+      → :class:`EvaluationTimeoutError` (terminal in
       WP3 — hence the loose markers are anchored and file-specific: a
       docker-client/network line containing ``Timeout error:`` in the
       instance log must not convert a retryable infra flake into a terminal
@@ -938,7 +956,7 @@ def _triage_no_report(
         _TIMEOUT_MARKER_TEST_OUTPUT_TAIL.search(test_output) is not None
         or _TIMEOUT_MARKER_TEST_OUTPUT in test_output
     )
-    timeout_instance_log = _TIMEOUT_MARKER_INSTANCE_LOG in instance_log
+    timeout_instance_log = _TIMEOUT_MARKER_INSTANCE_LOG.search(instance_log) is not None
     if apply_fail and not _stale("instance", paths["instance"]):
         return PatchCorruptionError(
             "the harness's git-apply chain rejected model_patch "
@@ -1061,9 +1079,14 @@ def evaluate(
     unreachable. ``run_id`` defaults to a per-call unique id so the eval
     container name (``sweb.eval.<iid>.<run_id>``) is always distinct from
     the agent container's (``sweb.eval.<iid>``) — AC2. ``overall_timeout``
-    is the optional outer watchdog in seconds (the project's hang policy: a
-    hung run is a failure, not a wait — the harness's ``-t`` bounds only the
-    in-container test exec). ``harness_runner`` is the test injection seam:
+    is the outer watchdog in seconds (the project's hang policy: a hung run
+    is a failure, not a wait — the harness's ``-t`` bounds only the
+    in-container test exec). It is bounded by default: with None (the
+    default, including the CLI default) the watchdog is ``timeout + 1800``
+    s — a wedged dataset download, multi-GB image pull, or Docker daemon
+    must not hang the sequential benchmark forever (the rest of the package
+    uses bounded defaults for subprocess calls, e.g. ``runner.py``
+    ``timeout_s=30/15``); pass an explicit value to override. ``harness_runner`` is the test injection seam:
     a ``fn(argv, cwd, overall_timeout) -> CompletedProcess-like`` replacing
     the real subprocess (any failure it raises — or of the real spawn — is
     converted to a typed :class:`HarnessFailedError`, never a traceback).
@@ -1116,11 +1139,13 @@ def evaluate(
     try:
         workdir_abs = Path(workdir).resolve()
         paths = _instance_paths(workdir_abs, run_id, model_name_or_path, instance_id)
-    except (OSError, ValueError, TypeError) as e:
+    except (OSError, ValueError, TypeError, RuntimeError) as e:
         # OSError (ENOSPC / EACCES / ENAMETOOLONG), ValueError (a NUL byte
-        # in a str path, or a broken PathLike whose fspath() raises) and
-        # TypeError (a broken PathLike's fspath() returning a non-str) are
-        # all pre-spawn infra/refusal failures — typed, never raw.
+        # in a str path, or a broken PathLike whose fspath() raises),
+        # TypeError (a broken PathLike's fspath() returning a non-str) and
+        # RuntimeError (Path.resolve() on a symlink loop —
+        # "Maximum symlink depth exceeded") are all pre-spawn
+        # infra/refusal failures — typed, never raw.
         raise HarnessFailedError(
             f"pre-spawn filesystem failure resolving workdir ({workdir!r}): "
             f"{e!r}",
@@ -1204,6 +1229,17 @@ def evaluate(
         timeout,
         workdir_abs,
     )
+    # Bounded by default: the rest of the package uses bounded defaults for
+    # subprocess calls (runner.py timeout_s=30/15), and a wedged dataset
+    # download, multi-GB image pull, or Docker daemon must not hang the
+    # sequential benchmark forever. With overall_timeout=None the watchdog
+    # is timeout + margin — the in-container test cap plus the pre-test
+    # download/pull/setup window; an explicit value overrides.
+    watchdog = (
+        overall_timeout
+        if overall_timeout is not None
+        else timeout + DEFAULT_OVERALL_TIMEOUT_MARGIN_S
+    )
     runner = (
         harness_runner if harness_runner is not None else _default_harness_runner
     )
@@ -1215,10 +1251,10 @@ def evaluate(
         workdir_abs,
         instance_id.lower(),
         run_id,
-        overall_timeout if overall_timeout is not None else "none",
+        watchdog,
     )
     try:
-        proc = runner(argv, str(workdir_abs), overall_timeout)
+        proc = runner(argv, str(workdir_abs), watchdog)
     except EvaluationError:
         raise  # a typed error an injected runner raises stays typed
     except subprocess.TimeoutExpired as e:
@@ -1226,7 +1262,7 @@ def evaluate(
         # docker-managed eval container may still be running — surface its
         # name for cleanup — and the partial output must not be discarded.
         raise HarnessFailedError(
-            f"the outer watchdog fired after {overall_timeout}s (the eval "
+            f"the outer watchdog fired after {watchdog}s (the eval "
             f"container sweb.eval.{instance_id.lower()}.{run_id} — possibly "
             "with a .{timestamp} 409-retry suffix — may still be running; "
             "'docker rm -f' it)",
@@ -1351,8 +1387,10 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         "--overall-timeout",
         type=float,
         default=None,
-        help="outer watchdog in seconds (default: none — the harness's -t "
-        "bounds only the in-container test exec)",
+        help="outer watchdog in seconds (default: bounded — timeout + 1800 "
+        "s; the harness's -t bounds only the in-container test exec and a "
+        "wedged dataset download, image pull, or Docker daemon must not "
+        "hang the run; pass an explicit value to override)",
     )
     parser.add_argument("--workdir", default=None)
     parser.add_argument("--run-id", default=None)

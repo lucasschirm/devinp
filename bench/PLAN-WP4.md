@@ -103,14 +103,18 @@ Re-verified directly against the pinned wheel
    - `Timeout error: <n> seconds exceeded.` — appended to `test_output.txt`
      as the file's *final write* when the in-container test exec hits `-t`
      (hence tail-anchored); the harness also logs its own `Test timed out
-     after <n> seconds` `EvaluationError` message into `run_instance.log`.
+     after <n> seconds.` `EvaluationError` message into `run_instance.log`
+     (anchored on the number + trailing period — the harness echoes the
+     applied patch's `git diff`, context lines included, into
+     `run_instance.log`, so a bare substring could be the patch's own text).
    - `>>>>> Tests Timed Out` (`TESTS_TIMEOUT`) — the dataset eval-script's
      timeout marker, which grading reads *inside the test output*
      (`grading.py:137`) — it is never written to `run_instance.log`.
    - Markers are anchored and file-specific because `EvaluationTimeoutError`
      is *terminal* in WP3 while `HarnessFailedError` is the retried
-     `eval_error` class — a loose substring in the wrong file must not
-     convert a retryable infra flake into a terminal `timeout`.
+     `eval_error` class — a loose substring in the wrong file (or echoed
+     patch text in the instance log) must not convert a retryable infra
+     flake into a terminal `timeout`.
 8. **Stale-report / stale-log risk of a re-used (workdir, run_id) pair:**
    `get_dataset_from_preds` treats a pre-existing per-run `report.json` as
    "already run" (`exclude_completed` → the instance is silently skipped), and
@@ -189,11 +193,16 @@ workdir is resolved to an absolute path **before** the spawn — the harness
 resolves `-p` / `--report_dir` against its own cwd (= workdir), so an
 unresolved relative path would double-resolve (`workdir/workdir/…`).
 
-**`overall_timeout`** is the optional outer watchdog in seconds (the
-project's hang policy, `runner.py`: a hung run is a failure, not a wait).
-The harness's own `-t` bounds only the *in-container* test exec; the HF
-dataset download, the multi-GB image pull and the Docker daemon are not
-bound by `-t`, so the watchdog wraps the whole subprocess. When it fires,
+**`overall_timeout`** is the outer watchdog in seconds (the project's hang
+policy, `runner.py`: a hung run is a failure, not a wait). The harness's own
+`-t` bounds only the *in-container* test exec; the HF dataset download, the
+multi-GB image pull and the Docker daemon are not bound by `-t`, so the
+watchdog wraps the whole subprocess. It is **bounded by default** (the rest
+of the package uses bounded defaults for subprocess calls, `runner.py`
+`timeout_s=30/15`): with `None` — the default, including the CLI default —
+the watchdog is `timeout + DEFAULT_OVERALL_TIMEOUT_MARGIN_S` (1800 s), so a
+wedged dataset download, image pull, or Docker daemon cannot hang the
+sequential benchmark forever; an explicit value overrides. When it fires,
 the typed error surfaces the possibly-still-running eval container name
 (`sweb.eval.<iid>.<run_id>`, possibly `.{timestamp}`-suffixed — fact 5) +
 the partial output.

@@ -315,12 +315,16 @@ contract — never a traceback with exit 1).
   run report to `<report_dir>/<model>.<run_id>.json`, so every artifact
   lands under one directory). The argv is pinned by a unit test; the
   module's no-`swebench`-import contract is pinned by an AST test.
-  `overall_timeout` is the optional outer watchdog (the project's hang
-  policy — `-t` bounds only the *in-container* test exec; the HF dataset
-  download, the image pull and the Docker daemon are not bound by `-t`);
-  pre-spawn filesystem work, a spawn failure and the watchdog firing (its
-  typed error surfaces the possibly-still-running eval container name +
-  the partial output) are typed `HarnessFailedError`, never a raw escape.
+  `overall_timeout` is the outer watchdog — bounded by default (the
+  project's hang policy: `-t` bounds only the *in-container* test exec;
+  the HF dataset download, the image pull and the Docker daemon are not
+  bound by `-t`, and a wedged one must not hang the sequential benchmark
+  — with `None`, the default, the watchdog is `timeout + 1800` s; pass an
+  explicit value to override); pre-spawn filesystem work, a spawn failure
+  and the watchdog firing (its typed error surfaces the
+  possibly-still-running eval container name + the partial output) are
+  typed `HarnessFailedError`, never a raw escape (a `Path.resolve()`
+  symlink-loop `RuntimeError` on the workdir included).
   Typed errors an injected runner raises *stay typed*. Every typed error
   raised after the workdir is resolved carries `error.workdir` (with
   `workdir=None` that is the auto-created tempdir), so the caller-owned
@@ -378,10 +382,13 @@ contract — never a traceback with exit 1).
   tail-anchored `Timeout error: N seconds exceeded.` marker (the harness's
   final write) or `>>>>> Tests Timed Out` (the dataset eval-script's
   marker, graded *inside* the test output) in `test_output.txt`, or the
-  harness's own `Test timed out after N seconds` message in
-  `run_instance.log` → `EvaluationTimeoutError` (terminal in WP3 — hence
-  the loose markers are anchored and file-specific, so a docker-client
-  flake cannot zero out a retryable instance), anything else →
+  harness's own `Test timed out after N seconds.` message in
+  `run_instance.log` (anchored on the number + trailing period — the
+  harness echoes the applied patch's `git diff` into the instance log, so
+  a bare substring could be the patch's own text) → `EvaluationTimeoutError`
+  (terminal in WP3 — hence the loose markers are anchored and file-specific,
+  so a docker-client flake cannot zero out a retryable instance),
+  anything else →
   `HarnessFailedError` (the WP3 `eval_error` retry class). A clean typed
   error, never a crash.
 
