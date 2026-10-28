@@ -37,7 +37,13 @@
 
 * ``mock-devin-<mode>`` — a POSIX wrapper that the client spawns as its
   ``devin`` binary (the trailing ``acp``/``--model`` args are ignored);
-  it execs the mock with the mode + state path baked in.
+  it execs the mock with the mode + state path + a unique per-mock
+  token (``--bench-mock-token <uuid>``) baked in. The process-table leak
+  check (``living_mock_pids``) matches on that token — not on the
+  ``mock_devin.py`` script name — so an unrelated concurrent process on a
+  shared or self-hosted runner whose cmdline merely mentions
+  ``mock_devin.py`` (e.g. another checkout running this same suite)
+  cannot fail the orphan assertion.
 
 The mock appends an event file (JSON lines) that tests assert against:
 env facts (e.g. ``DEVIN_REFUSAL_FALLBACK``), the ``session/new`` cwd, the
@@ -51,6 +57,7 @@ import json
 import os
 import stat
 import sys
+import uuid
 from pathlib import Path
 
 MOCK_SOURCE = r'''
@@ -266,16 +273,21 @@ def make_mock(root, mode: str):
     """Create the mock ``devin`` binary + state file under ``root``.
 
     Returns ``(wrapper_path, state_path)`` — pass ``wrapper_path`` as the
-    session's ``devin_bin``.
+    session's ``devin_bin``. The wrapper bakes in a unique per-mock token
+    (``--bench-mock-token``; the mock ignores the extra arg) recorded in
+    :data:`_LIVE_MOCK_TOKENS` — the leak check's match key.
     """
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
     mock = root / "mock_devin.py"
     state = root / f"state-{mode}.jsonl"
     wrapper = root / f"mock-devin-{mode}"
+    token = uuid.uuid4().hex
+    _LIVE_MOCK_TOKENS.add(token)
     mock.write_text(MOCK_SOURCE)
     wrapper.write_text(
-        f"#!/bin/sh\nexec \"{sys.executable}\" \"{mock}\" {mode} \"{state}\"\n"
+        f"#!/bin/sh\nexec \"{sys.executable}\" \"{mock}\" {mode} \"{state}\" "
+        f"--bench-mock-token {token}\n"
     )
     wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP
                   | stat.S_IXOTH)
@@ -296,8 +308,20 @@ def read_state(state_path) -> list:
     return out
 
 
+_LIVE_MOCK_TOKENS: set = set()
+
+
 def living_mock_pids():
-    """Process-table check: pids of any surviving mock processes.
+    """Process-table check: pids of surviving mock processes **this suite
+    spawned**.
+
+    Matches on the unique per-mock token baked into the wrapper's exec
+    (``--bench-mock-token <uuid>``), not on the ``mock_devin.py`` script
+    name: on a shared or self-hosted runner an unrelated concurrent
+    process whose cmdline merely mentions ``mock_devin.py`` (e.g. another
+    checkout running this same suite) can no longer fail the orphan
+    assertion. An empty registry (no mock spawned yet in this process)
+    matches nothing.
 
     Returns ``None`` when the process table is not inspectable (no
     ``/proc``) so callers can fall back to the group-alive check.
@@ -322,6 +346,7 @@ def living_mock_pids():
         return out
 
     skip = _ancestors()
+    needles = [b" --bench-mock-token " + t.encode() for t in _LIVE_MOCK_TOKENS]
     pids = []
     for entry in os.listdir("/proc"):
         if not entry.isdigit():
@@ -334,6 +359,6 @@ def living_mock_pids():
                 cmd = f.read()
         except OSError:
             continue
-        if b"mock_devin.py" in cmd:
+        if any(n in cmd for n in needles):
             pids.append(pid)
     return pids

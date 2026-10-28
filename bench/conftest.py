@@ -7,7 +7,10 @@ bench/`` from the repo root, or ``cd bench && pytest``).
 
 Quota gate (issue #20, PLAN.md §6): tests marked ``@pytest.mark.bench_live``
 drive the real ``devin`` binary (quota). They are excluded by default — CI
-never consumes quota — and run only when ``BENCH_LIVE=1``.
+never consumes quota — and run only when ``BENCH_LIVE=1``. The marker is
+mandatory for real-Devin tests: ``tests/test_live_gate.py`` statically
+fails the suite on any unmarked test that names the real binary (the
+gate skips only marked items).
 """
 
 import os
