@@ -40,15 +40,23 @@ const out = execSync('npm pack --dry-run --json --ignore-scripts', {
 })
 
 function parsePackOutput(text) {
-  // `npm pack --dry-run --json` normally emits a single-element array (some
-  // npm versions wrap it in an object); normalize to the entry object.
+  // `npm pack --dry-run --json` output shape has drifted across npm majors:
+  //   npm 11: single-element array  [{ id, files: [...], ... }]
+  //   npm 12: object keyed by package name
+  //            { "@lucasschirm/devinp": { id, files: [...], ... } }
+  // Normalize to the entry object in either case.
   const candidates = [text]
   const start = text.search(/^[\[{]/m)
   if (start !== -1) candidates.push(text.slice(start))
   for (const candidate of candidates) {
     try {
       const parsed = JSON.parse(candidate)
-      return Array.isArray(parsed) ? parsed[0] : parsed
+      if (Array.isArray(parsed)) return parsed[0]
+      if (parsed?.files) return parsed
+      // npm 12 keyed shape: first value that carries the file list
+      const withFiles = Object.values(parsed ?? {}).find(v => v?.files)
+      if (withFiles) return withFiles
+      return parsed // no `files` — let the guards fail with diagnostics
     } catch {
       // try the next candidate
     }
