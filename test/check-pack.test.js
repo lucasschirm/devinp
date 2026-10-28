@@ -1,7 +1,15 @@
 import assert from 'node:assert/strict'
+import {mkdtempSync, mkdirSync, writeFileSync} from 'node:fs'
+import {tmpdir} from 'node:os'
+import {join} from 'node:path'
 import {describe, it} from 'node:test'
 
-import {checkTarball, extractEntry, parsePackOutput} from '../scripts/check-pack.js'
+import {
+  checkTarball,
+  extractEntry,
+  listFiles,
+  parsePackOutput,
+} from '../scripts/check-pack.js'
 
 const goodPaths = [
   'LICENSE',
@@ -97,6 +105,51 @@ describe('checkTarball — npm always-ignored files on disk', () => {
       dataFiles: ['benchlm-scores.json', '.npmrc', 'scores.orig', 'package-lock.json', 'npm-debug.log'],
     })
     assert.deepEqual(failures, [])
+  })
+
+  it('ignores always-ignored basenames at any depth, not just the directory root', () => {
+    const failures = checkTarball(
+      [...goodPaths, 'data/sub/.DS_Store', 'data/sub/node_modules/dep/index.js'],
+      {
+        binFiles: goodDisk.binFiles,
+        dataFiles: ['benchlm-scores.json', 'sub/.DS_Store', 'sub/node_modules/dep/index.js', 'sub/config.gypi'],
+      },
+    )
+    assert.deepEqual(failures, [])
+  })
+
+  it('still requires non-ignored nested files that are missing from the tarball', () => {
+    const failures = checkTarball(goodPaths, {
+      binFiles: goodDisk.binFiles,
+      dataFiles: ['benchlm-scores.json', 'sub/scores-v2.json'],
+    })
+    assert.ok(
+      failures.some((f) => f === 'data/ files missing from tarball: sub/scores-v2.json'),
+    )
+  })
+
+  it('does not require node_modules/config.gypi/VCS dirs at any depth', () => {
+    const failures = checkTarball(goodPaths, {
+      binFiles: ['command.js', 'run.js', 'node_modules/leftover/index.js', '.git/config'],
+      dataFiles: ['benchlm-scores.json', 'sub/config.gypi', 'sub/.svn/entries'],
+    })
+    assert.deepEqual(failures, [])
+  })
+})
+
+describe('listFiles — recursive listing without the {recursive} option', () => {
+  it('lists nested files relative to the root, across the Node 18 engines floor', () => {
+    const root = mkdtempSync(join(tmpdir(), 'check-pack-'))
+    mkdirSync(join(root, 'data', 'sub'), {recursive: true})
+    writeFileSync(join(root, 'data', 'a.json'), 'x')
+    writeFileSync(join(root, 'data', 'sub', 'b.json'), 'y')
+    const files = listFiles(join(root, 'data'))
+    assert.deepEqual(files.sort(), ['a.json', 'sub/b.json'])
+  })
+
+  it('returns null for a missing directory (main reports a FAIL diagnostic)', () => {
+    const root = mkdtempSync(join(tmpdir(), 'check-pack-'))
+    assert.equal(listFiles(join(root, 'nope')), null)
   })
 })
 

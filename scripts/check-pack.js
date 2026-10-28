@@ -34,18 +34,27 @@
  * silently on an unrecognizable output.
  */
 
-import {readdirSync, statSync} from 'node:fs'
+import {readdirSync} from 'node:fs'
 import {execSync} from 'node:child_process'
 import {pathToFileURL} from 'node:url'
 
-// Files npm never packs (npm pack docs — "always ignored"), so they cannot
-// be required in the tarball even when present on disk.
+// Files npm never packs (npm pack docs — "always ignored"), matched by
+// name at any depth — for directories (node_modules, .git, .svn, …) any
+// path segment under them counts.
 const ALWAYS_IGNORED = [
   /^\.npmrc$/,
   /^npm-debug\.log/,
   /^\.DS_Store$/,
   /^package-lock\.json$/,
   /\.orig$/,
+  /^node_modules$/,
+  /^config\.gypi$/,
+  /^\.git$/,
+  /^\.svn$/,
+  /^\.hg$/,
+  /^CVS$/,
+  /^\.lock-wscript$/,
+  /^\.wafpickle-\d+$/,
 ]
 
 // Expected tarball content, allowlist: what npm auto-includes (package.json,
@@ -53,8 +62,15 @@ const ALWAYS_IGNORED = [
 // (bin/, data/). Anything else is a regression.
 const EXPECTED_TOP_LEVEL = new Set(['package.json', 'README.md', 'LICENSE'])
 
+function isIgnored(relPath) {
+  // npm ignores these names for directories at any depth, so any path
+  // segment match counts (e.g. data/sub/.svn/entries lives under an
+  // ignored .svn directory).
+  return relPath.split('/').some((segment) => ALWAYS_IGNORED.some((re) => re.test(segment)))
+}
+
 function filterIgnored(files) {
-  return files.filter(f => !ALWAYS_IGNORED.some((re) => re.test(f)))
+  return files.filter((f) => !isIgnored(f))
 }
 
 /**
@@ -139,9 +155,36 @@ export function checkTarball(paths, {binFiles, dataFiles}) {
   return failures
 }
 
-function listFiles(dir) {
-  return readdirSync(dir, {recursive: true})
-    .filter((f) => statSync(`${dir}/${f}`).isFile())
+export function listFiles(dir) {
+  // Manual recursion (works on the engines floor, Node >=18.0.0 —
+  // readdirSync {recursive: true} needs >=18.17 and is silently ignored
+  // below it). Returns null when the directory does not exist; file
+  // paths are relative to the given root.
+  let rootEntries
+  try {
+    rootEntries = readdirSync(dir, {withFileTypes: true})
+  } catch {
+    return null
+  }
+  function walk(d, entries) {
+    const out = []
+    for (const entry of entries) {
+      const rel = `${d}/${entry.name}`
+      if (entry.isDirectory()) {
+        let subEntries
+        try {
+          subEntries = readdirSync(rel, {withFileTypes: true})
+        } catch {
+          continue
+        }
+        out.push(...walk(rel, subEntries))
+      } else if (entry.isFile()) {
+        out.push(rel.slice(dir.length + 1))
+      }
+    }
+    return out
+  }
+  return walk(dir, rootEntries)
 }
 
 // --- main (skipped when imported as a module by the tests) ---
@@ -159,11 +202,21 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     process.exit(1)
   }
 
+  const binFiles = listFiles('bin')
+  const dataFiles = listFiles('data')
+  if (binFiles === null || dataFiles === null) {
+    const missing = [
+      binFiles === null && 'bin/',
+      dataFiles === null && 'data/',
+    ]
+      .filter(Boolean)
+      .join(' and ')
+    console.error(`FAIL: ${missing} does not exist on disk after the build`)
+    process.exit(1)
+  }
+
   const paths = (entry?.files ?? []).map((f) => f.path)
-  const failures = checkTarball(paths, {
-    binFiles: listFiles('bin'),
-    dataFiles: listFiles('data'),
-  })
+  const failures = checkTarball(paths, {binFiles, dataFiles})
 
   if (failures.length) {
     console.error('FAIL:')
