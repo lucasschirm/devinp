@@ -299,3 +299,114 @@ under the new checklist would gate item 10 on the recorded state. The
 tightened checklist is the deliverable; if a live re-verification is
 required, the documented two-command sequence (interrupt + resume) is
 the run pair to re-execute.
+
+## Review round 2 (PR #37 `pr-review` — the second pass)
+
+The second `pr-review` pass (on the round-1 fixes) raised 5 Major /
+5 Medium / 6 Minor findings. All addressed (zero-quota regression
+tests in `tests/test_live_pilot.py`):
+
+**Major**
+
+1. **Collapsed untracked dir ≥2 components deep dropped whole** —
+   `?? src/newpkg/` failed the lexical gate on the *dir* path (no
+   source/test marker, not a `.py`), so the per-file expansion never
+   ran and the agent's new package silently never reached the patch.
+   Now every collapsed untracked dir is expanded to its files and the
+   guards run per file (a dir excluded as a whole — `.venv/`,
+   `node_modules/`, `__pycache__/` — short-circuits to a single skip
+   entry, no per-file walk of a 10k-file venv).
+2. **Generated dirs swept into the diff** — `.venv/`, `node_modules/`
+   (plus `.tox`, `dist`, `.mypy_cache`) passed the inclusion gate, so
+   a routine agent `python -m venv .venv` intent-to-added every
+   `.py` under the tree, blew the diff past `PATCH_SIZE_CAP_BYTES`,
+   and the completed session was discarded (retried at full quota,
+   same cap). Those dir names are now exclusion patterns.
+3. **Eager pre-flight vs container setup / resume** — the pilot's
+   batch loop pre-flighted *every pinned* instance before the session
+   factory, so the `docker_image` leg fired before the setup's
+   `docker pull` (a cold host aborted `preflight_failed` — the pull
+   unreachable) and before `resume_queue` filtering (a `--resume`
+   inspected finished instances' images, which the prune `docker rmi`'d).
+   Now: the resume state + `to_run` are read **before** the pre-flight;
+   the eager loop inspects only the instances this invocation will
+   run; and the per-instance image leg is **pull-if-missing** (the
+   zero-quota pull belongs in the pre-flight; the setup's pull then
+   no-ops).
+4. **Checklist read raw checkpoint records** — a superseded retry-class
+   line (an instance-level `preflight_failed` carries no
+   orphan/leak/pruning meta) flipped items 7/10/14 on the resumed run,
+   a false NO-GO for an instance that completed cleanly. The checklist
+   now uses the deduped last-line-per-instance view (the WP5
+   `rep.dedupe` contract).
+5. **`ArtifactCheckError` swallowed, verdict still rendered** — a
+   corrupt report could not fail the gate (the round-1 live record
+   shows exactly this: `WP5 report: ArtifactCheckError` … then
+   `go/no-go: GO`). Now a failed report pipeline records the failure
+   in the state file (`final_state: report_failed`), removes the
+   stale record, and exits 4 with **no verdict rendered** (the resume
+   class).
+
+**Medium**
+
+1. **`-rA` parser keyed on the raw line** — real pytest prints
+   `FAILED <id> - <reason>` (the suffix landed in the key, so the
+   outcome was also filed under `missing`) and `SKIPPED [N]
+   <file>:<line>: <reason>` (never matched `::`/`test_`, so it never
+   parsed). Now: the reason suffix is stripped, the `[N]` token is
+   handled, and a file-level outcome (a collection `ERROR`, a
+   `file:line` `SKIPPED`) is attributed to every requested node id
+   under that file.
+2. **Item 6's `perms_all_answered` was vacuous** — a permission
+   transcript entry is appended *before* the response send is
+   attempted (send failures swallowed), so `requests == allowed +
+   denied` held by construction. Now the client counts
+   `permission_send_failures` (a response the server never heard), the
+   session meta records it, and item 6 fails on a non-zero count.
+3. **Repeat `--resume` on a finished pair rewrote the record to
+   NO-GO** — run 2 reset the state file's `interrupted` flag, so the
+   AC3 leg failed on the third invocation and the GO was not durable.
+   Now the state carries a cumulative `resume_exercised` flag (the
+   pair's intentional-interrupt resume), item 11 passes on it, and a
+   third invocation re-runs nothing and keeps the GO.
+4. **Crash-resume reused the mutated testbed** — a mid-session crash
+   leaves `runs/<iid>/testbed` (the prune runs only for a completed
+   record), so the retried session inherited the previous attempt's
+   edits and the patch was the union of two attempts (pass@1
+   contamination). Now the sandbox factory removes the stale agent
+   tree (`testbed` + `xdg`) before the re-clone (the clone cache is
+   retained), and container mode `docker rm -f`s a crashed attempt's
+   container before the `docker run --name`.
+5. **README coverage claims** — the pre-staged-junk path was untested
+   and no test asserted `meta["pruning"]` lands in the persisted line.
+   Added: `test_extract_patch_unstages_pre_staged_junk` and the
+   mock-driven full-pilot assertion that the pruning record is in
+   every JSONL line.
+
+**Minor**
+
+1. **Dry-run verdict inconsistency** — the skeleton rendered `Verdict:
+   NO-GO` (`_verdict` counted `pass=None` as failed) and the early
+   exits left a stale verdict file standing. Now `_verdict` returns
+   `n/a` for a rendering with no decided items (a dry run decides
+   nothing), and every early exit (dry-run skeleton, pre-flight /
+   model-gate refusal, an abort) removes the previous invocation's
+   record file (`_remove_stale_record`).
+2. **Phantom `which devin` docstring** — `make_preflight` had no such
+   leg. Now there is one: the `binary` leg (`shutil.which` — a missing
+   binary is the loud exit-4 gate that follows the informational
+   `devin version` probe).
+3. **`inst.get(k) in (None, "")` passed non-string scalars** —
+   `base_commit: 0` / `instance_id: false` surfaced later as a raw
+   `TypeError` inside the git argv. Now a strict `isinstance(v, str)
+   and v` check (bools/numbers rejected) → `PilotConfigError`.
+4. **Dead `_mock_pilot` helper** — removed.
+5. **`.gitignore` gap** — the live smoke's scratch dir
+   (`pilot-a-smoke/` at the repo root) is now ignored.
+6. **PLAN artifact drift** — `pilot-a-meta.json` / `session.log` /
+   `host-check.log` are not produced (the meta is in-memory to
+   `report.generate`; the eval log is `eval.log`). The artifacts
+   section now lists the real set (`run-<id>.jsonl`,
+   `pilot-<id>.state.json`, `pilot.lock`, `runs/<iid>/{patch.diff,
+   trajectory.jsonl, eval.log}`, the retained `clone-cache/`,
+   `report/{report.md, all_preds.jsonl, trajs/}`).

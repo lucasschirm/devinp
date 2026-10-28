@@ -126,6 +126,16 @@ _EXCLUDE_PATTERNS = (
     re.compile(r"(^|/)htmlcov(/|$)"),
     re.compile(r"\.egg-info(/|$)"),
     re.compile(r"(^|/)build(/|$)"),
+    # the generated-dir class (PLAN §4.2): a routine agent ``python -m
+    # venv .venv`` / ``npm install`` would otherwise intent-to-add every
+    # ``.py`` under the tree — the diff blows past the size cap and the
+    # completed session is discarded (retried at full quota on resume,
+    # hitting the same cap)
+    re.compile(r"(^|/)\.venv(/|$)"),
+    re.compile(r"(^|/)node_modules(/|$)"),
+    re.compile(r"(^|/)\.tox(/|$)"),
+    re.compile(r"(^|/)dist(/|$)"),
+    re.compile(r"(^|/)\.mypy_cache(/|$)"),
 )
 
 #: Quota / rate-limit signal markers (PLAN §2.3: the ACP stop reason,
@@ -258,16 +268,21 @@ def load_instances(path: str) -> list:
         raise PilotConfigError(
             f"instances file {path!r} must carry a non-empty "
             f"'instances' list (got {type(data).__name__})")
-    required = ("instance_id", "repo", "base_commit",
-               "problem_statement", "FAIL_TO_PASS", "PASS_TO_PASS")
     out = []
     for i, inst in enumerate(insts):
         if not isinstance(inst, dict):
             raise PilotConfigError(
                 f"instance {i} must be a JSON object "
                 f"(got {type(inst).__name__})")
-        missing = [k for k in required
-                  if k not in inst or inst.get(k) in (None, "")]
+        missing = []
+        for k in ("instance_id", "repo", "base_commit",
+                  "problem_statement"):
+            v = inst.get(k)
+            # a strict string (a bool / a bare number / an empty
+            # string is a config error — not a raw TypeError inside
+            # the git argv later)
+            if not isinstance(v, str) or not v:
+                missing.append(k)
         if missing:
             raise PilotConfigError(
                 f"instance {i} ({inst.get('instance_id', '?')!r}) is "
@@ -275,10 +290,10 @@ def load_instances(path: str) -> list:
         # the two list fields: an **empty** list is valid (an instance
         # with no PASS_TO_PASS); only absence / a wrong type fails
         for k in ("FAIL_TO_PASS", "PASS_TO_PASS"):
-            if not isinstance(inst[k], list):
+            if k not in inst or not isinstance(inst[k], list):
                 raise PilotConfigError(
                     f"instance {i}: {k} must be a list "
-                    f"(got {type(inst[k]).__name__})")
+                    f"(got {type(inst.get(k)).__name__})")
         out.append(inst)
     ids = [i["instance_id"] for i in out]
     if len(set(ids)) != len(ids):
@@ -403,17 +418,55 @@ def extract_patch(cwd: str) -> dict:
         elif len(line) >= 4:
             porcelain[line[3:].strip()] = line[:2]
 
+    def _guard(path: str) -> "Optional[str]":
+        """The per-path verdict: the skip reason, or None (include)."""
+        if _exclude(path):
+            return "exclusion pattern"
+        if _is_binary(os.path.join(cwd, path)):
+            return "binary content"
+        if not _looks_source_or_test(path):
+            return "outside source/test dirs"
+        return None
+
     included: list = []
     skipped: list = []
     for path in untracked:
-        if _exclude(path):
-            skipped.append([path, "exclusion pattern"])
+        full = os.path.join(cwd, path)
+        if os.path.isdir(full):
+            # a collapsed untracked dir (any depth — ``?? tests/``,
+            # ``?? src/newpkg/``). A dir that is excluded as a whole
+            # (``.venv/``, ``node_modules/``, ``__pycache__/``) is
+            # reported as a single dir entry (no per-file walk of a
+            # 10k-file venv); otherwise the dir is expanded to its
+            # actual files and the guards run per file — a nested
+            # source/test dir (``src/newpkg/``, ``src/tests/``) is
+            # found at the FILE level (the lexical gate on the
+            # collapsed dir path would drop a ≥2-component dir whose
+            # own name is not a source/test marker, silently losing
+            # the agent's new package)
+            dpath = path if path.endswith("/") else path + "/"
+            if _exclude(dpath):
+                skipped.append([path, "exclusion pattern"])
+                continue
+            found = False
+            for root, dirs, files in os.walk(full):
+                for f in files:
+                    fp = os.path.relpath(os.path.join(root, f), cwd)
+                    why = _guard(fp)
+                    if why:
+                        skipped.append([fp, why])
+                        continue
+                    included.append(fp)
+                    found = True
+            if not found:
+                # an empty dir, or one with only excluded / non-source
+                # files: report the collapsed entry itself
+                skipped.append([path, _guard(dpath) or
+                               "outside source/test dirs"])
             continue
-        if _is_binary(os.path.join(cwd, path)):
-            skipped.append([path, "binary content"])
-            continue
-        if not _looks_source_or_test(path):
-            skipped.append([path, "outside source/test dirs"])
+        why = _guard(path)
+        if why:
+            skipped.append([path, why])
             continue
         included.append(path)
 
@@ -429,30 +482,10 @@ def extract_patch(cwd: str) -> dict:
             _git(cwd, "reset", "--", path)
             skipped.append([path, f"pre-staged entry: {why} — unstaged"])
 
-    # ``git add -N`` on a directory would recursively stage *everything*
-    # under it (git collapses untracked directories in the porcelain
-    # status — ``?? tests/``) — so directories are expanded to their
-    # actual files and the file-level guards are applied per file
-    add_args: list = []
-    for path in included:
-        full = os.path.join(cwd, path)
-        if os.path.isdir(full):
-            for root, dirs, files in os.walk(full):
-                for f in files:
-                    fp = os.path.relpath(os.path.join(root, f), cwd)
-                    if _exclude(fp):
-                        skipped.append([fp, "exclusion pattern"])
-                        continue
-                    if _is_binary(os.path.join(root, f)):
-                        skipped.append([fp, "binary content"])
-                        continue
-                    if not _looks_source_or_test(fp):
-                        skipped.append([fp, "outside source/test dirs"])
-                        continue
-                    add_args.append(fp)
-        else:
-            add_args.append(path)
-
+    # the included set is files only (the collapsed dirs were expanded
+    # above) — the staging is a flat ``git add -N`` (never on a dir:
+    # git would recursively stage everything under it)
+    add_args: list = list(included)
     if add_args:
         _git(cwd, "add", "-N", *add_args)
     try:
@@ -713,6 +746,11 @@ class PilotSession(rr.AgentSession):
         self.meta["permissions"] = perms
         self.meta["vendor_notifications"] = len(
             self._acp.vendor_notifications)
+        # the permission responses the client could not send (a
+        # non-zero count = a request the server never heard — item 6
+        # must be able to fail on it)
+        self.meta["permission_send_failures"] = getattr(
+            self._acp, "permission_send_failures", 0)
         # the mid-session stderr tail (the client's drain thread —
         # ``stderr_tail`` itself is only populated at close(), which is
         # too late for the error paths + the quota signal)
@@ -901,7 +939,7 @@ class PilotSession(rr.AgentSession):
                 cwd=clone, capture_output=True, timeout=3600, check=False)
             out = p.stdout.decode("utf-8", "replace")
             log_lines.append(out[-4000:])
-            results = _parse_pytest_ra(out)
+            results = _parse_pytest_ra(out, ids)
             if results is None:
                 raise _HostCheckInfra(
                     f"pytest exited {p.returncode} with no parseable "
@@ -950,22 +988,50 @@ def _find_python() -> str:
     raise PilotConfigError("no python interpreter found for the host check")
 
 
-def _parse_pytest_ra(out: str) -> "Optional[dict]":
-    """The per-node-id results from the ``-rA`` short summary lines
-    (``PASSED <id>`` / ``FAILED <id>`` / ``ERROR <id>`` / ``SKIPPED`` /
-    ``XFAIL`` / ``XPASS``). Returns None when nothing parsed (an infra
+def _parse_pytest_ra(out: str, requested: list) -> "Optional[dict]":
+    """The per-node-id results from the ``-rA`` short summary lines.
+    Real pytest shapes: ``PASSED <id>``, ``FAILED <id> - <reason>``,
+    ``ERROR <id-or-file> - <reason>`` (a collection error is a
+    FILE-level line — the suffix would otherwise land in the key), and
+    ``SKIPPED [N] <file>:<line>: <reason>`` (a ``file:line`` key, no
+    ``::`` — it never matches a node id lexically). A file-level
+    outcome is attributed to every requested node id under that file
+    (a collection error kills every test in the file). Returns the
+    id→state map (``passed``/``failed``/``error``/``skipped``/
+    ``xfailed``/``xpassed``) or None when nothing parsed (an infra
     failure, not a verdict)."""
     out_map = {"PASSED": "passed", "FAILED": "failed", "ERROR": "error",
               "SKIPPED": "skipped", "XFAIL": "passed", "XPASS": "failed"}
-    res: dict = {}
+    node_outcomes: dict = {}
+    file_outcomes: dict = {}
     for line in out.splitlines():
-        line = line.strip()
-        for tag, state in out_map.items():
-            prefix = tag + " "
-            if line.startswith(prefix):
-                tid = line[len(prefix):].strip()
-                if "::" in tid or tid.startswith("test_"):
-                    res[tid] = state
+        m = re.match(r"^(PASSED|FAILED|ERROR|SKIPPED|XFAIL|XPASS)\s+(.*)$",
+                     line.strip())
+        if not m:
+            continue
+        kind, rest = m.group(1), m.group(2)
+        # ``SKIPPED [N] …`` — strip the count token
+        rest = re.sub(r"^\[\d+\]\s*", "", rest)
+        # ``FAILED <id> - <reason>`` / ``ERROR <id> - <reason>`` — the
+        # reason is not part of the id
+        node = re.split(r"\s+-\s+", rest, 1)[0].strip()
+        if "::" in node:
+            node_outcomes.setdefault(node, out_map[kind])
+        else:
+            # a file-level id (a collection ``ERROR``) or a ``file:line``
+            # (``SKIPPED``) — attribute to the requested node ids under
+            # the file
+            filepart = node.split(":", 1)[0]
+            file_outcomes.setdefault(filepart, out_map[kind])
+    res: dict = {}
+    for rid in requested:
+        if rid in node_outcomes:
+            res[rid] = node_outcomes[rid]
+        elif rid.split("::", 1)[0] in file_outcomes:
+            res[rid] = file_outcomes[rid.split("::", 1)[0]]
+    # any parsed line that is not a requested id is kept too (the
+    # caller's ``missing`` computation only looks at the requested set)
+    res.update(node_outcomes)
     return res if res else None
 
 
@@ -1203,8 +1269,48 @@ def make_preflight(config: PilotConfig) -> Callable:
             raise rr.PreflightFailed(
                 "sandbox_runtime", "no usable python interpreter")
 
+    def _binary() -> None:
+        # the missing-binary gate (a missing ``devin`` binary is a
+        # pre-flight failure — the loud exit-4 path; the ``devin
+        # version`` probe above is informational only)
+        if shutil.which(config.devin_bin) is None:
+            raise rr.PreflightFailed(
+                "binary", f"the {config.devin_bin!r} binary is not on "
+                         f"PATH (or not executable)")
+
+    def _ensure_docker_image(img: str) -> None:
+        # pull-if-missing: a cold host has never pulled the instance
+        # image — ``docker image inspect`` would fail and the per-
+        # instance pre-flight would abort before the setup's own pull
+        # could run. The pull is zero-quota (no agent session), so it
+        # belongs in the pre-flight (the WP3b per-instance leg); the
+        # setup's pull then becomes a no-op
+        p = subprocess.run(["docker", "image", "inspect", img],
+                          capture_output=True, timeout=timeout_s)
+        if p.returncode == 0:
+            return
+        try:
+            p = subprocess.run(["docker", "pull", img],
+                              capture_output=True, timeout=7200)
+        except Exception as exc:
+            raise rr.PreflightFailed(
+                "docker_image", f"docker pull could not be run: "
+                     f"{type(exc).__name__}: {exc}") from exc
+        if p.returncode != 0:
+            tail = (p.stderr or b"")[-200:].decode(
+                "utf-8", "replace").strip()
+            raise rr.PreflightFailed(
+                "docker_image", f"docker pull exited {p.returncode}: {tail!r}")
+        p = subprocess.run(["docker", "image", "inspect", img],
+                          capture_output=True, timeout=timeout_s)
+        if p.returncode != 0:
+            raise rr.PreflightFailed(
+                "docker_image", f"the image {img!r} is still absent "
+                                f"after the pull")
+
     def _check(instance_id: "Optional[str]") -> None:
         checks = [
+            ("binary", _binary),
             ("auth",
              lambda: _cmd("auth", [config.devin_bin, "auth", "status"])),
         ]
@@ -1214,13 +1320,14 @@ def make_preflight(config: PilotConfig) -> Callable:
                  lambda: _cmd("docker_daemon", ["docker", "info"])))
             if instance_id is not None:
                 # the WP3b default image format (the Docker-Hub
-                # ``__`` → ``_1776_`` escape)
+                # ``__`` → ``_1776_`` escape) — pull-if-missing (a
+                # cold host pre-flights the pull; the setup's pull
+                # then no-ops)
                 img = "swebench/sweb.eval.x86_64."
                 + instance_id.replace("__", "_1776_")
                 checks.append(
                     ("docker_image",
-                     lambda: _cmd("docker_image",
-                                ["docker", "image", "inspect", img])))
+                     lambda: _ensure_docker_image(img)))
         else:
             checks.append(("sandbox_runtime", _sandbox_runtime))
         checks.append(("disk", pf._disk_check))
@@ -1415,7 +1522,7 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
                    records: list,
                    skipped_on_resume: dict,
                    interrupted_this_run: "Optional[dict]",
-                   interrupted_before: bool,
+                   resume_after_interrupt: bool,
                    devin_ok: "Optional[bool]",
                    sessions_this_invocation: int,
                    wall_budget_s: float,
@@ -1441,6 +1548,7 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
     total_tokens = 0
     perms_req = 0
     perms_all_answered = True
+    perms_send_failures = 0
     vendor_seen = 0
     orphan_checked = True
     orphan_unchecked = False
@@ -1468,6 +1576,8 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
         if int(p.get("requests", 0)) != int(p.get("allowed", 0)) + int(
                 p.get("denied", 0)):
             perms_all_answered = False
+        perms_send_failures += int(
+            m.get("permission_send_failures", 0))
         vendor_seen += int(m.get("vendor_notifications", 0))
         # item 7: a check that did not run (a close() failure —
         # ``orphan_check`` stays None) is a FAIL, not a pass
@@ -1543,9 +1653,13 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
         "web denied; out-of-scope writes denied)",
         f"{perms_req} request(s) observed; all answered per policy: "
         f"{perms_all_answered}"
+        + (f"; {perms_send_failures} response(s) the client could not "
+           "send (the server never heard them)"
+           if perms_send_failures else "")
         + (" (zero observed — the WP0 trivial-task caveat)"
            if perms_req == 0 and records else ""),
-        perms_all_answered if records else devin_ok)
+        (perms_all_answered and perms_send_failures == 0)
+        if records else devin_ok)
     add("7 session/close + group kill + no orphans (WP0 §1)",
         "close sent best-effort; the process group killed; no orphan "
         "devin survives",
@@ -1580,20 +1694,20 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
         "retained",
         "; ".join(pruning_obs) or "no instances",
         (pruning_ok and bool(records)) if records else devin_ok)
-    if (skipped_on_resume and config.resume and interrupted_before):
+    if (skipped_on_resume and config.resume and resume_after_interrupt):
         obs = "resumed after the intentional interrupt: " + ", ".join(
             f"{k} skipped ({v})" for k, v in sorted(
                 skipped_on_resume.items()))
         p = True
     elif config.resume and skipped_on_resume:
-        # a resume with skipped instances, but the previous run was not
-        # the intentional interrupt (a crash/abort resume — the AC3
-        # path is not exercised)
+        # a resume with skipped instances, but the pair was not the
+        # intentional interrupt (a crash/abort resume — the AC3 path
+        # is not exercised)
         obs = ("resumed (skipped: "
                + ", ".join(f"{k} ({v})"
                           for k, v in sorted(skipped_on_resume.items()))
-               + ") — but the previous run was not the intentional "
-                 "interrupt (AC3 not exercised)")
+               + ") — but the pair was not the intentional interrupt "
+                 "(AC3 not exercised)")
         p = False
     elif interrupted_this_run:
         obs = (f"interrupted after "
@@ -1634,12 +1748,17 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
 
 def _verdict(items: list) -> "tuple[str, list]":
     """GO ⟺ items 1–12 + 14 all pass (item 13 is deviation-tolerant,
-    non-gating — PLAN-WP6A.md)."""
+    non-gating — PLAN-WP6A.md). A rendering with no decided items at
+    all (the dry-run skeleton — every item ``pass=None``) is ``n/a``,
+    not NO-GO (a dry run decides nothing)."""
     gating_numbers = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "10",
                      "11", "12", "14"}  # 13 excluded (non-gating)
-    failed = [i["item"] for i in items
+    decided = [i for i in items
               if i["item"].split(" ", 1)[0] in gating_numbers
-              and i["pass"] is not True]
+              and i["pass"] is not None]
+    if not decided:
+        return ("n/a", [])
+    failed = [i["item"] for i in decided if i["pass"] is not True]
     return ("NO-GO" if failed else "GO", failed)
 
 
@@ -1740,6 +1859,18 @@ def _write_state(workdir: str, run_id: str, state: dict) -> None:
         json.dump(state, f, indent=2)
 
 
+def _remove_stale_record(workdir: str) -> None:
+    """The record file is the last *completed* run's verdict — an early
+    exit (dry-run skeleton, pre-flight / model-gate refusal, an abort)
+    removes it so a stale verdict from a previous invocation is never
+    mistaken for this run's (consistent record handling across exits)."""
+    p = os.path.join(workdir, "wp6a-go-no-go.md")
+    try:
+        os.remove(p)
+    except OSError:
+        pass
+
+
 def run_pilot(config: PilotConfig,
               make_session: "Optional[Callable]" = None) -> int:
     """The pilot driver (the tests call this with the injected
@@ -1760,10 +1891,12 @@ def run_pilot(config: PilotConfig,
         items = build_checklist(
             config=config, dry_run=True, gate=None, preflight_ok=None,
             preflight_failures=[], records=[], skipped_on_resume={},
-            interrupted_this_run=None, interrupted_before=False,
+            interrupted_this_run=None, resume_after_interrupt=False,
             devin_ok=None, sessions_this_invocation=0,
             wall_budget_s=config.max_wall_s
             * config.max_sessions_per_day, wall_used_s=0.0)
+        _remove_stale_record(workdir)  # the skeleton replaces the last
+        # completed run's verdict — a stale file is never kept
         with open(os.path.join(workdir, "wp6a-go-no-go.md"), "w",
                   encoding="utf-8", newline="") as f:
             f.write(render_checklist_md(items, config, cal, {
@@ -1782,48 +1915,17 @@ def run_pilot(config: PilotConfig,
     print(f"[pilot] devin: {ver} · model: {config.model} · mode: "
           f"{config.mode} · run: {run_id}")
 
-    # the documented gate order (PLAN-WP6A.md): opt-in (above) →
-    # pre-flight (zero quota, before any session; the runner also
-    # re-runs it per batch + per instance) → model gate (fail-closed)
-    pf = make_preflight(config)
-    preflight_ok = True
-    preflight_failures: list = []
-    try:
-        pf(None)
-        for i in insts:
-            pf(i["instance_id"])
-    except rr.PreflightFailed as exc:
-        preflight_ok = False
-        preflight_failures.append(str(exc))
-        print(f"[pilot] pre-flight FAILED: {exc}")
-        # the batch-level marker (the WP3b contract: instance_id=None —
-        # it consumes no queue slot on resume)
-        with rr.JsonlCheckpoint(jsonl) as ck:
-            ck.record_instance(None, "preflight_failed",
-                              {"reason": str(exc), "phase": "batch"})
-        return EXIT_RUN_FAILED
-
-    # the fail-closed model gate (WP3b)
-    try:
-        models = rr.fetch_models_list(config.devin_bin)
-    except rr.ModelGateError as exc:
-        print(f"[pilot] model gate REFUSED (fail-closed): {exc}")
-        return EXIT_RUN_FAILED
-    gate_res = rr.gate_cost_tier(models, config.model)
-    gate = {"allowed": gate_res.allowed,
-           "cost_tier": gate_res.cost_tier,
-           "reason": gate_res.reason,
-           "free_models": list(gate_res.free_models)}
-    if not gate_res.allowed:
-        print(f"[pilot] model gate REFUSED: {gate_res.reason}")
-        return EXIT_RUN_FAILED
-
     # the resume (WP3b) — the interrupted / partial state (the state
     # file is the previous invocation's — it is overwritten at the end
-    # of this run)
+    # of this run). Read **before** the pre-flight: the per-instance
+    # pre-flight legs must only inspect the instances this invocation
+    # will RUN — a --resume must not pre-flight finished instances'
+    # container images (the prune docker rmi'd them) or re-pull images
+    # a finished run already consumed
     state = _load_state(workdir, run_id)
     interrupted_before = bool(state.get("interrupted"))
     aborted_before = bool(state.get("aborted"))
+    resume_exercised_before = bool(state.get("resume_exercised"))
     skipped_on_resume: dict = {}
     to_run = [i["instance_id"] for i in insts]
     if os.path.isfile(jsonl):
@@ -1835,6 +1937,7 @@ def run_pilot(config: PilotConfig,
                   f"{len(skipped_on_resume)} finished instance(s) — "
                   f"pass --resume to continue (it is not re-run "
                   "silently)")
+            _remove_stale_record(workdir)
             return EXIT_CONFIG
         print(f"[pilot] resuming: skipped {skipped_on_resume}; "
               f"to run: {to_run}")
@@ -1845,6 +1948,51 @@ def run_pilot(config: PilotConfig,
     if not to_run:
         print("[pilot] nothing to run (all instances finished in a "
               "previous invocation)")
+    # the cumulative AC3 exercise (the state is overwritten every run —
+    # a repeat --resume on a finished pair must not lose the record
+    # that the pair exercised the intentional-interrupt resume)
+    resume_exercised = resume_exercised_before or (
+        bool(config.resume) and bool(skipped_on_resume)
+        and interrupted_before)
+
+    # the documented gate order (PLAN-WP6A.md): opt-in (above) →
+    # pre-flight (zero quota, before any session; the runner also
+    # re-runs it per batch + per instance) → model gate (fail-closed)
+    pf = make_preflight(config)
+    preflight_ok = True
+    preflight_failures: list = []
+    try:
+        pf(None)
+        for iid in to_run:
+            pf(iid)
+    except rr.PreflightFailed as exc:
+        preflight_ok = False
+        preflight_failures.append(str(exc))
+        print(f"[pilot] pre-flight FAILED: {exc}")
+        # the batch-level marker (the WP3b contract: instance_id=None —
+        # it consumes no queue slot on resume)
+        with rr.JsonlCheckpoint(jsonl) as ck:
+            ck.record_instance(None, "preflight_failed",
+                              {"reason": str(exc), "phase": "batch"})
+        _remove_stale_record(workdir)
+        return EXIT_RUN_FAILED
+
+    # the fail-closed model gate (WP3b)
+    try:
+        models = rr.fetch_models_list(config.devin_bin)
+    except rr.ModelGateError as exc:
+        print(f"[pilot] model gate REFUSED (fail-closed): {exc}")
+        _remove_stale_record(workdir)
+        return EXIT_RUN_FAILED
+    gate_res = rr.gate_cost_tier(models, config.model)
+    gate = {"allowed": gate_res.allowed,
+           "cost_tier": gate_res.cost_tier,
+           "reason": gate_res.reason,
+           "free_models": list(gate_res.free_models)}
+    if not gate_res.allowed:
+        print(f"[pilot] model gate REFUSED: {gate_res.reason}")
+        _remove_stale_record(workdir)
+        return EXIT_RUN_FAILED
 
     # the per-instance session meta (the reporter merger's source)
     meta_by_instance: dict = {}
@@ -1861,6 +2009,18 @@ def run_pilot(config: PilotConfig,
                 "instances are the resume class, PLAN §2.5)")
         inst = next(i for i in insts if i["instance_id"] == iid)
         if config.mode == "sandbox":
+            # a clean attempt, every time: on a resume after a
+            # mid-session crash the previous attempt's
+            # ``runs/<iid>/testbed`` survives (the prune runs only for
+            # a completed record) — reusing it would make the retried
+            # session inherit the previous attempt's edits and the
+            # extracted patch the union of two attempts (pass@1
+            # contamination). The agent tree is removed (the shared
+            # clone cache is retained) before the re-clone
+            for stale in ("testbed", "xdg"):
+                sp = os.path.join(workdir, "runs", iid, stale)
+                if os.path.isdir(sp):
+                    shutil.rmtree(sp, ignore_errors=True)
             prep = prepare_sandbox_instance(inst, workdir)
             spec = SessionSpec(
                 instance=inst, mode=config.mode,
@@ -1869,6 +2029,13 @@ def run_pilot(config: PilotConfig,
                 wall_s=config.max_wall_s,
                 host_check=bool(config.host_check), workdir=workdir)
         else:
+            # a crashed attempt's agent container may still be up on a
+            # crash-resume — ``docker run --name`` would fail with
+            # "name already in use" (best-effort removal)
+            subprocess.run(
+                ["docker", "rm", "-f",
+                 f"sweb.eval.{inst['instance_id']}"],
+                capture_output=True, timeout=300, check=False)
             cprep = _container_setup(inst, workdir)
             spec = SessionSpec(
                 instance=inst, mode=config.mode,
@@ -1930,6 +2097,7 @@ def run_pilot(config: PilotConfig,
         "run_id": run_id, "mode": config.mode, "model": config.model,
         "devin_cli_version": ver, "interrupted": interrupted,
         "aborted": aborted,
+        "resume_exercised": resume_exercised,
         "final_state": ("aborted" if aborted
                        else ("interrupted" if interrupted
                            else "done")),
@@ -1941,11 +2109,16 @@ def run_pilot(config: PilotConfig,
         print(f"[pilot] ABORTED (exit {EXIT_RUN_FAILED}): the run "
               "aborted — recorded in the state file; the "
               "retry-eligible instances are the resume class")
+        _remove_stale_record(workdir)
         return EXIT_RUN_FAILED
 
     # the WP5 report + the go/no-go record
-    inst_records = [r for r in records
-                   if r.get("instance_id") is not None]
+    # the deduped last-line-per-instance view (the WP5 contract —
+    # ``rep.dedupe``): a superseded retry-class line (e.g. a stale
+    # instance-level ``preflight_failed`` shadowed by the resumed
+    # ``resolved`` line) must not flip the checklist items
+    finals, _ = rep.dedupe(records)
+    inst_records = list(finals.values())
     cal = calibrate(inst_records, config)
     meta = {
         "run_id": run_id,
@@ -1964,18 +2137,40 @@ def run_pilot(config: PilotConfig,
                    if config.mode == "sandbox" else
                    "swebench/sweb.eval.x86_64.* (one per instance)"),
     }
+    report_failed = False
     try:
         rep.generate(jsonl, os.path.join(workdir, "report"), meta)
         print("[pilot] WP5 report: ok")
     except rep.ReportError as exc:
-        print(f"[pilot] WP5 report: {type(exc).__name__}: {exc}")
+        # a failed report pipeline (ArtifactCheckError / generate
+        # failure) is a run failure — a corrupt report can never yield
+        # a GO: the state is recorded and no checklist renders (the
+        # resume class — fix the artifact reference and resume)
+        report_failed = True
+        print(f"[pilot] WP5 report FAILED: {type(exc).__name__}: {exc}")
+    if report_failed:
+        _write_state(workdir, run_id, {
+            "run_id": run_id, "mode": config.mode, "model": config.model,
+            "devin_cli_version": ver, "interrupted": False,
+            "aborted": False, "resume_exercised": resume_exercised,
+            "final_state": "report_failed",
+            "report_error": "the WP5 report pipeline failed",
+            "completed_this_invocation": rep_.done_count,
+            "ts": time.time(),
+        })
+        _remove_stale_record(workdir)
+        print(f"[pilot] REPORT FAILED (exit {EXIT_RUN_FAILED}): the "
+              "WP5 report pipeline failed — no verdict rendered; "
+              "the run is the resume class")
+        return EXIT_RUN_FAILED
     items = build_checklist(
         config=config, dry_run=False, gate=gate,
         preflight_ok=preflight_ok, preflight_failures=preflight_failures,
         records=inst_records, skipped_on_resume=skipped_on_resume,
         interrupted_this_run=None if not interrupted
         else {"completed": rep_.done_count},
-        interrupted_before=interrupted_before,
+        resume_after_interrupt=(interrupted_before
+                               or resume_exercised_before),
         devin_ok=bool(inst_records) and not run_failed,
         sessions_this_invocation=rep_.done_count,
         wall_budget_s=config.max_wall_s * config.max_sessions_per_day,

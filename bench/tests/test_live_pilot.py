@@ -99,14 +99,6 @@ def _entry(i: int, repo_path: str, base_commit: str,
     }
 
 
-def _mock_pilot(tmp: Path, mode: str = "sandbox", **kw) -> int:
-    """The CLI path with the mock as the devin binary (zero quota)."""
-    args = ["--mode", mode, "--devin-bin", MOCK_PATH,
-            "--largest-bytes", "1048576"]
-    args += kw.pop("args", [])
-    return lp.main(args + kw.pop("cli", []))
-
-
 def _run(cfg: lp.PilotConfig, make_session=None) -> int:
     return lp.run_pilot(cfg, make_session=make_session)
 
@@ -252,6 +244,11 @@ def test_mock_driven_full_pilot_sandbox(tmp_path, live):
         assert l["status"] == "eval_error", l
         m = l["meta"]
         assert m["eval_skip_reason"] == "no_container_runtime"
+        # the pruning record lands IN the persisted line (the round-3
+        # item-10 fix — the hook ran before the line was merged +
+        # persisted)
+        assert isinstance(m.get("pruning"), dict)
+        assert m["pruning"]["failed"] == []
         # the WP5 reference contract on every line
         for k in ("artifacts_dir", "patch_diff", "trajectory",
                   "eval_log"):
@@ -596,18 +593,49 @@ def test_host_check_infra_failure_is_eval_error(tmp_path, monkeypatch):
 
 
 def test_parse_pytest_ra():
+    # the real ``-rA`` shapes (the review finding: the old parser keyed
+    # on the raw line — a ``FAILED <id> - <reason>`` suffix landed in
+    # the key, and a ``SKIPPED [N] <file>:<line>: <reason>`` line
+    # never matched ``::`` at all):
     out = ("PASSED tests/a.py::test_a\n"
-           "FAILED tests/b.py::test_b\n"
-           "ERROR tests/c.py::test_c\n"
-           "SKIPPED tests/d.py::test_d\n"
+           "FAILED tests/b.py::test_b - AssertionError: 1 != 2\n"
+           "ERROR tests/c.py::test_c - ImportError: cannot import\n"
+           "SKIPPED [1] tests/d.py:45: needs network\n"
            "==================== 1 error, 1 failed, 1 passed in 0.1s "
            "====================\n")
-    res = lp._parse_pytest_ra(out)
-    assert res == {"tests/a.py::test_a": "passed",
-                  "tests/b.py::test_b": "failed",
-                  "tests/c.py::test_c": "error",
-                  "tests/d.py::test_d": "skipped"}
-    assert lp._parse_pytest_ra("no summary here") is None
+    res = lp._parse_pytest_ra(
+        out, ["tests/a.py::test_a", "tests/b.py::test_b",
+              "tests/c.py::test_c", "tests/d.py::test_d"])
+    assert res["tests/a.py::test_a"] == "passed"
+    # the ``- <reason>`` suffix is not part of the key
+    assert res["tests/b.py::test_b"] == "failed"
+    assert "tests/b.py::test_b - AssertionError" not in res
+    assert res["tests/c.py::test_c"] == "error"
+    # the ``file:line`` SKIPPED is attributed to the node id under the
+    # file (the ``file:line`` key itself is never a requested id)
+    assert res["tests/d.py::test_d"] == "skipped"
+
+    # a collection ``ERROR`` is a FILE-level line — it kills every
+    # requested node id under the file (the old parser filed it under
+    # ``missing`` instead)
+    out2 = ("ERROR tests/e.py - NameError: name 'x' is not defined\n"
+           "==================== 1 error in 0.1s ====================\n")
+    res2 = lp._parse_pytest_ra(
+        out2, ["tests/e.py::test_e1", "tests/e.py::test_e2"])
+    assert res2["tests/e.py::test_e1"] == "error"
+    assert res2["tests/e.py::test_e2"] == "error"
+
+    # an unrequested node id is still parsed (the caller's missing
+    # computation only looks at the requested set)
+    res3 = lp._parse_pytest_ra(
+        "PASSED tests/f.py::test_f\n", ["tests/g.py::test_g"])
+    assert res3["tests/f.py::test_f"] == "passed"
+    assert "tests/g.py::test_g" not in res3
+    assert lp._parse_pytest_ra("no summary here", []) is None
+    # a request with no own line and no file-level outcome is missing
+    res4 = lp._parse_pytest_ra(
+        "PASSED tests/h.py::test_h\n", ["tests/i.py::test_i"])
+    assert "tests/i.py::test_i" not in res4
 
 
 # ---------------------------------------------------------------------------
@@ -659,7 +687,7 @@ def _checklist_setup(**over):
         ],
         skipped_on_resume={},
         interrupted_this_run=None,
-        interrupted_before=False,
+        resume_after_interrupt=False,
         devin_ok=True,
         sessions_this_invocation=1,
         wall_budget_s=2700.0 * 10,
@@ -677,7 +705,7 @@ def test_checklist_verdict_gating(tmp_path, monkeypatch):
     # item 11 PASS → GO
     items = lp.build_checklist(**_checklist_setup(
         config=lp.PilotConfig(max_wall_s=2700.0, resume=True),
-        interrupted_before=True,
+        resume_after_interrupt=True,
         skipped_on_resume={"a": "no_patch"}))
     assert len(items) == 14
     verdict, failed = lp._verdict(items)
@@ -700,7 +728,7 @@ def test_checklist_verdict_gating(tmp_path, monkeypatch):
     # a failure
     items = lp.build_checklist(**_checklist_setup(
         interrupted_this_run={"completed": 1},
-        interrupted_before=False))
+        resume_after_interrupt=False))
     item11 = [i for i in items if i["item"].startswith("11")][0]
     assert item11["pass"] is None
     # a resume that was NOT preceded by the intentional interrupt
@@ -708,7 +736,7 @@ def test_checklist_verdict_gating(tmp_path, monkeypatch):
     # exercised by a plain resume
     items = lp.build_checklist(**_checklist_setup(
         config=lp.PilotConfig(max_wall_s=2700.0, resume=True),
-        interrupted_before=False,
+        resume_after_interrupt=False,
         skipped_on_resume={"a": "no_patch"}))
     item11 = [i for i in items if i["item"].startswith("11")][0]
     assert item11["pass"] is False
@@ -996,6 +1024,234 @@ def test_devin_version_guards_missing_binary(tmp_path, live):
     # pre-flight's ``which devin`` is the loud gate that follows
     assert lp.devin_version(str(tmp_path / "no-such-binary")) \
         .startswith("unknown")
+
+
+# ---------------------------------------------------------------------------
+# the review round-2 regressions (the PR #37 second review)
+# ---------------------------------------------------------------------------
+
+def test_extract_patch_includes_nested_untracked_dirs(tmp_path, live):
+    # the review finding: a collapsed untracked dir ≥2 components deep
+    # (``?? src/newpkg/``) was dropped whole — the lexical gate ran on
+    # the dir path (no source/test marker, not a ``.py``), so the
+    # agent's new package never reached the patch. Now the collapsed
+    # dir is expanded to its files and the guards run per file.
+    repo = tmp_path / "repo"
+    _make_repo(repo, name="mod.py")
+    (repo / "src").mkdir()
+    (repo / "src" / "newpkg").mkdir()
+    (repo / "src" / "newpkg" / "__init__.py").write_text("# pkg\n")
+    (repo / "src" / "newpkg" / "mod.py").write_text("x = 1\n")
+    (repo / "src" / "tests").mkdir()
+    (repo / "src" / "tests" / "test_new.py").write_text(
+        "def test_new(): pass\n")
+    ext = lp.extract_patch(str(repo))
+    assert "src/newpkg/mod.py" in ext["diff"]
+    assert "src/newpkg/__init__.py" in ext["diff"]
+    assert "src/tests/test_new.py" in ext["diff"]
+
+
+def test_extract_patch_excludes_generated_dirs(tmp_path, live):
+    # the review finding: ``.venv/`` / ``node_modules/`` (and ``.tox``,
+    # ``dist``, ``.mypy_cache``) passed the top-level gate, so every
+    # ``.py`` under them was intent-to-added — a routine agent ``python
+    # -m venv .venv`` blew the diff past the cap and the completed
+    # session was discarded. Now the whole dir is excluded (a single
+    # collapsed skip entry, no per-file walk of a 10k-file venv).
+    repo = tmp_path / "repo"
+    _make_repo(repo, name="mod.py")
+    for d, fname in ((".venv", "lib/site-packages/site.py"),
+                    ("node_modules", "pkg/index.js"),
+                    (".tox", "py/test-x.py"),
+                    ("dist", "out/build.py"),
+                    (".mypy_cache", "cache/x.py")):
+        dpath = repo / d
+        fpath = dpath / fname
+        fpath.parent.mkdir(parents=True, exist_ok=True)
+        fpath.write_text("x = 1\n")
+    ext = lp.extract_patch(str(repo))
+    for d in (".venv", "node_modules", ".tox", "dist",
+             ".mypy_cache"):
+        assert f"{d}/" not in ext["diff"], d
+        assert any(p == d + "/" and w == "exclusion pattern"
+                   for p, w in ext["skipped"]), d
+
+
+def test_extract_patch_unstages_pre_staged_junk(tmp_path, live):
+    # the review finding: the pre-staged-junk path (the agent ran
+    # ``git add`` on a junk file — porcelain ``"A "``) was untested.
+    # The exclusion list applies regardless of staging state: the junk
+    # is UNSTAGED, reported, and out of the diff.
+    repo = tmp_path / "repo"
+    _make_repo(repo, name="mod.py")
+    (repo / "mod.py").write_text("print('changed')\n")
+    (repo / "__pycache__").mkdir()
+    junk = repo / "__pycache__" / "mod.pyc"
+    junk.write_bytes(b"\x00x")
+    _git(repo, "add", "--", str(junk.relative_to(repo)))
+    (repo / "tests").mkdir()
+    binf = repo / "tests" / "blob.bin"
+    binf.write_bytes(b"\x00\x01\x02")
+    _git(repo, "add", "--", str(binf.relative_to(repo)))
+    ext = lp.extract_patch(str(repo))
+    assert "mod.py" in ext["diff"]
+    assert "mod.pyc" not in ext["diff"]
+    assert "blob.bin" not in ext["diff"]
+    why = {p: w for p, w in ext["skipped"]}
+    assert any("pre-staged" in w for w in why.values())
+    # unstaged: the working tree is back to a plain untracked state
+    p = _git(repo, "status", "--porcelain")
+    assert "A  " not in p.stdout.decode()
+
+
+def test_dry_run_verdict_na_and_removes_stale_record(tmp_path, live):
+    # the review finding: the dry-run skeleton rendered ``Verdict:
+    # NO-GO`` (``_verdict`` counted ``pass=None`` as failed) and the
+    # early exits left a stale verdict file standing. Now: a dry run
+    # renders ``n/a`` (it decides nothing) and the stale record from a
+    # previous invocation is removed, not clobbered-in-place.
+    wd = tmp_path / "wd"
+    wd.mkdir()
+    stale = wd / "wp6a-go-no-go.md"
+    stale.write_text("# stale\n**Verdict: GO**\n")
+    repos = _three_repos(tmp_path)
+    inst = _instances_file(tmp_path / "inst.json", repos)
+    rc = lp.main(["--mode", "sandbox", "--devin-bin", MOCK_PATH,
+                 "--instances", inst, "--workdir", str(wd),
+                 "--run-id", "dry", "--dry-run"])
+    assert rc == lp.EXIT_OK
+    gng = stale.read_text()
+    assert "**Verdict: n/a**" in gng
+    assert "**Verdict: GO**" not in gng
+    assert "stale" not in gng
+
+
+def test_preflight_binary_leg_missing_devin(tmp_path, live):
+    # the review finding: the docstring deferred to a ``which devin``
+    # pre-flight leg that did not exist. Now the ``binary`` leg is
+    # first: a missing binary is a pre-flight failure (exit 4, the
+    # batch marker — no session burned).
+    repos = _three_repos(tmp_path)
+    inst = _instances_file(tmp_path / "inst.json", repos)
+    wd = tmp_path / "wd"
+    rc = lp.main(["--mode", "sandbox",
+                 "--devin-bin", str(tmp_path / "no-such-devin"),
+                 "--instances", inst, "--workdir", str(wd),
+                 "--run-id", "bin", "--largest-bytes", "1048576"])
+    assert rc == lp.EXIT_RUN_FAILED
+    lines = _read_jsonl(wd / "run-bin.jsonl")
+    assert any(l["status"] == "preflight_failed"
+               and (l.get("meta") or {}).get("phase") == "batch"
+               for l in lines)
+
+
+def test_checklist_uses_deduped_view_on_resume(tmp_path, live):
+    # the review finding: the checklist iterated RAW checkpoint records
+    # — a superseded retry-class line (an instance-level
+    # ``preflight_failed`` carries no orphan/leak/pruning meta) flipped
+    # items 7/10/14 on the resumed run, a false NO-GO for an instance
+    # that completed cleanly. Now the checklist uses the deduped
+    # last-line-per-instance view (the WP5 contract).
+    r = tmp_path / "src"
+    commit = _make_repo(r)
+    inst = _instances_file(tmp_path / "inst.json",
+                          [_entry(0, str(r), commit)])
+    wd = tmp_path / "wd"
+    wd.mkdir()
+    # the artifact files the cross-check resolves (a ``resolved`` line
+    # requires a ``patch_diff`` reference)
+    adir = wd / "runs" / "test__repo0-1"
+    adir.mkdir(parents=True)
+    (adir / "patch.diff").write_text("diff --git a/x b/x\n+x = 1\n")
+    (adir / "trajectory.jsonl").write_text("")
+    (adir / "eval.log").write_text("ok\n")
+    iid = "test__repo0-1"
+    stale = {"instance_id": iid, "status": "preflight_failed",
+             "ts": 1000.0,
+             "meta": {"reason": "infra", "wall_s": 0.5,
+                     "artifacts_dir": None, "patch_diff": None,
+                     "trajectory": None, "eval_log": None}}
+    good = {"instance_id": iid, "status": "resolved",
+            "ts": 1001.0,
+            "meta": {"wall_s": 60.0,
+                    "wall": {"setup_s": 1.0, "session_s": 60.0,
+                            "eval_s": 5.0},
+                    "usage": {"totalTokens": 100},
+                    "permissions": {"requests": 0, "allowed": 0,
+                                   "denied": 0},
+                    "vendor_notifications": 0,
+                    "orphan_check": True,
+                    "pruning": {"removed": ["agent checkout"],
+                               "failed": []},
+                    "leak_guard": {"remotes_after": [],
+                                  "warnings": []},
+                    "leak_verify": {"remotes": [], "tags": [],
+                                   "clean": True},
+                    "artifacts_dir": "runs/test__repo0-1",
+                    "patch_diff": "patch.diff",
+                    "trajectory": "trajectory.jsonl",
+                    "eval_log": "eval.log"}}
+    jsonl = wd / "run-dedup.jsonl"
+    jsonl.write_text(
+        json.dumps(stale) + "\n" + json.dumps(good) + "\n")
+    # the previous invocation was the intentional interrupt (the state
+    # file) — item 11's resume-after-interrupt leg
+    (wd / "pilot-dedup.state.json").write_text(
+        json.dumps({"interrupted": True, "aborted": False}))
+    rc = lp.main(["--mode", "sandbox", "--devin-bin", MOCK_PATH,
+                 "--instances", str(inst), "--workdir", str(wd),
+                 "--run-id", "dedup", "--resume",
+                 "--no-host-check", "--largest-bytes", "1048576"])
+    assert rc == lp.EXIT_OK
+    gng = (wd / "wp6a-go-no-go.md").read_text()
+    # the deduped view (the ``resolved`` line) passes items 7/10/14 —
+    # the raw view (the superseded ``preflight_failed`` line) would
+    # have failed them
+    assert "**Verdict: GO**" in gng
+    assert "NOT PERFORMED" not in gng
+
+
+def test_repeat_resume_keeps_go_record(tmp_path, live):
+    # the review finding: a repeat ``--resume`` on a finished run pair
+    # rewrote the record to NO-GO (run 2 reset the state file's
+    # ``interrupted`` flag) — the GO was not durable. Now the AC3
+    # exercise is cumulative in the state (``resume_exercised``): the
+    # third invocation still renders GO and re-runs nothing.
+    repos = _three_repos(tmp_path)
+    inst = _instances_file(tmp_path / "inst.json", repos)
+    wd = tmp_path / "wd"
+    # the pair is FINISHED in the resume sense: every instance lands
+    # in a never-re-run terminal status (``no_patch`` — a mock mode;
+    # the host-check-off ``eval_error`` would be the retry class and
+    # legitimately re-run on the third invocation)
+    modes = {"test__repo0-1": "no_patch",
+            "test__repo1-1": "no_patch", "test__repo2-1": "no_patch"}
+    cfg1 = _cfg(tmp_path, str(inst), run_id="rr", workdir=str(wd),
+               interrupt_after=1)
+    assert _run(cfg1, make_session=_mock_make_session(modes)) \
+        == lp.EXIT_INTERRUPT
+    cfg2 = _cfg(tmp_path, str(inst), run_id="rr", workdir=str(wd),
+               resume=True)
+    assert _run(cfg2, make_session=_mock_make_session(modes)) \
+        == lp.EXIT_OK
+    assert "**Verdict: GO**" in (wd / "wp6a-go-no-go.md").read_text()
+    state2 = json.loads((wd / "pilot-rr.state.json").read_text())
+    assert state2["resume_exercised"] is True
+    # the third invocation: the finished pair — no instance session
+    # re-runs (the JSONL may gain batch-level marker lines — the
+    # instance lines are the quota-relevant count), the record stays GO
+    n_before = sum(1 for l in _read_jsonl(wd / "run-rr.jsonl")
+                  if l.get("instance_id"))
+    cfg3 = _cfg(tmp_path, str(inst), run_id="rr", workdir=str(wd),
+               resume=True)
+    assert _run(cfg3, make_session=_mock_make_session(modes)) \
+        == lp.EXIT_OK
+    assert sum(1 for l in _read_jsonl(wd / "run-rr.jsonl")
+              if l.get("instance_id")) == n_before
+    gng = (wd / "wp6a-go-no-go.md").read_text()
+    assert "**Verdict: GO**" in gng
+    state3 = json.loads((wd / "pilot-rr.state.json").read_text())
+    assert state3["resume_exercised"] is True
 
 
 # ---------------------------------------------------------------------------

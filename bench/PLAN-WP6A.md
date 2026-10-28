@@ -69,13 +69,24 @@ pilot report + leaderboard artifacts).
    (mirrors `bench/conftest.py`'s gate; `--dry-run` is zero-quota: config +
    instance-file validation, budget math, checklist skeleton — CI safe).
 2. **Pre-flight (real, WP3b `Preflight` legs, injected `run`/`disk_usage_fn`):**
+   - `binary` — `shutil.which(devin_bin)` finds an executable (a missing
+     binary is a loud pre-flight failure — the `devin version` probe is
+     informational only).
    - `auth` — `devin auth status` exits 0.
-   - `docker_daemon` / `docker_image` — **container mode only**.
+   - `docker_daemon` / `docker_image` — **container mode only** (the
+     per-instance image leg is **pull-if-missing**: a cold host pre-
+     flights the zero-quota `docker pull`, and the setup's pull then
+     no-ops — an inspect-only leg would abort before the setup could
+     run).
    - `sandbox_runtime` — sandbox mode: `git` + a `python3` interpreter present
      (the no-container substitute for the daemon/image legs; a failed leg
      aborts before burning a session, recorded `preflight_failed`).
    - `disk` — free disk ≥ 2 × largest expected image (container: the
      sweb.eval image floor, PLAN §7) / 2 × largest expected checkout (sandbox).
+   The pilot's **eager** pre-flight loop inspects only the instances this
+   invocation will **run** (the `resume_queue` view) — a `--resume` must
+   not pre-flight finished instances' container images (the prune `docker
+   rmi`'d them) or re-pull images a finished run already consumed.
 3. **Model gate (real, WP3b):** `gate_cost_tier(fetch_models_list(devin_bin),
    model)` — fail-closed; `swe-2-high` is `cost_tier == "Free"` (WP0 §7).
 
@@ -200,18 +211,23 @@ written to `<workdir>/wp6a-go-no-go.md` (auto-generated) and committed to
 `bench/notes/wp6a-go-no-go.md` with the run artifacts referenced.
 
 **Artifacts (per run, under `<workdir>/`):** `run-<run_id>.jsonl` (WP3b
-checkpoint, the `report.py` source of truth), `pilot-a-meta.json` (the WP5
-`methodology` meta: `run_id`, `devin_cli_version`, `model`, `cost_tier`,
-`prompt_template_hash`, `permission_policy`, `caps`, `harness_version`,
-`images` — "sandbox: no sweb.eval images (deviation)"), per-instance
-`runs/<instance_id>/{patch.diff, trajectory.jsonl (the AcpSession
-transcript dump), session.log (wall/usage/permission/vendor counts),
-host-check.log}` — the exact shapes `report.write_artifacts` /
-`check_artifacts` cross-check (the WP5 reference is the relative
-`meta.artifacts_dir = "runs/<instance_id>"` resolved against the JSONL's
-directory; a mismatch surfaces as an `ArtifactCheckError`), then
-`report.generate(...)` → the markdown report + `all_preds.jsonl` +
-`trajs/`.
+checkpoint, the `report.py` source of truth), `pilot-<run_id>.state.json`
+(the pilot's interrupt / abort / resume bookkeeping — including the
+cumulative `resume_exercised` flag), `pilot.lock` (the runner's
+overlap guard), per-instance `runs/<instance_id>/{patch.diff,
+trajectory.jsonl (the AcpSession transcript dump), eval.log (the
+host-check log: install/apply/pytest -rA + the verdict inputs)}` — the
+exact shapes `report.write_artifacts` / `check_artifacts` cross-check
+(the WP5 reference is the relative `meta.artifacts_dir =
+"runs/<instance_id>"` resolved against the JSONL's directory; a mismatch
+surfaces as an `ArtifactCheckError`, which fails the run — exit 4, no
+verdict rendered), the retained `clone-cache/` (sandbox: the shared
+bare-clone "base layers"), then `report.generate(...)` → `report/
+{report.md (the WP5 methodology meta — `run_id`, `devin_cli_version`,
+`model`, `cost_tier`, `prompt_template_hash`, `permission_policy`,
+`caps`, `harness_version`, `images` — embedded in the report; the meta
+is passed in-memory, not a separate file), all_preds.jsonl,
+trajs/<instance_id>.jsonl}`.
 
 ### `bench/pilot_instances.json` (new) — the pinned 3 instances
 

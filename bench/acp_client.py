@@ -702,6 +702,11 @@ class AcpSession:
         self.transcript: list[SessionEvent] = []
         #: every ignored vendor notification (logged, never an error)
         self.vendor_notifications: list[dict] = []
+        #: permission responses the client could NOT send (the process
+        #: was already dying — a request the server never heard; the
+        #: transcript entry is appended before the send attempt, so a
+        #: non-zero count is the "not all answered" signal)
+        self.permission_send_failures: int = 0
 
     # -- context manager -------------------------------------------------
 
@@ -1081,7 +1086,12 @@ class AcpSession:
                 deadline=time.monotonic() + 2.0,
             )
         except (OSError, ValueError, AcpError):
-            pass  # process dying — kill path covers it
+            # process dying — the kill path covers the session; but the
+            # unanswered REQUEST is recorded (the pilot's checklist item
+            # 6 must be able to observe a request the server never
+            # heard — the transcript entry alone is vacuous by
+            # construction)
+            self.permission_send_failures += 1
 
     def _kill_group(self) -> None:
         if self._killed or self._proc is None:

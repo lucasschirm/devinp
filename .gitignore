@@ -153,3 +153,4 @@ __pycache__/
 .pytest_cache/
 bench/notes/raw-frames.jsonl
 pilot-a/
+pilot-a-smoke/
