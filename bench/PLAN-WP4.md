@@ -103,13 +103,24 @@ Re-verified directly against the pinned wheel
    - `Timeout error: <n> seconds exceeded.` — appended to `test_output.txt`
      as the file's *final write* when the in-container test exec hits `-t`
      (hence tail-anchored); the harness also logs its own `Test timed out
-     after <n> seconds.` `EvaluationError` message into `run_instance.log`
-     (anchored on the number + trailing period — the harness echoes the
-     applied patch's `git diff`, context lines included, into
-     `run_instance.log`, so a bare substring could be the patch's own text).
+     after {timeout} seconds.` `EvaluationError` message into
+     `run_instance.log` — the number is *this run's `-t` value*
+     (`run_evaluation.py:379`), so the marker is tied to the run's own
+     test cap, not any number a patch's diff might contain.
    - `>>>>> Tests Timed Out` (`TESTS_TIMEOUT`) — the dataset eval-script's
      timeout marker, which grading reads *inside the test output*
      (`grading.py:137`) — it is never written to `run_instance.log`.
+   - **Echo-masked instance-log markers:** the harness reflects the patch
+     text into `run_instance.log` in exactly two places — the
+     `Git diff before:` / `Git diff after:` echoes (one logger call each,
+     the diff is the multi-line message body → un-prefixed continuation
+     lines). The terminal-class instance-log markers (the apply-fail line —
+     first line of its own logger call, `run_evaluation.py:332` — and the
+     timeout message — the traceback's last line) are *outside* those echo
+     regions, so the marker checks run on the log with the echo regions
+     masked: a patch containing marker text (a diff touching code or docs
+     carrying `>>>>> Patch Apply Failed`, or the exact timeout sentence)
+     cannot be triaged as the harness's verdict.
    - Markers are anchored and file-specific because `EvaluationTimeoutError`
      is *terminal* in WP3 while `HarnessFailedError` is the retried
      `eval_error` class — a loose substring in the wrong file (or echoed
@@ -232,12 +243,16 @@ it; the run id seeds the container name, the tempdir prefix and a log-path
 component). NUL bytes are rejected for every string that lands in an
 argv/shell context (dataset, split, workdir, python, model name — a NUL in
 an argv element would otherwise surface as a raw `ValueError` at `Popen`).
-`timeout` must be a positive int (bools excluded); `overall_timeout` a
-positive *finite* number (nan/inf would hang or immediately fire the
-watchdog); `model_name_or_path` is escaped `/` → `__` like the harness, but
-the escaped name must not be a log-path traversal (`.` / `..`).
+`timeout` must be a positive int (bools excluded; a huge int is refused —
+it would overflow the float conversion at spawn); `overall_timeout` a
+positive *finite* number (nan/inf/huge-int would hang or immediately fire
+the watchdog — `math.isnan`/`isinf` on a huge int raises a raw
+`OverflowError` the validation must not let out); `model_name_or_path` is
+escaped `/` → `__` like the harness, but the escaped name must not be a
+log-path traversal (`.` / `..`).
 `workdir` (str or path-like — an *empty* path-like resolves to the caller's
-CWD and is refused; a broken `__fspath__` raising is a typed refusal) and a
+CWD and is refused; a broken `__fspath__` raising — including a `RuntimeError`
+symlink-loop — is a typed refusal) and a
 non-callable `harness_runner` are refused the same way.
 
 **Return contract (AC3, typed `TypedDict` — the repo's first; the sibling

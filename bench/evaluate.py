@@ -46,6 +46,7 @@ harness's own artifacts to resolve the outcome:
   exits 0) → triage on harness-written markers, **by the file the pinned
   harness writes / the test output it grades** (``run_evaluation.py``,
   ``grading.py:137``): ``>>>>> Patch Apply Failed`` in ``run_instance.log``
+  (a harness-written line — the first line of its own logger call)
   → :class:`PatchCorruptionError` (the definitive corruption guard, AC4;
   wins over a timeout marker — a corrupt patch is terminal and a retry would
   just re-fail the apply); in ``test_output.txt``: the tail-anchored
@@ -53,9 +54,11 @@ harness's own artifacts to resolve the outcome:
   final write, or the dataset eval-script's ``>>>>> Tests Timed Out`` marker
   (graded *inside* the test output — never written to ``run_instance.log``);
   in ``run_instance.log``: the harness's own ``Test timed out after <n>
-  seconds.`` EvaluationError message (anchored on the number + trailing
-  period — the harness echoes the applied patch's ``git diff`` into the
-  instance log, so a bare substring could be the patch's own text)
+  seconds.`` EvaluationError message — the number is *this run's ``-t``
+  value* (``run_evaluation.py:379``) — checked on the log with the
+  harness's patch-diff echo regions (``Git diff before:`` / ``Git diff
+  after:``) masked, because the harness reflects the patch text into the
+  instance log in exactly those two places
   → :class:`EvaluationTimeoutError`
   (*terminal* in WP3 — hence the loose markers are anchored and
   file-specific: a docker-client/network line containing ``Timeout error:``
@@ -209,6 +212,7 @@ __all__ = [
     "DEFAULT_SPLIT",
     "DEFAULT_MODEL_NAME",
     "DEFAULT_TIMEOUT_S",
+    "DEFAULT_OVERALL_TIMEOUT_MARGIN_S",
     "EvaluationError",
     "InvalidInputError",
     "PatchCorruptionError",
@@ -255,20 +259,57 @@ _APPLY_PATCH_FAIL_MARKER = ">>>>> Patch Apply Failed"  # run_instance.log
 # hence tail-anchored), and ">>>>> Tests Timed Out" is the dataset
 # eval-script's timeout marker, which grading reads *inside* the test output
 # (grading.py:137) — it is never written to run_instance.log. The
-# instance-log marker is the harness's own "Test timed out after <n> seconds."
-# EvaluationError message via the logger (the traceback's last line) —
-# anchored on the number + trailing period: the harness echoes the applied
-# patch's ``git diff`` (context lines included) into run_instance.log, so a
-# bare substring could be the patch's own text. Markers are anchored and
-# file-specific because EvaluationTimeoutError is terminal in WP3 while
-# HarnessFailedError is the retried eval_error class — a loose substring in
-# the wrong file must not convert a retryable infra flake into a terminal
-# timeout.
+# instance-log markers are the harness's own lines: "Test timed out after
+# {timeout} seconds." (the EvaluationError message — its number is exactly
+# this run's -t, run_evaluation.py:379) and ">>>>> Patch Apply Failed:"
+# (the first line of its own logger call, run_evaluation.py:332). The
+# harness reflects the patch text into run_instance.log in exactly two
+# places — the "Git diff before:" / "Git diff after:" echoes
+# (run_evaluation.py:349/393; one logger call each, the diff is the
+# multi-line message body, so it spans un-prefixed continuation lines) —
+# so the terminal-class marker checks run on the instance log with those
+# echo regions masked: a patch containing marker text (a diff touching code
+# or docs carrying ">>>>> Patch Apply Failed", or the exact timeout
+# sentence) cannot be triaged as the harness's verdict. Markers are
+# anchored and file-specific because EvaluationTimeoutError is terminal in
+# WP3 while HarnessFailedError is the retried eval_error class — a loose
+# substring in the wrong file must not convert a retryable infra flake
+# into a terminal timeout.
 _TIMEOUT_MARKER_TEST_OUTPUT_TAIL = re.compile(
     r"Timeout error: \d+ seconds exceeded\.\s*$"
 )
 _TIMEOUT_MARKER_TEST_OUTPUT = ">>>>> Tests Timed Out"
-_TIMEOUT_MARKER_INSTANCE_LOG = re.compile(r"Test timed out after \d+ seconds\.")
+# A logger line in the harness's file log starts with the asctime prefix
+# (logging.Formatter default: "YYYY-MM-DD HH:MM:SS,ms - LEVEL - message" —
+# the milliseconds are optional-robust here).
+_LOG_LINE_PREFIX = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:,\d{3})? - ")
+
+
+def _mask_diff_echoes(instance_log: str) -> str:
+    """Blank the harness's patch-diff echo regions (the "Git diff before:"
+    / "Git diff after:" logger calls) so marker checks see only the lines
+    the harness itself wrote. The echo start line is logger-prefixed; the
+    diff body is un-prefixed continuation lines ending at the next
+    logger-prefixed line."""
+    out: list[str] = []
+    in_echo = False
+    for line in instance_log.splitlines(keepends=True):
+        if _LOG_LINE_PREFIX.match(line):
+            in_echo = "Git diff before:" in line or "Git diff after:" in line
+        elif in_echo:
+            line = "\n"
+        out.append(line)
+    return "".join(out)
+
+
+def _timeout_marker_for(timeout: int) -> re.Pattern:
+    """The instance-log timeout marker tied to *this* run's -t value: the
+    harness's own message is f"Test timed out after {timeout} seconds."
+    (run_evaluation.py:379 — ``{timeout}`` is exactly the -t we pass), so
+    the number is the run's own test cap, not any number a patch's diff
+    might contain. ``timeout`` is a validated positive int — digits only,
+    nothing to regex-escape."""
+    return re.compile(rf"Test timed out after {timeout} seconds\.")
 
 # The shared name character-set check (instance_id / run_id): the Docker
 # container-name charset, starting alphanumeric, without ".." (they become
@@ -546,9 +587,12 @@ def _validate_inputs(
     rejected for every string that lands in a shell/argv context (dataset,
     split, workdir, python, model_name_or_path — a NUL in an argv element
     would otherwise surface as a raw ``ValueError`` at Popen); ``timeout``
-    must be a positive int (bools excluded) and ``overall_timeout`` a
-    positive *finite* number (nan/inf would hang or immediately fire the
-    watchdog); ``model_name_or_path`` is escaped ``/`` → ``__`` like the
+    must be a positive int (bools excluded; a huge int is refused — it
+    would overflow the float conversion at spawn) and ``overall_timeout``
+    a positive *finite* number (nan/inf/huge-int would hang or immediately
+    fire the watchdog; ``math.isnan``/``isinf`` on a huge int raises a raw
+    ``OverflowError`` the validation must not let out);
+    ``model_name_or_path`` is escaped ``/`` → ``__`` like the
     harness, but the *escaped* name must not be a log-path traversal
     (``.``/``..``).
     """
@@ -587,6 +631,16 @@ def _validate_inputs(
     if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0:
         raise InvalidInputError(
             f"timeout must be a positive int (seconds), got {timeout!r}"
+        )
+    try:
+        float(timeout)
+    except OverflowError:
+        # a huge int timeout would overflow the float conversion at spawn
+        # (the bounded default watchdog is timeout + margin) — refuse it
+        # typed, never raw.
+        raise InvalidInputError(
+            "timeout must be a positive finite number of seconds (a huge int "
+            f"would overflow the float conversion at spawn), got {timeout!r}"
         )
     if not isinstance(dataset, str) or not dataset.strip() or "\x00" in dataset:
         raise InvalidInputError(
@@ -634,15 +688,28 @@ def _validate_inputs(
     if overall_timeout is not None and (
         isinstance(overall_timeout, bool)
         or not isinstance(overall_timeout, (int, float))
-        or math.isnan(overall_timeout)
-        or math.isinf(overall_timeout)
-        or overall_timeout <= 0
     ):
         raise InvalidInputError(
             "overall_timeout must be a positive finite number of seconds (or "
             f"None for the bounded default — timeout + "
             f"{DEFAULT_OVERALL_TIMEOUT_MARGIN_S} s), got {overall_timeout!r}"
         )
+    if overall_timeout is not None:
+        try:
+            # a huge int (e.g. 10**400) overflows the float conversion that
+            # isnan/isinf perform — a raw OverflowError this validation block
+            # must not let out.
+            not_finite = (
+                math.isnan(overall_timeout) or math.isinf(overall_timeout)
+            )
+        except OverflowError:
+            not_finite = True
+        if not_finite or overall_timeout <= 0:
+            raise InvalidInputError(
+                "overall_timeout must be a positive finite number of seconds "
+                f"(or None for the bounded default — timeout + "
+                f"{DEFAULT_OVERALL_TIMEOUT_MARGIN_S} s), got {overall_timeout!r}"
+            )
     if python is not None:
         if not isinstance(python, str) or not python.strip() or "\x00" in python:
             raise InvalidInputError(
@@ -900,14 +967,20 @@ def _triage_no_report(
     stdout: Any,
     stderr: Any,
     pre_log_mtimes: dict[str, "int | bool"],
+    timeout: int,
     workdir: Optional[str] = None,
 ) -> EvaluationError:
     """A harness run that exited 0 without producing a report.json (the
     harness swallows per-instance failures — it prints, it does not raise).
     Triage on harness-written markers only, **by the file the pinned harness
-    writes them to** — no re-grading:
+    writes them to** — no re-grading. The instance-log markers are checked
+    on the log with the harness's patch-diff echo regions masked (the
+    harness reflects the patch text into the log in exactly two places —
+    the "Git diff before:" / "Git diff after:" echoes), so a patch
+    containing marker text cannot masquerade as a harness verdict:
 
-    * ``APPLY_PATCH_FAIL`` in run_instance.log → the harness's own git-apply
+    * ``APPLY_PATCH_FAIL`` in run_instance.log (a harness-written line —
+      the first line of its own logger call) → the harness's own git-apply
       chain failed → :class:`PatchCorruptionError` (definitive corruption
       guard, AC4; wins over the timeout marker — a corrupt patch is a
       terminal verdict and a retry would just re-fail the apply).
@@ -916,10 +989,10 @@ def _triage_no_report(
       ``>>>>> Tests Timed Out`` in test_output.txt (the dataset
       eval-script's timeout marker — graded inside the test output,
       ``grading.py:137``; never written to run_instance.log), or the
-      harness's ``Test timed out after <n> seconds.`` EvaluationError
-      message in run_instance.log (anchored on the number + trailing
-      period — the harness echoes the applied patch's ``git diff`` into
-      the instance log, so a bare substring could be the patch's own text)
+      harness's ``Test timed out after {timeout} seconds.``
+      EvaluationError message in run_instance.log — the number is *this
+      run's -t value* (``run_evaluation.py:379``), and the check runs on
+      the echo-masked log
       → :class:`EvaluationTimeoutError` (terminal in
       WP3 — hence the loose markers are anchored and file-specific: a
       docker-client/network line containing ``Timeout error:`` in the
@@ -951,12 +1024,21 @@ def _triage_no_report(
         except OSError:
             return True
 
-    apply_fail = _APPLY_PATCH_FAIL_MARKER in instance_log
+    # The terminal-class instance-log markers are checked on the log with
+    # the harness's patch-diff echo regions masked: the patch text can
+    # appear in the instance log *only* inside those echoes, while the
+    # harness's own marker lines (the apply-fail marker — first line of its
+    # own logger call — and the timeout EvaluationError — the traceback's
+    # last line) are outside them.
+    instance_log_harness = _mask_diff_echoes(instance_log)
+    apply_fail = _APPLY_PATCH_FAIL_MARKER in instance_log_harness
     timeout_test_output = (
         _TIMEOUT_MARKER_TEST_OUTPUT_TAIL.search(test_output) is not None
         or _TIMEOUT_MARKER_TEST_OUTPUT in test_output
     )
-    timeout_instance_log = _TIMEOUT_MARKER_INSTANCE_LOG.search(instance_log) is not None
+    timeout_instance_log = (
+        _timeout_marker_for(timeout).search(instance_log_harness) is not None
+    )
     if apply_fail and not _stale("instance", paths["instance"]):
         return PatchCorruptionError(
             "the harness's git-apply chain rejected model_patch "
@@ -1261,13 +1343,17 @@ def evaluate(
         # The outer watchdog fired: the harness process was killed, but the
         # docker-managed eval container may still be running — surface its
         # name for cleanup — and the partial output must not be discarded.
+        # The log paths are re-read *now* (not the pre-spawn snapshot): the
+        # harness may already have written run_instance.log / test_output.txt
+        # before the kill, and for a re-used workdir the pre-spawn snapshot
+        # would report the previous run's files as this run's.
         raise HarnessFailedError(
             f"the outer watchdog fired after {watchdog}s (the eval "
             f"container sweb.eval.{instance_id.lower()}.{run_id} — possibly "
             "with a .{timestamp} 409-retry suffix — may still be running; "
             "'docker rm -f' it)",
             instance_id=instance_id,
-            log_paths=log_paths,
+            log_paths=_existing_log_paths(paths),
             output_tail=_combined_tail(
                 getattr(e, "output", None),
                 getattr(e, "stderr", None),
@@ -1351,6 +1437,7 @@ def evaluate(
         stdout=stdout,
         stderr=stderr,
         pre_log_mtimes=pre_log_mtimes,
+        timeout=timeout,
         workdir=str(workdir_abs),
     )
 

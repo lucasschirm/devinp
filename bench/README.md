@@ -322,9 +322,12 @@ contract — never a traceback with exit 1).
   — with `None`, the default, the watchdog is `timeout + 1800` s; pass an
   explicit value to override); pre-spawn filesystem work, a spawn failure
   and the watchdog firing (its typed error surfaces the
-  possibly-still-running eval container name + the partial output) are
-  typed `HarnessFailedError`, never a raw escape (a `Path.resolve()`
-  symlink-loop `RuntimeError` on the workdir included).
+  possibly-still-running eval container name + the partial output, and
+  re-reads the log paths *after* the kill so it carries the artifacts the
+  harness already wrote — not the pre-spawn snapshot) are typed
+  `HarnessFailedError`, never a raw escape (a `Path.resolve()`
+  symlink-loop `RuntimeError` on the workdir and the `OverflowError` a
+  huge-int `timeout`/`overall_timeout` would raise at spawn included).
   Typed errors an injected runner raises *stay typed*. Every typed error
   raised after the workdir is resolved carries `error.workdir` (with
   `workdir=None` that is the auto-created tempdir), so the caller-owned
@@ -382,10 +385,12 @@ contract — never a traceback with exit 1).
   tail-anchored `Timeout error: N seconds exceeded.` marker (the harness's
   final write) or `>>>>> Tests Timed Out` (the dataset eval-script's
   marker, graded *inside* the test output) in `test_output.txt`, or the
-  harness's own `Test timed out after N seconds.` message in
-  `run_instance.log` (anchored on the number + trailing period — the
-  harness echoes the applied patch's `git diff` into the instance log, so
-  a bare substring could be the patch's own text) → `EvaluationTimeoutError`
+  harness's own `Test timed out after <n> seconds.` message in
+  `run_instance.log` — the number is *this run's `-t` value*
+  (`run_evaluation.py:379`) — checked on the log with the harness's
+  patch-diff echo regions (`Git diff before:` / `Git diff after:`) masked,
+  because the harness reflects the patch text into the instance log in
+  exactly those two places → `EvaluationTimeoutError`
   (terminal in WP3 — hence the loose markers are anchored and file-specific,
   so a docker-client flake cannot zero out a retryable instance),
   anything else →
