@@ -51,6 +51,7 @@ protobuf==7.36.2
 pyarrow==26.0.0
 Pygments==2.21.0
 pytest==9.1.1
+pytest-timeout==2.4.0
 python-dateutil==3.0.0
 python-discovery==1.6.4
 python-dotenv==1.2.4

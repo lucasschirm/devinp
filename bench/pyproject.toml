@@ -12,6 +12,10 @@ requires-python = ">=3.11"
 dependencies = [
     "swebench==5.0.2",
     "pytest>=8",
+    # test-only watchdog: the Docker-gated integration tests carry
+    # pytest.mark.timeout (a wedged pull must fail the test, not hang the
+    # job); without the plugin the marker is inert (a plain warning).
+    "pytest-timeout>=2",
 ]
 
 [tool.pytest.ini_options]
@@ -19,7 +23,7 @@ testpaths = ["tests", "probes"]
 
 [tool.setuptools]
 # Explicit flat-layout declaration: the only importable modules are
-# acp_client + mock_devin + runner (conftest.py / probes / tests are
-# dev-only, notes/ is recon data). Without this, setuptools flat-layout
+# acp_client + mock_devin + runner + evaluate (conftest.py / probes / tests
+# are dev-only, notes/ is recon data). Without this, setuptools flat-layout
 # discovery fails on the multiple top-level directories.
-py-modules = ["acp_client", "mock_devin", "runner"]
+py-modules = ["acp_client", "mock_devin", "runner", "evaluate"]
