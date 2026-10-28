@@ -53,6 +53,7 @@ import pytest
 
 import acp_client as ac
 import live_pilot as lp
+import report as rep
 import runner as rr
 
 MOCK_PATH = str(Path(__file__).resolve().parent.parent / "mock_devin.py")
@@ -1543,6 +1544,273 @@ def test_main_catch_all_is_exit_4(tmp_path, live, monkeypatch):
                  _instances_file(tmp_path / "i.json", [_entry(0, "/x", "a")]),
                  "--workdir", str(tmp_path)])
     assert rc == lp.EXIT_RUN_FAILED
+
+
+# ---------------------------------------------------------------------------
+# the fourth review round's regressions (PR #37 pr-review round 4)
+# ---------------------------------------------------------------------------
+
+def test_session_env_authoritative_not_overlaid(tmp_path, monkeypatch):
+    # the BLOCKER: ``AcpSession.start`` built the child env as
+    # ``dict(os.environ)`` overlaid by ``self._env`` — every key the
+    # pilot stripped (and the DEVIN_MODEL / refusal pops) was
+    # re-inherited from the host. Now a caller-supplied env is
+    # authoritative; the host env is the default only for a bare
+    # session (container mode's shim — whose agent env comes from
+    # the ``docker exec -e`` flags, not its own env)
+    captured: dict = {}
+
+    class FakePopen:
+        def __init__(self, cmd, **kw):
+            captured["env"] = kw.get("env")
+            raise OSError("the spawn is stopped — the env is captured")
+
+    monkeypatch.setattr(lp.subprocess, "Popen", FakePopen)
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_leak_check")
+    s = ac.AcpSession("devin", env={"PATH": "/x", "HOME": "/y"})
+    try:
+        s.start()
+    except OSError:
+        pass
+    assert captured["env"].get("GITHUB_TOKEN") is None
+    assert captured["env"] == {"PATH": "/x", "HOME": "/y"}
+    # a bare session (no env) still gets the host env
+    captured.clear()
+    s2 = ac.AcpSession("devin")
+    try:
+        s2.start()
+    except OSError:
+        pass
+    assert captured["env"].get("GITHUB_TOKEN") == "ghp_leak_check"
+    # the refusal fallback stays out in every case
+    monkeypatch.setenv("DEVIN_REFUSAL_FALLBACK", "1")
+    s3 = ac.AcpSession("devin", env={"PATH": "/x"})
+    try:
+        s3.start()
+    except OSError:
+        pass
+    assert captured["env"].get("DEVIN_REFUSAL_FALLBACK") is None
+
+
+def test_report_failure_keeps_interrupted_state(tmp_path, live,
+                                                 monkeypatch):
+    # a report failure on an interrupted pair must not clobber the
+    # durable interrupt record (the follow-up --resume's item-11
+    # gate reads interrupted_before — the clobber made AC3
+    # unprovable and the pair render NO-GO)
+    repos = _three_repos(tmp_path)
+    inst = _instances_file(tmp_path / "inst.json", repos)
+
+    def _raise(*a, **k):
+        raise rep.ReportError("the report pipeline failed")
+
+    monkeypatch.setattr(lp.rep, "generate", _raise)
+    cfg = _cfg(tmp_path, inst, interrupt_after=1, host_check=False)
+    rc = lp.run_pilot(cfg, make_session=_mock_make_session("ok"))
+    assert rc == lp.EXIT_RUN_FAILED
+    state = json.loads(
+        next(tmp_path.glob("pilot-*.state.json")).read_text())
+    assert state["interrupted"] is True
+    assert state["final_state"] == "report_failed"
+
+
+def test_budget_counts_superseded_attempts(tmp_path, live):
+    # a superseded attempt (eval_error → rerun) burned a session +
+    # wall the deduped view would silently drop — the gate must
+    # count ATTEMPTS (all instance-id lines), like WP5's session
+    # arithmetic
+    repos = _three_repos(tmp_path)
+    inst = _instances_file(tmp_path / "inst.json", repos)
+    wd = tmp_path / "wd"
+    # run 1: instance 0 runs (mock ok + host check off →
+    # eval_error, the documented skip)
+    cfg1 = _cfg(tmp_path, str(inst), run_id="att", workdir=str(wd),
+               interrupt_after=1, host_check=False)
+    assert _run(cfg1, _mock_make_session("ok")) == lp.EXIT_INTERRUPT
+    # run 2 (resume): instance 0 is RETRY (eval_error) → re-run as
+    # no_patch (superseded line); instances 1–2 run (eval_error)
+    modes2 = {"test__repo0-1": "no_patch",
+             "test__repo1-1": "ok", "test__repo2-1": "ok"}
+    cfg2 = _cfg(tmp_path, str(inst), run_id="att", workdir=str(wd),
+               resume=True, host_check=False)
+    assert _run(cfg2, _mock_make_session(modes2)) == lp.EXIT_OK
+    # 4 attempt lines: i0×2 (the superseded pair) + i1 + i2 — the
+    # deduped view would say 3
+    gng = (wd / "wp6a-go-no-go.md").read_text()
+    row12 = [l for l in gng.splitlines() if l.startswith("| 12 |")][0]
+    assert "sessions (attempts, incl. reruns): 4" in row12, row12
+
+
+def test_instance_id_charset_validation(tmp_path, live):
+    # the id is joined into workdir paths and interpolated into the
+    # shim's shell script — ``..`` / metacharacters are a config
+    # error at validation time
+    base = _entry(0, "/x", "abc")
+    for bad in ("evil/../../x", "a b", "id;rm -rf /", "id|whoami"):
+        b = dict(base)
+        b["instance_id"] = bad
+        f = tmp_path / f"bad{abs(hash(bad))}.json"
+        _instances_file(f, [b])
+        with pytest.raises(lp.PilotConfigError):
+            lp.load_instances(str(f))
+    good = dict(base)
+    good["instance_id"] = "owner__repo-123"
+    f = tmp_path / "good.json"
+    _instances_file(f, [good])
+    out = lp.load_instances(str(f))
+    assert out[0]["instance_id"] == "owner__repo-123"
+
+
+def test_oversize_patch_is_eval_error_not_fatal(tmp_path, live,
+                                                monkeypatch):
+    # an oversize patch is the instance class (eval_error —
+    # recorded, the queue not aborted, a resume may retry), not a
+    # run-killing fatal (the fatal re-burns the full session at
+    # quota on every resume before hitting the same cap)
+    monkeypatch.setattr(lp, "PATCH_SIZE_CAP_BYTES", 1)
+    repos = _three_repos(tmp_path)
+    inst = _instances_file(tmp_path / "inst.json", repos)
+    wd = tmp_path / "wd"
+    cfg = _cfg(tmp_path, str(inst), run_id="big", workdir=str(wd),
+              interrupt_after=1)
+    # the run converges: the oversize patch is recorded (eval_error)
+    # and the intentional interrupt fires — a FATAL (exit 4) would
+    # have aborted before the interrupt and written no line
+    rc = lp.run_pilot(cfg, make_session=_mock_make_session("ok"))
+    assert rc == lp.EXIT_INTERRUPT
+    lines = _read_jsonl(wd / "run-big.jsonl")
+    assert len(lines) == 1
+    assert lines[0]["status"] == "eval_error"
+    assert "exceeds the cap" in (
+        (lines[0]["meta"].get("eval_skip_reason") or ""))
+
+
+def test_quota_429_word_boundary():
+    # a bare ``429`` substring false-positives on incidental digits
+    # (a 1429 byte count, a port 4290) and parks the batch in the
+    # sleep-to-next-UTC-midnight backoff — the numeric marker must
+    # match as a whole number
+    assert lp._quota_marker_hit("http 429 too many requests")
+    assert lp._quota_marker_hit("error: 429")
+    assert lp._quota_marker_hit("rate limit reached")
+    assert not lp._quota_marker_hit("transferred 1429 bytes")
+    assert not lp._quota_marker_hit("listening on port 4290")
+    assert not lp._quota_marker_hit("at 14:29:05 the build ran")
+
+
+def test_largest_bytes_zero_is_config_error(tmp_path, monkeypatch):
+    # an explicit ``--largest-bytes 0`` is a config error, not a
+    # silent replacement by the default (the ``or`` fallback covers
+    # absence only)
+    monkeypatch.delenv(lp.LIVE_ENV, raising=False)
+    rc = lp.main(["--mode", "sandbox", "--devin-bin", MOCK_PATH,
+                 "--instances",
+                 _instances_file(tmp_path / "i.json",
+                                [_entry(0, "/x", "a")]),
+                 "--workdir", str(tmp_path), "--largest-bytes", "0"])
+    assert rc == lp.EXIT_CONFIG
+
+
+def test_pinned_image_consumed(tmp_path, live, monkeypatch):
+    # the instance file's PINNED ``image`` field must be what is
+    # pulled (a custom file whose pinned image diverges from the
+    # derivation must not silently pull the derived name)
+    vers = tmp_path / "versions"
+    vers.mkdir()
+    monkeypatch.setenv("DEVIN_VERSIONS_DIR", str(vers))
+    calls: list = []
+
+    def fake_run(args, **kw):
+        a = [str(x) for x in args]
+        calls.append(a)
+        return _fake_completed(0, b"")
+
+    monkeypatch.setattr(lp.subprocess, "run", fake_run)
+    inst = _entry(0, "/tmp/x", "abc123")
+    inst["image"] = "custom.registry/eval:pin-42"
+    lp._container_setup(inst, str(tmp_path))
+    pulls = [c for c in calls if c[0] == "docker" and c[1] == "pull"]
+    assert pulls[0][2] == "custom.registry/eval:pin-42"
+
+
+def test_container_guard_runs_in_testbed_group(tmp_path, live,
+                                               monkeypatch):
+    # only the first ``git remote remove`` was &&-chained to
+    # ``cd /testbed`` — a cd failure ran the rest (incl. the
+    # ``git remote`` probe) in the container's default cwd, reading
+    # remotes from the wrong repository. The whole ref-stripping
+    # sequence is now a { …; } group under the cd
+    vers = tmp_path / "versions"
+    vers.mkdir()
+    monkeypatch.setenv("DEVIN_VERSIONS_DIR", str(vers))
+
+    def fake_run(args, **kw):
+        return _fake_completed(0, b"")
+
+    monkeypatch.setattr(lp.subprocess, "run", fake_run)
+    inst = _entry(0, "/tmp/x", "abc123")
+    lp._container_setup(inst, str(tmp_path))
+    shim = (tmp_path / "devin-shim-test__repo0-1").read_text()
+    # the guard script is the sh -c payload of the docker exec —
+    # verify the shape via a fresh capture
+    guard: list = []
+
+    def cap_run(args, **kw):
+        a = [str(x) for x in args]
+        if a[0] == "docker" and a[1] == "exec" and "-c" in a:
+            guard.append(a[a.index("-c") + 1])
+        return _fake_completed(0, b"")
+
+    monkeypatch.setattr(lp.subprocess, "run", cap_run)
+    lp._container_setup(inst, str(tmp_path))
+    guards = [g for g in guard if g.startswith("cd /testbed")]
+    assert len(guards) == 1
+    g = guards[0]
+    assert g.startswith("cd /testbed && { ")
+    assert g.rstrip().endswith("git remote; }")
+
+
+def test_add_n_separator_includes_leading_dash_file(tmp_path):
+    # an agent-created leading-dash filename is a path, not an
+    # option — without the ``--`` separator the ``git add -N``
+    # would fail and the extraction would be a run-killing
+    # PilotError (the ``git reset --`` below already guarded the
+    # same list)
+    repo = tmp_path / "repo"
+    _make_repo(repo, name="mod.py")
+    (repo / "tests").mkdir()
+    (repo / "tests" / "-dash.py").write_text("x = 1\n")
+    out = lp.extract_patch(str(repo))
+    assert "tests/-dash.py" in out["included"], out["included"]
+
+
+def test_early_exits_remove_stale_record(tmp_path, monkeypatch):
+    # exit 2 (config) and exit 3 (live-refused) return before
+    # run_pilot's removal could run — the stale verdict must be
+    # gone on those paths too (a stale verdict is never kept)
+    for args, env_state, expected in (
+            (["--mode", "sandbox", "--devin-bin", MOCK_PATH,
+              "--instances",
+              _instances_file(tmp_path / "i.json",
+                             [_entry(0, "/x", "a")]),
+              "--largest-bytes", "0"],
+             "unset", lp.EXIT_CONFIG),
+            (["--mode", "sandbox", "--devin-bin", MOCK_PATH,
+              "--instances",
+              _instances_file(tmp_path / "i2.json",
+                             [_entry(0, "/x", "a")])],
+             "unset", lp.EXIT_LIVE_REFUSED)):
+        wd = tmp_path / f"wd-{expected}"
+        wd.mkdir(exist_ok=True)
+        stale = wd / "wp6a-go-no-go.md"
+        stale.write_text("**Verdict: GO** (stale)\n")
+        if env_state == "unset":
+            monkeypatch.delenv(lp.LIVE_ENV, raising=False)
+        else:
+            monkeypatch.setenv(lp.LIVE_ENV, "1")
+        rc = lp.main([*args, "--workdir", str(wd)])
+        assert rc == expected
+        assert not stale.exists()
 
 
 # ---------------------------------------------------------------------------

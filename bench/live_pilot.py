@@ -140,11 +140,25 @@ _EXCLUDE_PATTERNS = (
 )
 
 #: Quota / rate-limit signal markers (PLAN §2.3: the ACP stop reason,
-#: the CLI stderr, or a non-zero exit with quota text).
+#: the CLI stderr, or a non-zero exit with quota text). The numeric
+#: ``429`` marker is matched as a whole number (a bare substring would
+#: false-positive on incidental digits — a ``1429`` byte count, a port
+#: ``4290`` — and park the batch in the sleep-to-next-UTC-midnight
+#: backoff for no reason).
 _QUOTA_MARKERS = (
-    "quota", "rate limit", "rate_limit", "rate-limit", "429",
+    "quota", "rate limit", "rate_limit", "rate-limit",
     "too many requests", "usage limit",
 )
+_QUOTA_429_RE = re.compile(r"(?<!\d)429(?!\d)")
+
+
+def _quota_marker_hit(text: str) -> bool:
+    """The marker match over one text (stop reason or the stderr
+    tail, lowercased): the text markers as substrings, the numeric
+    ``429`` as a whole number."""
+    if _QUOTA_429_RE.search(text):
+        return True
+    return any(m in text for m in _QUOTA_MARKERS)
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +302,23 @@ def load_instances(path: str) -> list:
             raise PilotConfigError(
                 f"instance {i} ({inst.get('instance_id', '?')!r}) is "
                 f"missing required field(s): {', '.join(missing)}")
+        # the instance_id is joined into workdir paths
+        # (``runs/<iid>``, ``devin-shim-<iid>``) and interpolated into
+        # the docker-exec shim's shell script — a charset restriction
+        # (the WP4 ``_charset_ok`` / WP5 ``_IID_CHARSET`` analogue)
+        # keeps a custom ``--instances`` file from writing outside the
+        # workdir (``..``) or injecting shell commands
+        iid = inst["instance_id"]
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", iid):
+            raise PilotConfigError(
+                f"instance {i}: instance_id {iid!r} has characters "
+                "outside [A-Za-z0-9._-] (the id is joined into "
+                "workdir paths and interpolated into the docker-exec "
+                "shim script — no metacharacters)")
+        if ".." in iid:
+            raise PilotConfigError(
+                f"instance {i}: instance_id {iid!r} must not contain "
+                "'..' (path traversal)")
         # the two list fields: an **empty** list is valid (an instance
         # with no PASS_TO_PASS); only absence / a wrong type fails
         for k in ("FAIL_TO_PASS", "PASS_TO_PASS"):
@@ -319,6 +350,23 @@ def _git(cwd: str, *args: str, timeout_s: float = 120.0) -> "subprocess.Complete
     return subprocess.run(
         ["git", "-C", cwd, *args],
         capture_output=True, timeout=timeout_s, check=False)
+
+
+class PilotPatchTooLarge(PilotError):
+    """A patch that exceeds the size cap (PLAN §4) — an
+    *instance*-class failure (the ``eval_error`` route: recorded in
+    the checkpoint, the queue is not aborted, a resume may retry with
+    a fresh session that could produce a smaller patch), not a
+    run-killing fatal (the fatal writes no checkpoint line, so every
+    ``--resume`` re-runs the full session at quota before hitting the
+    same deterministic cap — and aborts the whole queue, leaving the
+    run unconvergeable)."""
+
+    def __init__(self, size: int, cap: int) -> None:
+        super().__init__(
+            f"patch size {size} exceeds the cap {cap} bytes (PLAN §4)")
+        self.size = size
+        self.cap = cap
 
 
 def apply_leak_guard(testbed: str) -> dict:
@@ -555,8 +603,12 @@ def extract_patch(cwd: str) -> dict:
     if add_args:
         # a failing pathspec must not be silent: an unchecked
         # ``git add -N`` would leave the intent-to-add missing and
-        # ``git diff HEAD`` would quietly drop the agent's files
-        p = _git(cwd, "add", "-N", *add_args)
+        # ``git diff HEAD`` would quietly drop the agent's files.
+        # The ``--`` separator: an agent-created leading-dash
+        # filename is a path, not an option (without it the add
+        # would fail and this would be a run-killing PilotError —
+        # the ``git reset --`` directly below guards the same list)
+        p = _git(cwd, "add", "-N", "--", *add_args)
         if p.returncode != 0:
             raise PilotError(
                 "git add -N failed: "
@@ -580,9 +632,7 @@ def extract_patch(cwd: str) -> dict:
     warnings: list = []
     total = len(diff.encode("utf-8", "replace"))
     if total > PATCH_SIZE_CAP_BYTES:
-        raise PilotError(
-            f"patch size {total} exceeds the cap "
-            f"{PATCH_SIZE_CAP_BYTES} bytes (PLAN §4)")
+        raise PilotPatchTooLarge(total, PATCH_SIZE_CAP_BYTES)
 
     # the porcelain cross-check (PLAN §4: the diff and the working tree
     # agree): every diff path must be a tracked change or an included
@@ -714,8 +764,17 @@ class PilotSession(rr.AgentSession):
             self._write_trajectory()
             return "quota_limited"
 
-        # the patch (PLAN §4)
-        ext = extract_patch(self._extract_repo_dir())
+        # the patch (PLAN §4) — an oversize patch is the
+        # ``eval_error`` instance class, not a run fatal (see
+        # PilotPatchTooLarge): the checkpoint line is written, the
+        # queue is not aborted, a resume may retry
+        try:
+            ext = extract_patch(self._extract_repo_dir())
+        except PilotPatchTooLarge as exc:
+            self.meta["eval_skip_reason"] = str(exc)[:200]
+            self._write_eval_log(f"eval skipped: {exc}")
+            self._write_trajectory()
+            return "eval_error"
         self.meta["patch_warnings"] = ext.get("warnings", [])
         self.meta["patch_skipped"] = ext.get("skipped", [])
         self.meta["patch_included"] = ext.get("included", [])
@@ -866,12 +925,10 @@ class PilotSession(rr.AgentSession):
 
     def _quota_signal(self, result: ac.PromptResult) -> bool:
         stop = (result.stop_reason or "").lower()
-        if any(m in stop for m in _QUOTA_MARKERS):
+        if _quota_marker_hit(stop):
             return True
         tail = self._stderr_tail().lower()
-        if any(m in tail for m in _QUOTA_MARKERS):
-            return True
-        return False
+        return _quota_marker_hit(tail)
 
     def _write_trajectory(self) -> None:
         os.makedirs(self._artifact_dir(), exist_ok=True)
@@ -1274,6 +1331,19 @@ def _host_versions_dir() -> str:
         "_versions directory (container mode, WP0 §2)")
 
 
+def _image_for(inst: dict) -> str:
+    """The instance's ``sweb.eval`` image — the instance file's
+    **pinned** ``image`` field when present (a custom instances file
+    whose pinned image diverges from the derivation must pull the
+    pinned one, not the derived name), otherwise the WP3b default
+    derivation (the Docker-Hub ``__`` → ``_1776_`` escape)."""
+    img = inst.get("image")
+    if isinstance(img, str) and img:
+        return img
+    return ("swebench/sweb.eval.x86_64."
+            + inst["instance_id"].replace("__", "_1776_"))
+
+
 def _container_setup(inst: dict, workdir: str) -> dict:
     """The container-mode setup (PLAN §3.1–§3.6): the ``sweb.eval``
     image start, the **real**-binary injection (the ``_versions`` tree —
@@ -1282,7 +1352,7 @@ def _container_setup(inst: dict, workdir: str) -> dict:
     ``devin_bin`` (the WP1 client spawns one command — the shim forwards
     it into the container with the isolated env, PLAN §3.2/§3.5)."""
     iid = inst["instance_id"]
-    img = "swebench/sweb.eval.x86_64." + iid.replace("__", "_1776_")
+    img = _image_for(inst)
     versions = _host_versions_dir()
     subprocess.run(["docker", "pull", img], check=True, timeout=7200)
     subprocess.run(
@@ -1311,13 +1381,14 @@ def _container_setup(inst: dict, workdir: str) -> dict:
     # item 14 evidence)
     p = subprocess.run(
         ["docker", "exec", f"sweb.eval.{iid}", "sh", "-c",
-         "cd /testbed && git remote remove origin 2>/dev/null; "
+         "cd /testbed && { "
+         "git remote remove origin 2>/dev/null; "
          "git checkout --detach 2>/dev/null; "
          "git for-each-ref --format='%(refname:short)' refs/heads/ "
          "| xargs -r -n1 git branch -D 2>/dev/null; "
-         "git tag -l | xargs -r git tag -d; "
-         "git reflog expire --expire=now --all; "
-         "git remote"],
+         "git tag -l | xargs -r git tag -d 2>/dev/null; "
+         "git reflog expire --expire=now --all 2>/dev/null; "
+         "git remote; }"],
         capture_output=True, timeout=300)
     leak_guard = {
         "warnings": ([] if p.returncode == 0 else
@@ -1353,7 +1424,8 @@ def _container_setup(inst: dict, workdir: str) -> dict:
 # run_preflight_checks so the short-circuit + wrapping hold)
 # ---------------------------------------------------------------------------
 
-def make_preflight(config: PilotConfig) -> Callable:
+def make_preflight(config: PilotConfig,
+                   instances: "Optional[list]" = None) -> Callable:
     """The pre-flight hook for the WP3 runner: the WP3b legs (auth /
     runtime / disk) — container mode gets the stock docker legs (the
     daemon + the per-instance image), sandbox mode substitutes the
@@ -1465,12 +1537,16 @@ def make_preflight(config: PilotConfig) -> Callable:
                 ("docker_daemon",
                  lambda: _cmd("docker_daemon", ["docker", "info"])))
             if instance_id is not None:
-                # the WP3b default image format (the Docker-Hub
-                # ``__`` → ``_1776_`` escape) — pull-if-missing (a
-                # cold host pre-flights the pull; the setup's pull
-                # then no-ops)
-                img = "swebench/sweb.eval.x86_64."
-                + instance_id.replace("__", "_1776_")
+                # pull-if-missing (a cold host pre-flights the pull;
+                # the setup's pull then no-ops). The image is the
+                # instance file's PINNED ``image`` field when present
+                # (a custom file whose pinned image diverges from the
+                # derivation must pre-flight the pinned one)
+                inst = next((i for i in (instances or [])
+                            if i["instance_id"] == instance_id), None)
+                img = (_image_for(inst) if inst is not None else
+                       "swebench/sweb.eval.x86_64."
+                       + instance_id.replace("__", "_1776_"))
                 checks.append(
                     ("docker_image",
                      lambda: _ensure_docker_image(img)))
@@ -1561,7 +1637,7 @@ def prune_instance(config: PilotConfig, workdir: str,
     iid = inst["instance_id"]
     out = {"removed": [], "failed": [], "mode": config.mode}
     if config.mode == "container":
-        img = "swebench/sweb.eval.x86_64." + iid.replace("__", "_1776_")
+        img = _image_for(inst)
         for cmd, label in ((["docker", "rm", "-f", f"sweb.eval.{iid}"],
                            "agent container"),
                           (["docker", "rmi", img], "instance image")):
@@ -1884,7 +1960,7 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
     add("12 within the calibrated budget",
         f"sessions ≤ {config.max_sessions_per_day}; wall ≤ "
         f"{wall_budget_s:.0f}s",
-        f"sessions (whole run pair): {sessions_used}; "
+        f"sessions (attempts, incl. reruns): {sessions_used}; "
         f"wall used: {wall_used_s:.1f}s",
         sessions_used <= config.max_sessions_per_day
         and wall_used_s <= wall_budget_s)
@@ -2121,7 +2197,7 @@ def run_pilot(config: PilotConfig,
     # the documented gate order (PLAN-WP6A.md): opt-in (above) →
     # pre-flight (zero quota, before any session; the runner also
     # re-runs it per batch + per instance) → model gate (fail-closed)
-    pf = make_preflight(config)
+    pf = make_preflight(config, insts)
     preflight_ok = True
     preflight_failures: list = []
     try:
@@ -2317,8 +2393,13 @@ def run_pilot(config: PilotConfig,
     if report_failed:
         _write_state(workdir, run_id, {
             "run_id": run_id, "mode": config.mode, "model": config.model,
-            "devin_cli_version": ver, "interrupted": False,
-            "aborted": False, "resume_exercised": resume_exercised,
+            "devin_cli_version": ver,
+            # the flags from the state written before the report —
+            # a report failure on an interrupted pair must not
+            # clobber the durable interrupt record (the follow-up
+            # --resume's item-11 gate reads interrupted_before)
+            "interrupted": interrupted, "aborted": aborted,
+            "resume_exercised": resume_exercised,
             "final_state": "report_failed",
             "report_error": "the WP5 report pipeline failed",
             "completed_this_invocation": rep_.done_count,
@@ -2338,18 +2419,24 @@ def run_pilot(config: PilotConfig,
         resume_after_interrupt=(interrupted_before
                                or resume_exercised_before),
         devin_ok=bool(inst_records) and not run_failed,
+        # the budget gate counts ATTEMPTS (all checkpoint lines with
+        # an instance id — a superseded eval_error→rerun or a stale
+        # preflight_failed line burned a session / wall that the
+        # deduped view would silently drop), consistent with the
+        # wall sum and with WP5's session arithmetic
         sessions_used=sum(
-            1 for r in inst_records
-            if r.get("status") != "preflight_failed"),
+            1 for r in records
+            if r.get("instance_id")
+            and r.get("status") != "preflight_failed"),
         wall_budget_s=config.max_wall_s * config.max_sessions_per_day,
         wall_used_s=sum(
             (r.get("meta") or {}).get("wall_s", 0.0)
-            for r in inst_records))
+            for r in records if r.get("instance_id")))
     with open(os.path.join(workdir, "wp6a-go-no-go.md"), "w",
               encoding="utf-8", newline="") as f:
         f.write(render_checklist_md(items, config, cal, meta,
                                    interrupted=interrupted))
-    verdict, failed = _verdict(items)
+    verdict, failed = _verdict(items, interrupted=interrupted)
     print(f"[pilot] go/no-go: {verdict}"
           + (f" (failed: {', '.join(failed)})" if failed else ""))
     rep_dir = os.path.join(workdir, "report")
@@ -2398,6 +2485,14 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: "Optional[list]" = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
+        # the record-file invariant holds on **every** early exit
+        # (exit 2 config / exit 3 live-refused / exit 4 run): the
+        # workdir is resolved exactly as run_pilot does, and the
+        # previous run's verdict is removed before the first thing
+        # that can fail (a stale verdict is never kept)
+        wd = args.workdir or os.path.join(os.getcwd(), "pilot-a")
+        os.makedirs(wd, exist_ok=True)
+        _remove_stale_record(wd)
         budget = load_budget_file()
         msp = args.max_sessions_per_day
         if msp is None:
@@ -2405,6 +2500,18 @@ def main(argv: "Optional[list]" = None) -> int:
         mw = args.max_wall_per_session
         if mw is None:
             mw = budget.get("max_wall_per_session", DEFAULT_MAX_WALL_S)
+        # an explicit zero/negative cap is a config error, not a
+        # silent replacement by the default (the ``or`` fallback
+        # covers absence only)
+        if msp <= 0:
+            raise PilotConfigError(
+                "max_sessions_per_day must be > 0")
+        if mw <= 0:
+            raise PilotConfigError(
+                "max_wall_per_session must be > 0")
+        if (args.largest_bytes is not None
+                and args.largest_bytes <= 0):
+            raise PilotConfigError("--largest-bytes must be > 0")
         config = PilotConfig(
             mode=args.mode, devin_bin=args.devin_bin, model=args.model,
             instances_file=args.instances, workdir=args.workdir,

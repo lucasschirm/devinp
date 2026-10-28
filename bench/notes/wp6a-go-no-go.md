@@ -505,3 +505,103 @@ The third `pr-review` pass raised 1 Blocker / 1 Major / 4 Medium /
    `test_main_catch_all_is_exit_4`.
 7. **`pilot_instances.json` `fetched_at` postdated the live run** —
    corrected to 2026-10-28 (the date the run consumed the rows).
+
+## Review round 4 (PR #37 `pr-review` — the fourth pass)
+
+The fourth `pr-review` pass raised 1 Blocker / 4 Medium / 7 Minor
+findings. All addressed (zero-quota regression tests in
+`tests/test_live_pilot.py`):
+
+**Blocker**
+
+1. **The env sanitization was defeated by the client** —
+   `AcpSession.start()` built the child env as `dict(os.environ)`
+   *overlaid* by the session env, so every key the pilot stripped
+   (and the `DEVIN_MODEL` / refusal pops) was re-inherited from the
+   host; `meta.env_sanitized` recorded names as stripped that still
+   reached the agent. Now a caller-supplied env is **authoritative**
+   (the child env is exactly it); the host env is the default only
+   for a bare session (container mode's shim — whose agent env comes
+   from the `docker exec -e` flags, not the shim process's own env).
+   Regression: `test_session_env_authoritative_not_overlaid` (captures
+   the real `Popen` env: a set `GITHUB_TOKEN` is absent from a
+   filtered session's env and present in a bare session's; the
+   refusal-fallback pop holds in every case).
+
+**Medium**
+
+1. **The report-failure state write clobbered the interrupt record** —
+   the `report_failed` state hard-coded `interrupted: False` /
+   `aborted: False`, overwriting the durable record written earlier;
+   the follow-up `--resume` then read `interrupted_before=False`, item
+   11 could never pass, and the pair rendered NO-GO despite AC3 being
+   exercised. Now the flags are carried through. Regression:
+   `test_report_failure_keeps_interrupted_state` (an interrupted run
+   whose `rep.generate` fails → exit 4, state keeps `interrupted:
+   True` + `final_state: report_failed`).
+2. **The budget gate counted the deduped finals only** — a
+   superseded attempt (an `eval_error`→rerun, a stale
+   `preflight_failed` line) burned a session + wall the gate never
+   counted (unlike WP5, which counts attempts). Now `sessions_used` /
+   `wall_used_s` count **attempts** (every checkpoint line with an
+   instance id). Regression: `test_budget_counts_superseded_attempts`
+   (a superseded pair + two more → item 12 says "attempts, incl.
+   reruns: 4", where the deduped view would say 3).
+3. **`instance_id` was validated only as a non-empty string** — the
+   raw id is joined into `runs/<iid>` / `devin-shim-<iid>` paths and
+   interpolated into the shim's shell script, so `..` /
+   metacharacters wrote outside the workdir or injected commands. Now
+   a strict charset (`[A-Za-z0-9._-]+`) + an explicit `..` rejection
+   (the WP4 `_charset_ok` / WP5 `_IID_CHARSET` analogue). Regression:
+   `test_instance_id_charset_validation`.
+4. **An oversize patch was a run-fatal with no checkpoint line** —
+   every `--resume` re-ran the full session at quota before hitting
+   the same deterministic cap, and the fatal aborted the whole queue
+   (the run was unconvergeable). Now a `PilotPatchTooLarge` takes the
+   `eval_error` instance route: the checkpoint line is written, the
+   queue is not aborted, a resume may retry with a fresh session.
+   Regression: `test_oversize_patch_is_eval_error_not_fatal` (cap
+   monkeypatched to 1 byte: the run converges, the line is
+   `eval_error` with the cap in `eval_skip_reason`).
+
+**Minor**
+
+1. **The printed verdict ignored `interrupted`** — the file rendered
+   n/a while the print could read `go/no-go: GO` for a partial
+   interrupted run. Now the print uses the same
+   `_verdict(items, interrupted=…)` call.
+2. **`"429"` matched as a bare substring** — a `1429` byte count or a
+   `4290` port falsely produced `quota_limited` (and parked the batch
+   in the midnight backoff). The numeric marker now matches as a
+   whole number (`_quota_marker_hit`). Regression:
+   `test_quota_429_word_boundary`.
+3. **`--largest-bytes 0` was silently replaced by the default** (the
+   `or` fallback); an explicit zero/negative cap (and the same for
+   `--max-sessions-per-day` / `--max-wall-per-session`) is now a
+   `PilotConfigError` (exit 2). Regression:
+   `test_largest_bytes_zero_is_config_error`.
+4. **The pinned `image` field was never consumed** — the name was
+   re-derived in setup + the pre-flight. Now a `_image_for(inst)`
+   helper (the pinned field when present, else the WP3b derivation)
+   feeds the setup pull, the pre-flight image leg, and the prune
+   `docker rmi`. Regression: `test_pinned_image_consumed`.
+5. **`git add -N` had no `--` separator** — an agent-created
+   leading-dash filename was parsed as an option → a run-killing
+   `PilotError`. Now `git add -N -- <files>` (the `git reset --`
+   below already guarded the same list). Regression:
+   `test_add_n_separator_includes_leading_dash_file`.
+6. **Only the first `git remote remove` was `&&`-chained to
+   `cd /testbed`** — a cd failure ran the rest (incl. the `git
+   remote` probe) in the container's default cwd. The whole
+   ref-stripping sequence is now a `{ …; }` group under the cd (a cd
+   failure skips it and the guard record fails loud). Regression:
+   `test_container_guard_runs_in_testbed_group`.
+7. **Exit-2 / exit-3 exits kept a stale verdict file** —
+   `require_live` and the config errors returned before
+   `_remove_stale_record` could run. Now `main()` resolves the
+   workdir (exactly as `run_pilot` does) and removes the previous
+   run's verdict before the first thing that can fail, so every
+   early exit honors the "a stale verdict is never kept" invariant.
+   Regression: `test_early_exits_remove_stale_record` (the
+   `--largest-bytes 0` exit-2 path and the live-refused exit-3 path
+   both remove a planted stale file).

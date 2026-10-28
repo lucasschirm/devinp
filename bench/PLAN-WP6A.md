@@ -146,7 +146,10 @@ pilot report + leaderboard artifacts).
   apikey/auth — is stripped from the agent's environment so the agent
   process's in-scope `env`/`printenv` can't dump the host's `GITHUB_TOKEN`
   / cloud API keys; the stripped key names are recorded in the instance
-  meta), `cwd=<workdir>/runs/<instance_id>/testbed` **under the
+  meta — the sanitized env is **authoritative**: `AcpSession.start`
+  uses it as the child env verbatim, not as an overlay on the host
+  `os.environ`, which would re-inherit exactly what was stripped),
+  `cwd=<workdir>/runs/<instance_id>/testbed` **under the
   operator's trusted workspace root** (WP0 §8), host `python3` on PATH (the
   conda `testbed` env is a container-only fact — deviation recorded).
   **Host check** (the closest end-to-end leg available without a container
@@ -176,7 +179,23 @@ silently drop the agent's files); the diff is rendered with
 `-c core.quotepath=false` so the diff paths round-trip to the eval leg's
 `git apply`; a failing `git add -N` (intent-to-add staging) is a loud
 `PilotError`, never silent; the binary-content guard `lstat`s first (a
-FIFO / socket is not opened — `open()` on a FIFO blocks indefinitely).
+FIFO / socket is not opened — `open()` on a FIFO blocks
+indefinitely). The size cap is an **instance-class** failure
+(``PilotPatchTooLarge`` → ``eval_error``: the checkpoint line is
+written, the queue is not aborted, a resume may retry with a fresh
+session that could produce a smaller patch) — a run-fatal cap would
+write no line, so every `--resume` re-burns the full session at
+quota before hitting the same deterministic cap and the queue abort
+leaves the run unconvergeable. The ``instance_id`` is charset-
+restricted at validation (``[A-Za-z0-9._-]+``, no ``..`` — the WP4
+``_charset_ok`` / WP5 ``_IID_CHARSET`` analogue; the id is joined
+into workdir paths and interpolated into the shim's shell script),
+the instance file's **pinned** ``image`` field is what the setup /
+pre-flight / prune consume (a custom file whose pinned image
+diverges from the derivation must pull the pinned one), and the
+``429`` quota marker matches as a whole number (a bare substring
+false-positives on incidental digits and parks the batch in the
+midnight backoff).
 
 **Status mapping (harness → the WP3 `TERMINAL_STATUSES` set, unchanged):**
 

@@ -741,10 +741,21 @@ class AcpSession:
                 raise AcpProtocolError(
                     "--refusal-fallback is forbidden (PLAN §3.4)"
                 )
-        # Env hygiene (PLAN §3.4): refusal-fallback is NEVER in the child
-        # env, even if the caller supplied it.
-        env = dict(os.environ)
-        env.update(self._env)
+        # Env hygiene (PLAN §3.4): the session env is AUTHORITATIVE
+        # when the caller supplied one — the pilot passes a filtered
+        # env (host credentials stripped), and overlaying on
+        # ``os.environ`` here would re-inherit exactly what the
+        # caller removed (including its ``DEVIN_MODEL`` / refusal
+        # pops). The host env is the default only for a bare
+        # session (``env`` absent / empty — container mode, where
+        # the shim forwards the agent's env into the container via
+        # ``docker exec -e`` flags, so the shim process's own host
+        # env never reaches the agent). Refusal fallback stays out
+        # in every case.
+        if self._env:
+            env = dict(self._env)
+        else:
+            env = dict(os.environ)
         env.pop("DEVIN_REFUSAL_FALLBACK", None)
         cmd = [self._devin_bin, "acp"]
         if self._model:
