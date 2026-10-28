@@ -746,11 +746,12 @@ class PilotSession(rr.AgentSession):
         t0 = time.monotonic()
         base = os.path.join(self._spec.workdir, "host-check", iid)
         os.makedirs(base, exist_ok=True)
+        repo_url = inst.get("repo_url",
+                           "https://github.com/" + inst["repo"] + ".git")
         log_lines = [f"host check (the documented no-container "
                      f"fallback) for {iid}",
                      f"  base_commit: {inst['base_commit']}",
-                     f"  repo_url:    {inst.get('repo_url',
-                         'https://github.com/' + inst['repo'] + '.git')}"]
+                     f"  repo_url:    {repo_url}"]
         try:
             # 1. a fresh clone at the base commit (from the shared bare
             #    cache when present — the retained "base layer")
