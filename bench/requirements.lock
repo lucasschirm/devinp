@@ -40,7 +40,7 @@ modal==1.6.2
 multidict==7.2.1
 multiprocess==0.70.19
 nodeenv==1.11.0
-numpy==2.5.4
+numpy==2.4.6
 packaging==26.3
 pandas==3.1.0
 platformdirs==4.13.5
