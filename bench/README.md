@@ -28,6 +28,14 @@ returns `{resolved, logs}`, no bespoke apply/grade logic, typed error
 hierarchy; positive/negative/corruption controls + CLI) + unit tests
 (zero quota, CI; the container controls are CI integration tests on
 public images — they skip where no Docker daemon exists).
+**WP5 (issue #18) complete** — `report.py` (aggregation: pass@1 overall
++ per-repo table from the run JSONL with WP3b resume-dedup +
+terminal-status exclusion; the failure taxonomy; the methodology block
+— devin CLI version, model + `cost_tier`, prompt template hash,
+permission policy, caps, harness version, images, date range, sessions
+used; the leaderboard artifacts `all_preds.jsonl` +
+`trajs/<instance_id>.jsonl`; the artifact cross-check) + unit tests
+(fixtures → exact expected numbers, zero quota, CI).
 
 ## Layout
 
@@ -36,6 +44,7 @@ public images — they skip where no Docker daemon exists).
 | `PLAN.md` | Plan of record (architecture, WP0–WP6, policies) |
 | `PLAN-WP0.md` | WP0 implementation plan (phases, AC map, contingencies) |
 | `PLAN-WP4.md` | WP4 implementation plan (AC map, harness-fact record, contingencies) |
+| `PLAN-WP5.md` | WP5 implementation plan (AC map, WP3-schema fact record, design decisions pinned by the tests, contingencies) |
 | `notes/acp-surface.md` | **WP0 notes** — the recon record answering every "?" |
 | `notes/models-list.json` | Raw `devin models list --format json` (2026-10-26) |
 | `notes/auth-status.txt` | `devin auth status` output (quota evidence) |
@@ -45,7 +54,8 @@ public images — they skip where no Docker daemon exists).
 | `mock_devin.py` | **WP2** — `mock_devin` test double: a fake `devin` binary (canned ACP agent, modes `ok`/`no_patch`/`hang`/`quota`/`crash`, canned `models list` fixture) |
 | `runner.py` | **WP3a + WP3b** — sequential queue (concurrency 1 by default), quota-budget state machine (`running → budget_exhausted → sleeping → resume`), overlap guard + concurrency flag contract, abort on 2 consecutive `agent_error`; checkpoint/resume with pass@1-correct retry semantics (`JsonlCheckpoint`, `resume_queue`), the dynamic cost-tier model gate (fail-closed, `gate_cost_tier`/`parse_models_list`/`fetch_models_list`), the zero-quota pre-flight (`Preflight`, before every batch + every instance) (pure stdlib) |
 | `evaluate.py` | **WP4** — the SWE-bench evaluation leg: a thin delegate to `python -m swebench.harness.run_evaluation` (standard predictions file, fresh harness-created container, `{resolved, logs}` return contract, typed error hierarchy `InvalidInputError`/`PatchCorruptionError`/`EvaluationTimeoutError`/`HarnessFailedError`; never imports `swebench` — the subprocess is the only harness interaction; pure stdlib + subprocess) |
-| `tests/` | **WP1** — unit tests + in-process mock `devin` server; **WP2** — `mock_devin` integration tests (driven through the real WP1 client); **WP3a** — `runner` unit tests (instrumented fake sessions); **WP3b** — resume fixtures (incl. EOF corruption + retry-class rules), cost-tier gate fixtures (paid model, shape change, paid override), pre-flight stub-failure tests; **WP4** — `evaluate` unit tests (injected harness runner + fabricated harness trees, zero quota) + CI integration tests (positive control on the public flask image, corruption guard, isolation; skip without a Docker daemon) |
+| `report.py` | **WP5** — the report leg: pass@1 overall + per-repo table (WP3b resume-dedup; the retry class excluded from the denominator — the pass@1-correct semantics), the failure taxonomy, the methodology block, the leaderboard artifacts (`all_preds.jsonl` + `trajs/`), the artifact cross-check (typed errors `InvalidInputError`/`ReportProtocolError`/`ArtifactCheckError`; reads the run JSONL by import from `runner.load_checkpoint` — one source of truth for the WP3 schema; pure stdlib + `runner`) |
+| `tests/` | **WP1** — unit tests + in-process mock `devin` server; **WP2** — `mock_devin` integration tests (driven through the real WP1 client); **WP3a** — `runner` unit tests (instrumented fake sessions); **WP3b** — resume fixtures (incl. EOF corruption + retry-class rules), cost-tier gate fixtures (paid model, shape change, paid override), pre-flight stub-failure tests; **WP4** — `evaluate` unit tests (injected harness runner + fabricated harness trees, zero quota) + CI integration tests (positive control on the public flask image, corruption guard, isolation; skip without a Docker daemon); **WP5** — `report` unit tests (fixture JSONL → exact expected numbers: resume-dedup, terminal-status exclusion, artifact cross-checks, trajs byte-for-byte, methodology, determinism, CLI exit codes; zero quota) |
 | `conftest.py` | pytest path shim for the flat layout |
 | `pyproject.toml` / `requirements.lock` | Python ≥3.11; `swebench==5.0.2` pinned; `pytest-timeout` (the integration tests' watchdog) |
 
@@ -383,6 +393,95 @@ contract — never a traceback with exit 1).
   flake cannot zero out a retryable instance), anything else →
   `HarnessFailedError` (the WP3 `eval_error` retry class). A clean typed
   error, never a crash.
+
+## The report (WP5, issue #18)
+
+`report.py` — the aggregation, the failure taxonomy, the methodology
+block, and the leaderboard artifacts (PLAN.md §5 WP5; it reads the run
+JSONL **by import** from `runner.load_checkpoint` — the WP3b torn-EOF
+rule — and the pass@1-correct split from the runner's
+`TERMINAL_STATUSES` / `RETRY_STATUSES`):
+
+```bash
+cd bench
+python3 report.py --jsonl run-001.jsonl --out out/ [--meta-file meta.json]
+python3 report.py --jsonl run-001.jsonl --out out/ --check
+python -m pytest tests/test_report.py   # fixtures → exact numbers, zero quota
+```
+
+Exit codes: 0 = OK (generated / checked clean), 2 `InvalidInputError`
+(bad flag / unreadable / non-JSON meta file), 3 `ArtifactCheckError`
+(the cross-check failed — the report is *not* trusted), 4
+`ReportProtocolError` (a run-JSONL schema violation — a corrupted
+mid-file line fails loud; a torn **last** line drops, not fatal, and
+is noted in the report).
+
+- **pass@1 = resolved / terminal** (AC1), where *terminal* = the
+  legitimate agent outcomes = `TERMINAL_STATUSES − RETRY_STATUSES`
+  = `resolved` / `failed_test` / `timeout` / `no_patch` /
+  `agent_error` (PLAN §2.5: `timeout` / `no_patch` are legitimate agent
+  outcomes — re-running them "would turn pass@1 into a filtered
+  pass@k"; `agent_error` is a terminal agent outcome). The retry class
+  (`quota_limited` / `eval_error` / `preflight_failed`) is **excluded**
+  from the denominator (the outcome is undecided — pending retry) but
+  counted in the taxonomy. Dedup is the WP3b resume rule — a
+  duplicated line resolves to the **last** line (file order, not
+  timestamp). A `instance_id: null` line is a **batch marker** (a
+  pre-flight failure before the first instance) — counted in the
+  taxonomy section, never as an instance record. The per-repo table
+  groups by the SWE-bench Verified instance-id prefix (the repo key is
+  the prefix before the **last** `-` — correct for dash-bearing repo
+  names like `scikit-learn`); a repo with zero terminal instances
+  renders `n/a`.
+- **The per-instance `meta` contract** (defined by WP5; the adapter WP
+  conforms to it): `artifacts_dir` (optional base for relative paths —
+  default: the run JSONL's directory) + the references `patch_diff` /
+  `trajectory` / `eval_log` (null = no such artifact; a non-null
+  reference **must** resolve to an existing file) + an opaque `usage`
+  (carried into the report, not interpreted — WP0 §2.6 proxies or ACP
+  `usage.{inputTokens,…}`).
+- **The run-level methodology meta** is a separate operator file
+  (`--meta-file` — the WP3 checkpoint writes instance lines only):
+  `run_id` / `devin_cli_version` / `model` / `cost_tier` /
+  `prompt_template_hash` / `permission_policy` / `caps` /
+  `harness_version` / `images` / `model_name_or_path`?. Two fields are
+  **computed from the JSONL** (exact): the **date range** (min/max
+  `ts`, ISO-8601 UTC) and **sessions used** = *session attempts* —
+  lines with `instance_id ≠ null` and `status ≠ preflight_failed` (a
+  pre-flight failure stops *before* a session starts, PLAN §2.7; a
+  `quota_limited` line is a started-then-refused attempt; a resume
+  re-run counts a second attempt). A missing file / field renders
+  `unknown` — the block never silently omits a field.
+- **Leaderboard artifacts** (AC4): `all_preds.jsonl` — one line **per
+  deduped instance** (all 8 final statuses, incl. pending retry-class),
+  **sorted by `instance_id`**, exactly the harness's standard
+  predictions fields (`instance_id` / `model_name_or_path` /
+  `model_patch` — WP4-verified against the pinned `swebench==5.0.2`);
+  `model_patch` = the full `patch.diff` contents, else `""` — the
+  harness's own empty-patch semantics keeps a no-patch instance out of
+  `resolved_ids` (it lands in `empty_patch_ids`).
+  `model_name_or_path` = meta `model_name_or_path` → meta `model` →
+  `"devin"` (the WP4 default). `trajs/<instance_id>.jsonl` — a
+  **byte-for-byte copy** of each referenced, existing trajectory (no
+  re-serialization; no reference / no file → no entry). Output is
+  byte-stable for stable inputs.
+- **The artifact cross-check** (AC5) — run on generation (fail-loud,
+  exit 3, *before* the report is declared complete; the report still
+  renders with the violations so the operator sees *why*) and
+  standalone (`--check`, no writes): **R1** — every JSONL line's
+  referenced files exist (checked over **every** line — a superseded
+  line's references too, WP2 artifact atomicity), plus the semantic
+  rule: a `resolved` / `failed_test` final status must reference an
+  existing `patch.diff` (a graded verdict requires a patch); **R2** —
+  `all_preds.jsonl` re-read: one line per deduped instance, the exact
+  field set, sorted, and every non-empty `model_patch` matches
+  `patch.diff` byte-for-byte.
+- **The markdown report** (`report.md`): Summary (pass@1 overall,
+  instance counts incl. pending, date range, sessions used, the
+  dropped-tail note when a torn EOF line was dropped), the per-repo
+  table, the failure-taxonomy table (all 8 statuses, zeros included),
+  the methodology block (every field, one per line), the artifact
+  inventory + cross-check status.
 
 ## SWE-bench pin (WP0 result)
 

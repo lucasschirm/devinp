@@ -26,4 +26,4 @@ testpaths = ["tests", "probes"]
 # acp_client + mock_devin + runner + evaluate (conftest.py / probes / tests
 # are dev-only, notes/ is recon data). Without this, setuptools flat-layout
 # discovery fails on the multiple top-level directories.
-py-modules = ["acp_client", "mock_devin", "runner", "evaluate"]
+py-modules = ["acp_client", "mock_devin", "runner", "evaluate", "report"]
