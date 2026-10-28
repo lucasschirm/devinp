@@ -30,6 +30,10 @@ jobs:
           node-version: 24
           cache: npm
 
+      # Match publish.yml: the release runs under npm@latest, so assert the
+      # packlist under the same npm.
+      - run: npm install -g npm@latest
+
       - run: npm ci
 
       # Asserts (bench/PLAN.md §8.1) that `npm pack` never ships bench/ and

@@ -2,12 +2,23 @@
 
 /**
  * Assert the npm tarball never ships `bench/` (bench/ is a separate Python
- * package — see bench/PLAN.md §8.1).
+ * package — see bench/PLAN.md §8.1) and that the shipped surfaces are
+ * complete: every file the build produces in `bin/` and every file in
+ * `data/` must appear in the tarball.
  *
- * Runs `npm pack --dry-run` and fails if any tarball entry sits under
- * `bench/`. Positive guards also fail closed if the shipped surfaces
- * (`bin/`, `data/`) or `package.json` are missing, so a regression in
- * `package.json` `"files"` (e.g. an emptied array) cannot pass vacuously.
+ * The completeness check matters beyond "an entry under bin/ exists": npm
+ * always ships the files referenced by the `bin` field even when `bin` is
+ * dropped from `files`, so with a partial regression (`"files": ["data"]`)
+ * the tarball would still contain `bin/run.js` but drop `bin/command.js`
+ * — and the installed CLI crashes resolving oclif's
+ * `commands.single.target`. Checking for `bin/` entries alone would pass
+ * that broken package under green CI.
+ *
+ * Fails if:
+ *   - any tarball entry sits under `bench/`, or
+ *   - a file present in `bin/` or `data/` after the build is missing from
+ *     the tarball, or
+ *   - `package.json` is missing from the tarball.
  *
  * Usage: node scripts/check-pack.js
  *
@@ -15,6 +26,7 @@
  * `prepack`); `--ignore-scripts` keeps the `--json` output clean.
  */
 
+import {readdirSync, statSync} from 'node:fs'
 import {execSync} from 'node:child_process'
 
 function run(cmd) {
@@ -27,17 +39,26 @@ const out = execSync('npm pack --dry-run --json --ignore-scripts', {
   encoding: 'utf8',
 })
 
-// `npm pack --dry-run --json` emits a single-element array (some npm
-// versions wrap it in an object); normalize to the entry object.
-let parsed
-try {
-  parsed = JSON.parse(out)
-} catch {
-  // Fall back to the last JSON block in case of leading stdout noise.
-  const start = out.search(/^[\[{]/m)
-  parsed = JSON.parse(out.slice(start))
+function parsePackOutput(text) {
+  // `npm pack --dry-run --json` normally emits a single-element array (some
+  // npm versions wrap it in an object); normalize to the entry object.
+  const candidates = [text]
+  const start = text.search(/^[\[{]/m)
+  if (start !== -1) candidates.push(text.slice(start))
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate)
+      return Array.isArray(parsed) ? parsed[0] : parsed
+    } catch {
+      // try the next candidate
+    }
+  }
+  console.error('FAIL: no parseable JSON block in npm pack output')
+  console.error(text)
+  process.exit(1)
 }
-const entry = Array.isArray(parsed) ? parsed[0] : parsed
+
+const entry = parsePackOutput(out)
 const paths = (entry?.files ?? []).map(f => f.path)
 
 const failures = []
@@ -51,11 +72,22 @@ if (benchEntries.length) {
   )
 }
 
-// Positive guards: fail closed if shipped surfaces vanished.
-const has = prefix =>
-  paths.some(p => p === prefix || p.startsWith(`${prefix}/`))
-if (!has('bin')) failures.push('tarball has no bin/* entries (prepack/build ran?)')
-if (!has('data')) failures.push('tarball has no data/* entries')
+// Positive guards, fail-closed: every file the build left in bin/ (and
+// every file in data/) must ship. See the header for why "has a bin/
+// entry" is not enough.
+for (const dir of ['bin', 'data']) {
+  const onDisk = readdirSync(dir, {recursive: true})
+    .filter(f => statSync(`${dir}/${f}`).isFile())
+    .sort()
+  const packed = new Set(
+    paths.filter(p => p.startsWith(`${dir}/`)).map(p => p.slice(dir.length + 1)),
+  )
+  const missing = onDisk.filter(f => !packed.has(f))
+  if (missing.length) {
+    failures.push(`${dir}/ files missing from tarball: ${missing.join(', ')}`)
+  }
+}
+
 if (!paths.includes('package.json')) failures.push('tarball missing package.json')
 
 if (failures.length) {
@@ -65,6 +97,6 @@ if (failures.length) {
 }
 
 console.log(
-  `ok: ${paths.length} tarball entries — no bench/ entries; bin/, data/, package.json present`,
+  `ok: ${paths.length} tarball entries — no bench/ entries; bin/ + data/ complete`,
 )
 console.log(`    ${paths.join(', ')}`)
