@@ -55,6 +55,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -346,20 +347,64 @@ def apply_leak_guard(testbed: str) -> dict:
         res["warnings"].append(
             "reflog expire: "
             + p.stderr.decode("utf-8", "replace").strip())
+    # the local branches are the remaining leak vector: the clone
+    # leaves the default branch (``main``/``master``) at the
+    # upstream tip — PAST ``base_commit``, past the instance's
+    # merged fix commit (one ``git log`` away). The setup
+    # ``checkout --detach``'d first, so every local branch can be
+    # deleted safely
+    # ``for-each-ref`` (not ``git branch``): the latter prints a
+    # ``(HEAD detached at …)`` decoration line on a detached checkout,
+    # which would contaminate the branch list and make ``-D`` fail
+    p = _git(testbed, "for-each-ref",
+             "--format=%(refname:short)", "refs/heads/")
+    branches = [b for b in p.stdout.decode("utf-8", "replace").split()
+               if b]
+    if branches:
+        p = _git(testbed, "branch", "-D", *branches)
+        if p.returncode != 0:
+            res["warnings"].append(
+                "branch delete: "
+                + p.stderr.decode("utf-8", "replace").strip())
     p = _git(testbed, "remote")
     res["remotes_after"] = p.stdout.decode("utf-8", "replace").split()
     return res
 
 
-def verify_leak_guard(testbed: str) -> dict:
-    """The post-session half of item 14: no remote survives and no tags
-    survive (a remote the agent *re-added* would show up here)."""
+def verify_leak_guard(testbed: str,
+                      base_commit: "Optional[str]" = None) -> dict:
+    """The post-session half of item 14: no remote survives, no tags
+    survive (a remote the agent *re-added* would show up here), and —
+    when ``base_commit`` is given — no local branch points PAST
+    ``base_commit`` (a branch tip that is not an ancestor of the
+    base carries the merged fix commit: a leak the remotes/tags
+    check alone would miss)."""
     p = _git(testbed, "remote")
     remotes = p.stdout.decode("utf-8", "replace").split()
     p = _git(testbed, "tag", "-l")
     tags = p.stdout.decode("utf-8", "replace").split()
-    return {"remotes": remotes, "tags": tags,
-            "clean": not remotes and not tags}
+    branches: list = []
+    ahead: list = []
+    p = _git(testbed, "for-each-ref",
+             "--format=%(refname:short) %(objectname)", "refs/heads/")
+    for line in p.stdout.decode("utf-8", "replace").splitlines():
+        parts = line.split(" ", 1)
+        if len(parts) == 2 and parts[0]:
+            branches.append(parts[0])
+            if base_commit:
+                # a LEAK = a branch tip NOT reachable from the base
+                # (past or diverged — it carries the merged fix
+                # commit). Clean = the tip is an ancestor of (or
+                # equals) the base
+                p2 = _git(testbed, "merge-base", "--is-ancestor",
+                         parts[1], base_commit)
+                if p2.returncode != 0:
+                    # past/diverged (or an unresolvable object —
+                    # fail-closed: report it)
+                    ahead.append(parts[0])
+    return {"remotes": remotes, "tags": tags, "branches": branches,
+            "branches_ahead_of_base": ahead,
+            "clean": not remotes and not tags and not ahead}
 
 
 def _exclude(path: str) -> bool:
@@ -385,6 +430,16 @@ def _looks_source_or_test(path: str) -> bool:
 
 def _is_binary(path: str) -> bool:
     try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    if not stat.S_ISREG(st.st_mode):
+        # a FIFO / socket / device: ``open()`` on a FIFO BLOCKS
+        # indefinitely — an agent-created fifo left in the tree must
+        # not hang the extraction (treat as non-regular: it is not a
+        # binary payload)
+        return False
+    try:
         with open(path, "rb") as f:
             return b"\x00" in f.read(8192)
     except OSError:
@@ -405,18 +460,29 @@ def extract_patch(cwd: str) -> dict:
     _git(cwd, "submodule", "update", "--init", "--recursive",
          timeout_s=300.0)
 
-    p = _git(cwd, "status", "--porcelain")
+    # ``-z`` (NUL-separated): the default line mode QUOTES special
+    # paths (a non-ASCII filename prints as ``"w\303\251ird\n"``),
+    # which would silently drop the agent's files from the diff —
+    # ``-z`` gives raw, unquoted paths (even with newlines in them)
+    p = _git(cwd, "status", "--porcelain", "-z")
     if p.returncode != 0:
         raise PilotError(
-            "git status --porcelain failed: "
+            "git status --porcelain -z failed: "
             + p.stderr.decode("utf-8", "replace").strip())
-    porcelain = {}
+    porcelain: dict = {}
     untracked: list = []
-    for line in p.stdout.decode("utf-8", "replace").splitlines():
-        if line.startswith("??"):
-            untracked.append(line[3:].strip())
-        elif len(line) >= 4:
-            porcelain[line[3:].strip()] = line[:2]
+    for entry in p.stdout.split(b"\x00"):
+        # a well-formed entry is ``XY <path>`` (the 3rd byte is a
+        # space) — a rename/copy source path is a bare field without
+        # the status prefix (skipped: only the new name matters)
+        if len(entry) < 4 or entry[2:3] != b" ":
+            continue
+        xy = entry[:2].decode("utf-8", "replace")
+        path = entry[3:].decode("utf-8", "replace")
+        if xy.startswith("??"):
+            untracked.append(path)
+        else:
+            porcelain[path] = xy
 
     def _guard(path: str) -> "Optional[str]":
         """The per-path verdict: the skip reason, or None (include)."""
@@ -487,9 +553,21 @@ def extract_patch(cwd: str) -> dict:
     # git would recursively stage everything under it)
     add_args: list = list(included)
     if add_args:
-        _git(cwd, "add", "-N", *add_args)
+        # a failing pathspec must not be silent: an unchecked
+        # ``git add -N`` would leave the intent-to-add missing and
+        # ``git diff HEAD`` would quietly drop the agent's files
+        p = _git(cwd, "add", "-N", *add_args)
+        if p.returncode != 0:
+            raise PilotError(
+                "git add -N failed: "
+                + p.stderr.decode("utf-8", "replace").strip())
     try:
-        p = _git(cwd, "diff", "HEAD")
+        # ``-c core.quotepath=false``: the diff output must carry RAW
+        # paths (a non-ASCII filename would otherwise be quoted in the
+        # diff while the porcelain ``-z`` list is raw — the two would
+        # disagree and the agent's files would not round-trip to the
+        # eval leg's ``git apply``)
+        p = _git(cwd, "-c", "core.quotepath=false", "diff", "HEAD")
         if p.returncode != 0:
             raise PilotError(
                 "git diff HEAD failed: "
@@ -683,7 +761,8 @@ class PilotSession(rr.AgentSession):
             self.meta["orphan_check"] = not self._acp.group_alive()
             # the post-session leak-guard verification (item 14)
             self.meta["leak_verify"] = verify_leak_guard(
-                self._extract_repo_dir())
+                self._extract_repo_dir(),
+                self._spec.instance.get("base_commit"))
         except Exception as exc:
             # close is best-effort (the WP3 contract) — but a failed
             # close is RECORDED (the checklist item 7 must not render
@@ -693,6 +772,21 @@ class PilotSession(rr.AgentSession):
     # -- helpers ----------------------------------------------------------
 
     def _default_make_session(self, spec: SessionSpec) -> ac.AcpSession:
+        if spec.mode == "container" and spec.container:
+            # the devin process is spawned on the HOST (the shim
+            # forwards into the container with ``docker exec -w
+            # /testbed``) — the host ``Popen`` needs a host path;
+            # ``spec.cwd`` (``/testbed``) exists only inside the
+            # container, so it is the SESSION cwd (what the agent
+            # works in, inside the container) while the spawn cwd is
+            # a host-side scratch dir
+            spawn = os.path.join(self._artifact_dir(), "spawn")
+            os.makedirs(spawn, exist_ok=True)
+            return ac.AcpSession(
+                spec.devin_bin, model=spec.model, cwd=spawn,
+                session_cwd=spec.cwd,
+                env=spec.env, policy=ac.SwebenchPolicy(workdir=spec.cwd),
+                prompt_timeout_s=spec.wall_s)
         return ac.AcpSession(
             spec.devin_bin, model=spec.model, cwd=spec.cwd,
             env=spec.env, policy=ac.SwebenchPolicy(workdir=spec.cwd),
@@ -977,6 +1071,21 @@ class PilotSession(rr.AgentSession):
             self._write_eval_log("\n".join(log_lines))
             self.meta["eval_skip_reason"] = str(exc)[:200]
             return "eval_error"
+        except (OSError, subprocess.SubprocessError) as exc:
+            # a spawned-tool failure that is not a returncode — a
+            # ``FileNotFoundError`` (a venv without ``bin/pip``) or a
+            # ``subprocess.TimeoutExpired`` (a hung pip/pytest) — is
+            # likewise the ``eval_error`` infra class, not a
+            # run-killing fatal (it would otherwise escape the
+            # documented ``eval_error`` handling)
+            self.meta["wall"]["eval_s"] = round(
+                time.monotonic() - t0, 3)
+            log_lines.append(
+                f"  infra failure: {type(exc).__name__}: {exc}")
+            self._write_eval_log("\n".join(log_lines))
+            self.meta["eval_skip_reason"] = (
+                f"{type(exc).__name__}: {exc}"[:200])
+            return "eval_error"
         finally:
             self.meta["graded_by"] = "host_check(pytest -rA)"
 
@@ -1101,7 +1210,30 @@ def prepare_sandbox_instance(inst: dict, workdir: str) -> dict:
     env.pop("DEVIN_MODEL", None)  # the --model flag is authoritative
     env["XDG_DATA_HOME"] = xdg_data
     env["XDG_CONFIG_HOME"] = xdg_config
-    return {"cwd": testbed, "env": env, "leak_guard": guard}
+    env, stripped = _sanitize_session_env(env)
+    return {"cwd": testbed, "env": env, "env_stripped": stripped,
+            "leak_guard": guard}
+
+
+def _sanitize_session_env(env: dict) -> "tuple[dict, list]":
+    """PLAN §3.5 (extended): strip host credentials from the agent
+    environment — a denylist of secret-ish keys (token/secret/key/
+    password/passwd/credential/apikey/auth, case-insensitive) so the
+    agent process (and its in-scope exec tool — ``env``/``printenv``
+    dump them) never inherits the host's ``GITHUB_TOKEN`` / cloud API
+    keys. Returns the filtered env + the stripped key names (recorded
+    in the session meta)."""
+    secret = re.compile(
+        r"(?i)(token|secret|passwd|password|credential|apikey|_key|"
+        r"api_key|auth)")
+    out: dict = {}
+    stripped: list = []
+    for k, v in env.items():
+        if secret.search(k):
+            stripped.append(k)
+        else:
+            out[k] = v
+    return out, stripped
 
 
 def _host_credentials_file() -> "Optional[str]":
@@ -1180,6 +1312,9 @@ def _container_setup(inst: dict, workdir: str) -> dict:
     p = subprocess.run(
         ["docker", "exec", f"sweb.eval.{iid}", "sh", "-c",
          "cd /testbed && git remote remove origin 2>/dev/null; "
+         "git checkout --detach 2>/dev/null; "
+         "git for-each-ref --format='%(refname:short)' refs/heads/ "
+         "| xargs -r -n1 git branch -D 2>/dev/null; "
          "git tag -l | xargs -r git tag -d; "
          "git reflog expire --expire=now --all; "
          "git remote"],
@@ -1207,7 +1342,8 @@ def _container_setup(inst: dict, workdir: str) -> dict:
             "-w /testbed "
             f"sweb.eval.{iid} /usr/local/bin/devin \"$@\"\n")
     os.chmod(shim, 0o755)
-    return {"devin_bin": shim, "env": {},
+    env, stripped = _sanitize_session_env({})
+    return {"devin_bin": shim, "env": env, "env_stripped": stripped,
             "container": f"sweb.eval.{iid}", "image": img,
             "leak_guard": leak_guard}
 
@@ -1315,6 +1451,16 @@ def make_preflight(config: PilotConfig) -> Callable:
              lambda: _cmd("auth", [config.devin_bin, "auth", "status"])),
         ]
         if config.mode == "container":
+            def _versions() -> None:
+                try:
+                    _host_versions_dir()
+                except PilotError as exc:
+                    # a missing ``_versions`` tree would be the
+                    # setup's mid-batch fatal — surface it at the
+                    # zero-quota gate instead
+                    raise rr.PreflightFailed(
+                        "versions", str(exc)) from exc
+            checks.append(("versions", _versions))
             checks.append(
                 ("docker_daemon",
                  lambda: _cmd("docker_daemon", ["docker", "info"])))
@@ -1432,14 +1578,23 @@ def prune_instance(config: PilotConfig, workdir: str,
                 (os.path.join(workdir, "runs", iid, "xdg"),
                  "ephemeral XDG"),
                 (os.path.join(workdir, "host-check", iid),
-                 "host-check tree"),
-                (os.path.join(workdir, "eval", iid), "eval workdir")):
+                 "host-check tree")):
             if os.path.isdir(path):
                 try:
                     shutil.rmtree(path)
                     out["removed"].append(label)
                 except Exception as exc:
                     out["failed"].append(f"{label}: {exc}")
+    # the WP4 eval workdir (harness trees — potentially GBs per
+    # instance) is removed in BOTH modes (the host check / the
+    # container eval leg both work under ``eval/<iid>``)
+    eval_wd = os.path.join(workdir, "eval", iid)
+    if os.path.isdir(eval_wd):
+        try:
+            shutil.rmtree(eval_wd)
+            out["removed"].append("eval workdir")
+        except Exception as exc:
+            out["failed"].append(f"eval workdir: {exc}")
     # the container-mode /testbed host copy (the scratch tree the
     # host-side extraction ran on — removed in both modes; a no-op in
     # sandbox mode where it was never created)
@@ -1524,7 +1679,7 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
                    interrupted_this_run: "Optional[dict]",
                    resume_after_interrupt: bool,
                    devin_ok: "Optional[bool]",
-                   sessions_this_invocation: int,
+                   sessions_used: int,
                    wall_budget_s: float,
                    wall_used_s: float) -> list:
     """The 14-item go/no-go checklist (PLAN-WP6A.md). ``pass`` is None
@@ -1729,9 +1884,9 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
     add("12 within the calibrated budget",
         f"sessions ≤ {config.max_sessions_per_day}; wall ≤ "
         f"{wall_budget_s:.0f}s",
-        f"sessions this invocation: {sessions_this_invocation}; "
+        f"sessions (whole run pair): {sessions_used}; "
         f"wall used: {wall_used_s:.1f}s",
-        sessions_this_invocation <= config.max_sessions_per_day
+        sessions_used <= config.max_sessions_per_day
         and wall_used_s <= wall_budget_s)
     add("13 eval leg verdict (deviation-tolerant, NON-gating)",
         "container: the official harness; sandbox: the host check or "
@@ -1746,11 +1901,18 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
     return items
 
 
-def _verdict(items: list) -> "tuple[str, list]":
+def _verdict(items: list, interrupted: bool = False) -> "tuple[str, list]":
     """GO ⟺ items 1–12 + 14 all pass (item 13 is deviation-tolerant,
     non-gating — PLAN-WP6A.md). A rendering with no decided items at
     all (the dry-run skeleton — every item ``pass=None``) is ``n/a``,
-    not NO-GO (a dry run decides nothing)."""
+    not NO-GO (a dry run decides nothing). An **interrupted** run
+    decides nothing either: it is a PARTIAL record (e.g. 1/3
+    instances) — no gating item requires all pinned instances to have
+    a completed line, so without this guard the partial record would
+    render a GO the resume invocation would silently supersede. The
+    pair's verdict is the resume invocation's."""
+    if interrupted:
+        return ("n/a (interrupted — resume to complete)", [])
     gating_numbers = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "10",
                      "11", "12", "14"}  # 13 excluded (non-gating)
     decided = [i for i in items
@@ -1764,8 +1926,9 @@ def _verdict(items: list) -> "tuple[str, list]":
 
 def render_checklist_md(items: list, config: PilotConfig,
                        calibration: "Optional[dict]",
-                       meta: dict) -> str:
-    verdict, failed = _verdict(items)
+                       meta: dict,
+                       interrupted: bool = False) -> str:
+    verdict, failed = _verdict(items, interrupted=interrupted)
     lines = ["# WP6a Pilot A — go/no-go record (auto-generated)", "",
              f"**Verdict: {verdict}**"
              + (f" — failed items: {', '.join(failed)}" if failed else ""),
@@ -1892,7 +2055,7 @@ def run_pilot(config: PilotConfig,
             config=config, dry_run=True, gate=None, preflight_ok=None,
             preflight_failures=[], records=[], skipped_on_resume={},
             interrupted_this_run=None, resume_after_interrupt=False,
-            devin_ok=None, sessions_this_invocation=0,
+            devin_ok=None, sessions_used=0,
             wall_budget_s=config.max_wall_s
             * config.max_sessions_per_day, wall_used_s=0.0)
         _remove_stale_record(workdir)  # the skeleton replaces the last
@@ -2047,8 +2210,10 @@ def run_pilot(config: PilotConfig,
         s = PilotSession(spec, make_session=make_session)
         # the pre-session guard record (the checklist item 14 evidence —
         # kept in the session meta so the line merger persists it)
-        s.meta["leak_guard"] = (prep if config.mode == "sandbox"
-                               else cprep)["leak_guard"]
+        src = prep if config.mode == "sandbox" else cprep
+        s.meta["leak_guard"] = src["leak_guard"]
+        # the stripped credential key names (the env hygiene record)
+        s.meta["env_sanitized"] = src.get("env_stripped", [])
         meta_by_instance[iid] = s.meta
         return s
 
@@ -2100,7 +2265,8 @@ def run_pilot(config: PilotConfig,
         "resume_exercised": resume_exercised,
         "final_state": ("aborted" if aborted
                        else ("interrupted" if interrupted
-                           else "done")),
+                           else ("run_failed" if run_failed
+                                else "done"))),
         "completed_this_invocation": rep_.done_count,
         "ts": time.time(),
     })
@@ -2172,14 +2338,17 @@ def run_pilot(config: PilotConfig,
         resume_after_interrupt=(interrupted_before
                                or resume_exercised_before),
         devin_ok=bool(inst_records) and not run_failed,
-        sessions_this_invocation=rep_.done_count,
+        sessions_used=sum(
+            1 for r in inst_records
+            if r.get("status") != "preflight_failed"),
         wall_budget_s=config.max_wall_s * config.max_sessions_per_day,
         wall_used_s=sum(
             (r.get("meta") or {}).get("wall_s", 0.0)
             for r in inst_records))
     with open(os.path.join(workdir, "wp6a-go-no-go.md"), "w",
               encoding="utf-8", newline="") as f:
-        f.write(render_checklist_md(items, config, cal, meta))
+        f.write(render_checklist_md(items, config, cal, meta,
+                                   interrupted=interrupted))
     verdict, failed = _verdict(items)
     print(f"[pilot] go/no-go: {verdict}"
           + (f" (failed: {', '.join(failed)})" if failed else ""))
@@ -2261,6 +2430,13 @@ def main(argv: "Optional[list]" = None) -> int:
         # not escape as a traceback: a protocol failure is a run
         # failure (exit 4, the resume class)
         print(f"[pilot] RUNNER ERROR: {type(exc).__name__}: {exc}")
+        return EXIT_RUN_FAILED
+    except Exception as exc:
+        # any non-typed failure (an ``OSError`` writing the state file
+        # or the artifacts, a harness bug) stays inside the documented
+        # 0/2/3/4/42 exit-code contract — exit 4 (the resume class),
+        # never an exit-1 traceback
+        print(f"[pilot] FAILED: {type(exc).__name__}: {exc}")
         return EXIT_RUN_FAILED
 
 

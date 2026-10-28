@@ -87,6 +87,9 @@ pilot report + leaderboard artifacts).
    invocation will **run** (the `resume_queue` view) — a `--resume` must
    not pre-flight finished instances' container images (the prune `docker
    rmi`'d them) or re-pull images a finished run already consumed.
+   - `versions` — **container mode only**: the host `_versions` tree
+     resolves (a missing tree is a pre-flight failure, not a mid-batch
+     setup fatal).
 3. **Model gate (real, WP3b):** `gate_cost_tier(fetch_models_list(devin_bin),
    model)` — fail-closed; `swe-2-high` is `cost_tier == "Free"` (WP0 §7).
 
@@ -103,30 +106,47 @@ pilot report + leaderboard artifacts).
   `XDG_DATA_HOME`/`XDG_CONFIG_HOME`** seeded only with the auth token, isolated
   config (empty MCP servers / rules / plugins — `devin acp` has no `--config`
   flag, WP0 §1 correction (a) ⇒ the isolated XDG *is* the isolation),
-  `git -C /testbed remote remove origin` + strip tags/reflogs (upstream-leak
-  guard, PLAN §3.6 — **the guard record is kept in the instance meta**
-  (the checklist item 14 evidence)), the session's `devin_bin` is a
+  `git -C /testbed remote remove origin` + strip tags/reflogs + **delete all
+  local branches** (after `git checkout --detach` — the clone's default
+  branch sits at the upstream tip *past* `base_commit`, i.e. one `git log`
+  from the merged fix commit; the in-image guard does the same, PLAN §3.6 —
+  **the guard record is kept in the instance meta** (the checklist item 14
+  evidence)), the session's `devin_bin` is a
   **single-line** `docker exec` shim (the `exec` + every flag form one
   command — a multi-line shim would `exec docker exec -i` with no
   container and die), spawn `devin acp --model <M>` with
   `PATH=/opt/miniconda3/envs/testbed/bin:$PATH`, `CONDA_DEFAULT_ENV=testbed`,
   `cwd=/testbed`, `DEVIN_REFUSAL_FALLBACK` unset (PLAN §3.4 — `AcpSession`
-  enforces this itself). The host-side git ops (patch extraction, the
+  enforces this itself). The devin process is a **host** process (the shim
+  forwards into the container with `docker exec -w /testbed`), so the
+  `AcpSession` **spawn cwd is a host-side scratch dir** while the
+  **session cwd** (what `session/new` sends the agent) stays `/testbed`
+  (the conflation of the two in one `cwd` field would `Popen(cwd=
+  "/testbed")` on the host — a `FileNotFoundError` before the shim ever
+  ran). The host-side git ops (patch extraction, the
   post-session leak verification) run on a **host copy** of `/testbed`
   (`docker cp` — the in-container path does not exist on the host;
   the copy is scratch and pruned with the instance). Eval = WP4
   `evaluate()` (fresh harness container, official `run_evaluation`). Pruning =
   `docker rmi` the instance image + `docker rm` the exited agent container
-  + delete the host copy after eval (PLAN §7; shared base/
+  + delete the host copy + the WP4 `eval/<instance_id>` workdir after eval
+  (PLAN §7; shared base/
   env layers retained).
 * **`sandbox` (documented no-container fallback — the pilot's actual mode in
   this environment, deviation recorded in the checklist + meta):** per
   instance — `git clone <repo> <workdir>/runs/<instance_id>/testbed` @
   `base_commit` (a shared bare clone cache acts as the retained "base
-  layer"), the same leak guard (remote removed, tags/reflogs stripped —
+  layer"), the same leak guard (remote removed, tags/reflogs stripped, **all
+  local branches deleted** — the clone's default branch sits at the upstream
+  tip *past* `base_commit`, one `git log` from the merged fix commit —
   verified post-session; **the pre-session guard record is kept in the
   instance meta**), the same ephemeral-XDG + isolated-config +
-  refusal-fallback hygiene, `cwd=<workdir>/runs/<instance_id>/testbed` **under the
+  refusal-fallback hygiene, **host-credential env sanitization** (a
+  denylist of secret-ish keys — token/secret/key/password/passwd/credential/
+  apikey/auth — is stripped from the agent's environment so the agent
+  process's in-scope `env`/`printenv` can't dump the host's `GITHUB_TOKEN`
+  / cloud API keys; the stripped key names are recorded in the instance
+  meta), `cwd=<workdir>/runs/<instance_id>/testbed` **under the
   operator's trusted workspace root** (WP0 §8), host `python3` on PATH (the
   conda `testbed` env is a container-only fact — deviation recorded).
   **Host check** (the closest end-to-end leg available without a container
@@ -141,8 +161,22 @@ pilot report + leaderboard artifacts).
   If the host check cannot run at all (e.g. no pip/network), the instance
   lands in `eval_error` with `eval.skip_reason: "no_container_runtime"`
   (the retry class; the **gate does not depend on the eval verdict**).
-  Pruning = delete both trees (agent sandbox + fresh-checkout clone); the
-  bare clone cache is retained (the "shared base layers retained" analogue).
+  A spawned-tool failure that is not a returncode (a `FileNotFoundError`
+  — a venv without `bin/pip` — or a `subprocess.TimeoutExpired` — a hung
+  pip/pytest) is likewise the `eval_error` infra class, not a run-killing
+  fatal.  Pruning = delete both trees (agent sandbox + fresh-checkout
+  clone); the bare clone cache is retained (the "shared base layers
+  retained" analogue). The WP4 `eval/<instance_id>` workdir is pruned in
+  **both** modes (potentially GBs per instance).
+
+**Patch-extraction hardening (the review rounds):** the porcelain status
+is read with `git status --porcelain -z` (NUL-separated, RAW paths — the
+line mode quotes special paths, e.g. a non-ASCII filename, and would
+silently drop the agent's files); the diff is rendered with
+`-c core.quotepath=false` so the diff paths round-trip to the eval leg's
+`git apply`; a failing `git add -N` (intent-to-add staging) is a loud
+`PilotError`, never silent; the binary-content guard `lstat`s first (a
+FIFO / socket is not opened — `open()` on a FIFO blocks indefinitely).
 
 **Status mapping (harness → the WP3 `TERMINAL_STATUSES` set, unchanged):**
 
@@ -201,12 +235,22 @@ intentional interrupt), (12) budget within
 official harness; sandbox: host check or documented skip — **deviation,
 non-gating**), (14) leak guard **verified post-session, gated on the
 recorded results** (the pre-session guard's `remotes_after` is empty + the
-post-session verification is clean: no `origin` remote, no post-base tags).
+post-session verification is clean: no `origin` remote, no post-base tags,
+**no local branch pointing past `base_commit`** — a branch tip not
+reachable from the base carries the merged fix commit). The budget item
+(12) counts the **whole run pair** (the deduped records' sessions + wall —
+consistent with the wall sum), so a `--resume` can't reset the daily cap.
 **GO ⟺ items 1–12 + 14 all pass.** An **aborted** run (the WP3 terminal
 `aborted` — 2 consecutive `agent_error`, or a per-instance pre-flight
 abort) exits `4` with the abort recorded in the state file and **no
 checklist rendered** (it is the host-crash class: the operator fixes and
-resumes). The decision + measured numbers are
+resumes). An **interrupted** run decides nothing: it is a PARTIAL record
+(e.g. 1/3 instances — no gating item requires all pinned instances to
+have a completed line), so it renders `**Verdict: n/a (interrupted —
+resume to complete)**` instead of a GO the resume invocation would
+silently supersede; the pair's verdict is the resume invocation's. A
+host-crash (`run_failed`) invocation records `final_state: run_failed` in
+the state file (never `done`). The decision + measured numbers are
 written to `<workdir>/wp6a-go-no-go.md` (auto-generated) and committed to
 `bench/notes/wp6a-go-no-go.md` with the run artifacts referenced.
 

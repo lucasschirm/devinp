@@ -410,3 +410,98 @@ tests in `tests/test_live_pilot.py`):
    `pilot-<id>.state.json`, `pilot.lock`, `runs/<iid>/{patch.diff,
    trajectory.jsonl, eval.log}`, the retained `clone-cache/`,
    `report/{report.md, all_preds.jsonl, trajs/}`).
+
+## Review round 3 (PR #37 `pr-review` — the third pass)
+
+The third `pr-review` pass raised 1 Blocker / 1 Major / 4 Medium /
+7 Minor findings. All addressed (zero-quota regression tests in
+`tests/test_live_pilot.py`):
+
+**Blocker**
+
+1. **Container mode could never spawn a session** — `spec.cwd=
+   "/testbed"` was passed to the host-side `Popen(cwd=...)` (a
+   `FileNotFoundError` on every host before the docker-exec shim ever
+   ran; the tests only injected `FakeAcp` in container mode, so the
+   spawn path was never exercised). Now `AcpSession` has a
+   `session_cwd` seam: the devin process is a **host** process, so its
+   spawn cwd is a host-side scratch dir (`runs/<iid>/spawn`); the
+   **session** cwd (what `session/new` sends the agent) stays
+   `/testbed` (the shim's `docker exec -w /testbed` carries it).
+   Regression: `test_container_mode_spawn_cwd_is_host_path`.
+
+**Major**
+
+1. **The leak guard left the clone's local branch at the upstream tip**
+   — `apply_leak_guard` stripped remotes/tags/reflogs but left
+   `main`/`master` past `base_commit` (the merged fix commit one
+   `git log` away); `verify_leak_guard` checked only remotes + tags, so
+   item 14 reported `clean` with the gold patch reachable. Now the
+   guard (host **and** the in-image container variant, after a
+   `git checkout --detach`) deletes **all local branches**, and the
+   verification additionally flags any branch tip **not reachable from
+   `base_commit`** (`git merge-base --is-ancestor <tip> <base>`;
+   fail-closed on unresolvable objects). Regression:
+   `test_leak_guard_deletes_local_branches` (a branch at the fix tip is
+   caught; a branch at the base is not) +
+   `test_container_setup_guard_strips_branches`.
+
+**Medium**
+
+1. **An interrupted run rendered `GO` on a partial record** — item 11
+   was undecided and no gating item requires all pinned instances to
+   have a completed line, so `--interrupt-after 1` wrote a GO with 1/3
+   measured. Now an interrupted run renders `Verdict: n/a
+   (interrupted — resume to complete)` — the pair's verdict is the
+   resume invocation's. Regression: `test_interrupted_run_verdict_not_go`.
+2. **`_is_binary` blocked on FIFOs** — `open(path, "rb")` on an
+   agent-created fifo blocks indefinitely. Now `lstat` +
+   `S_ISREG` first (a fifo / socket / device is never opened).
+   Regression: `test_is_binary_fifo_does_not_block`.
+3. **Silent patch drops from quoted paths / unchecked `git add -N`** —
+   the line-mode `git status --porcelain` quotes special paths (a
+   non-ASCII filename prints as `"w\303\251ird …"`), dropping the
+   agent's files with no warning, and a failing `git add -N` was
+   unchecked. Now: `--porcelain -z` (raw NUL-separated paths), the diff
+   rendered with `-c core.quotepath=false` (paths round-trip to the
+   eval leg's `git apply`), and a failing `git add -N` is a loud
+   `PilotError`. Regressions: `test_extract_patch_non_ascii_filename_included`
+   + `test_extract_patch_add_n_failure_raises`.
+4. **Host credentials leaked into the agent env** — the session env was
+   the full host `os.environ`, so `GITHUB_TOKEN` / cloud API keys were
+   inheritable by the agent's in-scope `env`/`printenv`. Now a
+   denylist of secret-ish keys (token/secret/key/password/passwd/
+   credential/apikey/auth) is stripped before the session is built
+   (both modes), with the stripped key names recorded in the instance
+   meta (`env_sanitized`). Regressions: `test_session_env_sanitizes_credentials`
+   + `test_prepare_sandbox_strips_credentials`.
+
+**Minor**
+
+1. **`eval/<iid>` pruned only in sandbox mode** — now removed in both
+   modes (the WP4 workdir is GBs per instance). Regression:
+   `test_prune_removes_eval_workdir_in_both_modes`.
+2. **Spawned-tool failures escaped the `eval_error` class** — a
+   `FileNotFoundError` (a venv without `bin/pip`) or a
+   `subprocess.TimeoutExpired` (a hung pip/pytest) escaped
+   `_host_check` as a run-killing fatal. Now both are the
+   `eval_error` infra class. Regression:
+   `test_host_check_spawn_failure_is_eval_error`.
+3. **Item 12 mixed bases** — `sessions_this_invocation` counted the
+   current invocation while `wall_used_s` summed the whole run pair, so
+   earlier same-day sessions never counted toward the cap. Now the
+   sessions count is the deduped-records view (consistent with the
+   wall sum).
+4. **Container pre-flight had no `_versions` leg** — a missing tree
+   surfaced only mid-batch in the setup. Now a `versions` pre-flight
+   leg (container mode) fails at the zero-quota gate. Regression:
+   `test_preflight_versions_leg_container`.
+5. **`_write_state` recorded `final_state: "done"` for a `run_failed`**
+   invocation — the durable state file now says `run_failed`.
+   Regression: `test_run_failed_state_file_says_run_failed`.
+6. **Non-typed errors escaped `main()` as exit-1 tracebacks** — now a
+   catch-all maps them to exit 4 (the resume class), inside the
+   documented 0/2/3/4/42 contract. Regression:
+   `test_main_catch_all_is_exit_4`.
+7. **`pilot_instances.json` `fetched_at` postdated the live run** —
+   corrected to 2026-10-28 (the date the run consumed the rows).

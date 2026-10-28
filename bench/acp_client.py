@@ -660,6 +660,7 @@ class AcpSession:
         devin_bin: str = "devin",
         model: str = "swe-2-high",
         cwd: Optional[str] = None,
+        session_cwd: Optional[str] = None,
         extra_args: Optional[list] = None,
         env: Optional[dict] = None,
         policy: Optional[PermissionPolicy] = None,
@@ -672,6 +673,11 @@ class AcpSession:
         self._devin_bin = devin_bin
         self._model = model
         self._cwd = cwd
+        # the SESSION cwd (what ``session/new`` sends the agent) —
+        # distinct from the host-side spawn ``cwd`` (container mode:
+        # the devin process is a host process, the agent works in the
+        # container's ``/testbed``)
+        self._session_cwd = session_cwd
         self._extra_args = list(extra_args or [])
         self._env = dict(env or {})
         self._policy = policy or SwebenchPolicy()
@@ -790,12 +796,14 @@ class AcpSession:
 
     def create_session(self, cwd: Optional[str] = None,
                       mcp_servers: Optional[list] = None) -> str:
-        """``session/new`` (benchmark default: ``cwd="/testbed"``)."""
+        """``session/new`` (benchmark default: ``cwd="/testbed"``) —
+        the session cwd wins over the spawn cwd (container mode:
+        spawn in a host dir, session in the container's ``/testbed``)."""
         self._require_state("initialized")
         deadline = time.monotonic() + self._session_timeout
         rid = self._tx.send_request(
             WIRE["SESSION_NEW"],
-            {"cwd": cwd or self._cwd or "/testbed",
+            {"cwd": cwd or self._session_cwd or self._cwd or "/testbed",
              "mcpServers": mcp_servers if mcp_servers is not None else []},
             deadline=deadline,
         )

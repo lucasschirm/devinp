@@ -1,7 +1,7 @@
 {
   "_meta": {
     "source": "SWE-bench/SWE-bench_Verified (test split) \u2014 one instance from each of the three smallest Verified repos (WP0 notes \u00a75: pallets/flask 1 \u00b7 mwaskom/seaborn 2 \u00b7 psf/requests 8)",
-    "fetched_at": "2026-11-15",
+    "fetched_at": "2026-10-28",
     "fetched_via": "HF datasets-server rows API (https://datasets-server.huggingface.co/rows?dataset=SWE-bench%2FSWE-bench_Verified&config=default&split=test)",
     "note": "pinned verbatim for the WP6a pilot (issue #21); `test_patch` is consumed by the sandbox-mode host check (the documented no-container fallback); `image` is the container-mode sweb.eval image"
   },

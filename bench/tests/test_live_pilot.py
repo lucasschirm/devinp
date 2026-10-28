@@ -53,6 +53,7 @@ import pytest
 
 import acp_client as ac
 import live_pilot as lp
+import runner as rr
 
 MOCK_PATH = str(Path(__file__).resolve().parent.parent / "mock_devin.py")
 
@@ -689,7 +690,7 @@ def _checklist_setup(**over):
         interrupted_this_run=None,
         resume_after_interrupt=False,
         devin_ok=True,
-        sessions_this_invocation=1,
+        sessions_used=1,
         wall_budget_s=2700.0 * 10,
         wall_used_s=60.0,
     )
@@ -1252,6 +1253,296 @@ def test_repeat_resume_keeps_go_record(tmp_path, live):
     assert "**Verdict: GO**" in gng
     state3 = json.loads((wd / "pilot-rr.state.json").read_text())
     assert state3["resume_exercised"] is True
+
+
+# ---------------------------------------------------------------------------
+# the third review round's regressions (PR #37 pr-review round 3)
+# ---------------------------------------------------------------------------
+
+def test_container_mode_spawn_cwd_is_host_path(tmp_path, live):
+    # the BLOCKER: ``spec.cwd="/testbed"`` was passed to the host
+    # ``Popen(cwd=...)`` — ``/testbed`` exists only inside the
+    # container, so every container-mode run died on the first
+    # instance (``FileNotFoundError``) before the docker-exec shim
+    # ever ran. The devin process is a HOST process: the spawn cwd
+    # is a host-side scratch dir; the agent's session cwd stays
+    # ``/testbed`` (the shim's ``docker exec -w /testbed``).
+    inst = _entry(0, "/x", "abc")
+    wd = tmp_path / "wd"
+    spec = lp.SessionSpec(
+        instance=inst, mode="container", devin_bin="shim",
+        model="m", cwd="/testbed", env={}, wall_s=600.0,
+        host_check=False, workdir=str(wd),
+        container="sweb.eval.test__repo0-1")
+    s = lp.PilotSession(spec, make_session=lambda sp: sp)
+    out = s._default_make_session(spec)  # constructs; does not spawn
+    assert out._cwd != "/testbed"
+    assert str(wd) in out._cwd  # a host-side path
+    assert out._session_cwd == "/testbed"  # the agent's cwd
+    # sandbox mode: the spawn cwd IS the session cwd
+    spec2 = lp.SessionSpec(
+        instance=inst, mode="sandbox", devin_bin="shim", model="m",
+        cwd="/x", env={}, wall_s=600.0, host_check=False,
+        workdir=str(wd))
+    out2 = lp.PilotSession(spec2, make_session=lambda sp: sp)
+    o2 = out2._default_make_session(spec2)
+    assert o2._cwd == "/x"
+
+
+def test_session_cwd_wins_in_session_new():
+    # the ``session_cwd`` seam: the session/new payload carries the
+    # SESSION cwd (the container's /testbed), not the spawn cwd
+    s = ac.AcpSession("devin", cwd="/host/spawn", session_cwd="/testbed")
+    assert s._session_cwd == "/testbed"
+    # the fallback chain: explicit arg > session_cwd > cwd > default
+    assert s._cwd == "/host/spawn"
+
+
+def test_leak_guard_deletes_local_branches(tmp_path):
+    # MAJOR: the clone leaves the default branch at the upstream tip
+    # — PAST base_commit, past the instance's merged fix commit (one
+    # ``git log`` away); ``verify_leak_guard`` checked only remotes
+    # and tags, so item 14 reported clean while the gold patch was
+    # reachable
+    src = tmp_path / "src"
+    base = _make_repo(src)
+    (src / "fix.py").write_text("fix = True\n")
+    _git(src, "add", ".")
+    _git(src, "commit", "-q", "-m", "fix")
+    fix = _git(src, "rev-parse", "HEAD").stdout.decode().strip()
+    assert fix != base
+    tb = tmp_path / "tb"
+    _git(tmp_path, "clone", str(src), str(tb))
+    _git(tb, "checkout", "--detach", base)
+    lp.apply_leak_guard(str(tb))
+    v = lp.verify_leak_guard(str(tb), base)
+    assert v["clean"] is True
+    assert v["branches"] == []  # the branch is gone
+    # a branch recreated at the fix tip (the leak) is caught
+    _git(tb, "branch", "leak", fix)
+    v2 = lp.verify_leak_guard(str(tb), base)
+    assert v2["clean"] is False
+    assert v2["branches_ahead_of_base"] == ["leak"]
+    # a branch AT the base is not a leak (reachable from base)
+    _git(tb, "branch", "atbase", base)
+    v3 = lp.verify_leak_guard(str(tb), base)
+    assert "atbase" not in v3["branches_ahead_of_base"]
+
+
+def test_container_setup_guard_strips_branches(tmp_path, live, monkeypatch):
+    # the in-image guard has the same branch hole as the host guard
+    vers = tmp_path / "versions"
+    vers.mkdir()
+    monkeypatch.setenv("DEVIN_VERSIONS_DIR", str(vers))
+    guard_calls: list = []
+
+    def fake_run(args, **kw):
+        a = [str(x) for x in args]
+        if a[0] == "docker" and a[1] == "exec" and "-c" in a:
+            script = a[a.index("-c") + 1]
+            guard_calls.append(script)
+        return _fake_completed(0, b"")
+
+    monkeypatch.setattr(lp.subprocess, "run", fake_run)
+    inst = _entry(0, "/tmp/x", "abc123")
+    lp._container_setup(inst, str(tmp_path))
+    guard = [c for c in guard_calls
+            if c.startswith("cd /testbed")]
+    assert len(guard) == 1
+    g = guard[0]
+    assert "git checkout --detach" in g
+    assert "git branch -D" in g  # the branch strip
+
+
+def test_is_binary_fifo_does_not_block(tmp_path):
+    # ``open()`` on a FIFO blocks indefinitely — an agent-created
+    # fifo left in the tree must not hang the extraction
+    fifo = tmp_path / "pipe"
+    os.mkfifo(fifo)
+    assert lp._is_binary(str(fifo)) is False  # returns, does not hang
+    # a regular file with NUL bytes is still detected
+    f = tmp_path / "b.bin"
+    f.write_bytes(b"x\x00y")
+    assert lp._is_binary(str(f)) is True
+    t = tmp_path / "t.txt"
+    t.write_text("plain\n")
+    assert lp._is_binary(str(t)) is False
+
+
+def test_extract_patch_non_ascii_filename_included(tmp_path):
+    # the review finding: the line-mode ``git status --porcelain``
+    # QUOTES special paths (a non-ASCII filename printed as
+    # ``"w\303\251ird \303\261ame.py"``) — the file would be
+    # silently dropped from the diff. ``-z`` gives raw paths.
+    repo = tmp_path / "repo"
+    commit = _make_repo(repo, name="mod.py")
+    (repo / "tests").mkdir()
+    non_ascii = "w\u00e9ird \u00f6ame.py"
+    (repo / "tests" / non_ascii).write_text("x = 1\n")
+    out = lp.extract_patch(str(repo))
+    assert f"tests/{non_ascii}" in out["included"], out["included"]
+    assert non_ascii in out["diff"]  # raw, unquoted, in the diff
+
+
+def test_extract_patch_add_n_failure_raises(tmp_path, monkeypatch):
+    # an unchecked ``git add -N`` (a failing pathspec) would leave
+    # the intent-to-add missing and ``git diff HEAD`` would quietly
+    # drop the agent's files — it must be loud
+    repo = tmp_path / "repo"
+    _make_repo(repo, name="mod.py")
+    (repo / "tests").mkdir()
+    (repo / "tests" / "new.py").write_text("x = 1\n")
+    real_run = lp.subprocess.run
+
+    def fake_run(cmd, **kw):
+        a = [str(x) for x in cmd]
+        if a[0] == "git" and "-N" in a:
+            return _fake_completed(128, err=b"fatal: pathspec failed")
+        return real_run(cmd, **kw)
+
+    monkeypatch.setattr(lp.subprocess, "run", fake_run)
+    with pytest.raises(lp.PilotError, match="git add -N failed"):
+        lp.extract_patch(str(repo))
+
+
+def test_host_check_spawn_failure_is_eval_error(tmp_path, monkeypatch):
+    # a spawned-tool failure that is NOT a returncode — a
+    # ``FileNotFoundError`` (a venv without ``bin/pip``) or a
+    # ``subprocess.TimeoutExpired`` (a hung pip/pytest) — is the
+    # ``eval_error`` infra class, not a run-killing fatal
+    inst = {
+        "instance_id": "test__host-1", "repo": "test/host",
+        "base_commit": "abc123", "problem_statement": "x",
+        "FAIL_TO_PASS": ["tests/test_a.py::test_a"], "PASS_TO_PASS": [],
+        "test_patch": "", "repo_url": "file:///nonexistent",
+    }
+    spec = lp.SessionSpec(
+        instance=inst, mode="sandbox", devin_bin="x", model="m",
+        cwd=str(tmp_path), env={}, wall_s=30.0, host_check=True,
+        workdir=str(tmp_path))
+    s = lp.PilotSession(spec)
+
+    def fake_run(cmd, **kw):
+        raise FileNotFoundError(2, "No such file or directory", "pip")
+
+    monkeypatch.setattr(lp.subprocess, "run", fake_run)
+    assert s._host_check("patch") == "eval_error"
+    assert "FileNotFoundError" in s.meta["eval_skip_reason"]
+
+
+def test_prune_removes_eval_workdir_in_both_modes(tmp_path, live,
+                                                 monkeypatch):
+    # the WP4 eval workdir (potentially GBs per instance) was
+    # removed only in the sandbox branch — container mode left it
+    # behind on every instance
+    inst = _entry(0, "/tmp/x", "abc123")
+
+    def fake_run(cmd, **kw):
+        return _fake_completed(0, b"")
+
+    monkeypatch.setattr(lp.subprocess, "run", fake_run)
+    for mode in ("container", "sandbox"):
+        wd = tmp_path / f"eval-{mode}"
+        d = wd / "eval" / "test__repo0-1"
+        d.mkdir(parents=True)
+        (d / "big").write_text("x")
+        cfg = lp.PilotConfig(
+            mode=mode, devin_bin=MOCK_PATH, instances_file="x",
+            workdir=str(wd))
+        out = lp.prune_instance(cfg, str(wd), inst)
+        assert not d.is_dir(), f"eval workdir not removed ({mode})"
+        assert "eval workdir" in out["removed"]
+
+
+def test_preflight_versions_leg_container(tmp_path, live, monkeypatch):
+    # a missing ``_versions`` tree must surface at the zero-quota
+    # pre-flight gate (container mode), not mid-batch in the setup
+    def _raise():
+        raise lp.PilotError("no _versions tree")
+
+    monkeypatch.setattr(lp, "_host_versions_dir", _raise)
+    cfg = lp.PilotConfig(
+        mode="container", devin_bin=MOCK_PATH, instances_file="x",
+        workdir=str(tmp_path))
+    pf = lp.make_preflight(cfg)
+    with pytest.raises(rr.PreflightFailed) as excinfo:
+        pf(None)
+    assert excinfo.value.check == "versions"
+
+
+def test_session_env_sanitizes_credentials():
+    env = {"PATH": "/usr/bin", "HOME": "/root",
+           "GITHUB_TOKEN": "ghp_x", "AWS_SECRET_ACCESS_KEY": "y",
+           "OPENAI_API_KEY": "z", "SSH_AUTH_SOCK": "/tmp/ssh",
+           "PYTHONPATH": ""}
+    out, stripped = lp._sanitize_session_env(env)
+    assert "GITHUB_TOKEN" not in out
+    assert "AWS_SECRET_ACCESS_KEY" not in out
+    assert "OPENAI_API_KEY" not in out
+    assert "SSH_AUTH_SOCK" not in out
+    assert out["PATH"] == "/usr/bin"
+    assert out["HOME"] == "/root"
+    assert out["PYTHONPATH"] == ""
+    assert sorted(stripped) == sorted(
+        ["GITHUB_TOKEN", "AWS_SECRET_ACCESS_KEY", "OPENAI_API_KEY",
+         "SSH_AUTH_SOCK"])
+
+
+def test_prepare_sandbox_strips_credentials(tmp_path, live, monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_should_not_leak")
+    r = tmp_path / "src"
+    commit = _make_repo(r)
+    inst = _entry(0, str(r), commit)
+    out = lp.prepare_sandbox_instance(inst, str(tmp_path / "wd"))
+    assert "GITHUB_TOKEN" not in out["env"]
+    assert "GITHUB_TOKEN" in out["env_stripped"]
+
+
+def test_run_failed_state_file_says_run_failed(tmp_path, live):
+    # a host-crash (run_failed) invocation must not record
+    # ``final_state: done`` in the durable state file
+    repos = _three_repos(tmp_path)
+    inst = _instances_file(tmp_path / "inst.json", repos)
+
+    def boom(spec):
+        raise RuntimeError("the host crashed")
+
+    cfg = _cfg(tmp_path, inst)
+    rc = lp.run_pilot(cfg, make_session=boom)
+    assert rc == lp.EXIT_RUN_FAILED
+    state_files = list(tmp_path.glob("pilot-*.state.json"))
+    assert len(state_files) == 1
+    state = json.loads(state_files[0].read_text())
+    assert state["final_state"] == "run_failed"
+
+
+def test_interrupted_run_verdict_not_go(tmp_path, live):
+    # an interrupted invocation is a PARTIAL record (1/3 instances) —
+    # no gating item requires all pinned instances to have a
+    # completed line, so the partial record must not render a GO
+    # the resume invocation would silently supersede
+    repos = _three_repos(tmp_path)
+    inst = _instances_file(tmp_path / "inst.json", repos)
+    cfg = _cfg(tmp_path, inst, interrupt_after=1)
+    rc = lp.run_pilot(cfg, make_session=_mock_make_session("ok"))
+    assert rc == lp.EXIT_INTERRUPT
+    gng = (tmp_path / "wp6a-go-no-go.md").read_text()
+    assert "**Verdict: GO**" not in gng
+    assert "n/a (interrupted" in gng
+
+
+def test_main_catch_all_is_exit_4(tmp_path, live, monkeypatch):
+    # a non-typed failure (an OSError writing the state file / the
+    # artifacts) stays inside the documented exit-code contract —
+    # exit 4 (the resume class), never an exit-1 traceback
+    def _raise(*a, **k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(lp, "run_pilot", _raise)
+    rc = lp.main(["--dry-run", "--instances",
+                 _instances_file(tmp_path / "i.json", [_entry(0, "/x", "a")]),
+                 "--workdir", str(tmp_path)])
+    assert rc == lp.EXIT_RUN_FAILED
 
 
 # ---------------------------------------------------------------------------
