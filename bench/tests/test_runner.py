@@ -1,7 +1,8 @@
-"""WP3a (issue #14) + WP3b (issue #15) — ``runner.py``: sequential
-queue, quota-budget state machine, overlap guard, checkpoint/resume
-with pass@1-correct retry semantics, the dynamic cost-tier model
-gate, and the zero-quota pre-flight.
+"""WP3a (issue #14) + WP3b (issue #15) + WP3c (issue #16) —
+``runner.py``: sequential queue, quota-budget state machine, overlap
+guard, checkpoint/resume with pass@1-correct retry semantics, the
+dynamic cost-tier model gate, the zero-quota pre-flight, and the
+post-eval image/container pruning (PLAN §7).
 
 All tests are unit-level against instrumented fake sessions
 (:class:`FakeSession` + :class:`Registry`) and fixtures — zero quota,
@@ -140,6 +141,55 @@ WP3b acceptance mapping (issue #15, PLAN §2.4–§2.7):
   `test_preflight_failure_resume_cycle`, :func:
   `test_preflight_wall_excluded_from_session_wall`, :func:
   `test_wall_clock_step_back_clamps_to_zero`
+
+WP3c acceptance mapping (issue #16, PLAN §7):
+
+* AC1 — after each evaluated instance: ``docker rmi
+  sweb.eval.x86_64.<instance_id>`` + remove the non-running (exited /
+  created / dead) containers →
+  :func:`test_pruner_removes_instance_image_and_exited_containers`
+  (the exact ``rmi`` of the WP0-pinned reference incl. the ``__``
+  → ``_1776_`` escape; the agent + eval containers removed; the
+  ordering: the containers before the ``rmi``; a running container
+  and the base image untouched), :func:`test_runner_prunes_after_
+  evaluated_instances` (the never-re-run trigger matrix, the
+  post-mark ordering), :func:`test_pruner_running_container_blocks_
+  rmi` (no force), :func:`test_pruner_created_dead_containers_removed`
+  (the ``created`` / ``dead`` states — an ``agent_error`` session
+  that dies between create and start leaves a ``created`` container
+  that would otherwise block the ``rmi``; a running container stays
+  untouched)
+* AC2 — shared base/env layers retained → :func:
+  `test_pruner_base_env_layers_retained` (the layer-refcount model:
+  only the instance-unique layer drops)
+* AC3 — pre-flight disk check sized 2 × the largest expected image
+  (WP3b ``Preflight.min_free_bytes``; the boundary behavior is
+  pinned by ``test_preflight_stub_failure_legs``) → :func:
+  `test_preflight_disk_sizing_two_x_largest_image`, :func:
+  `test_pruner_default_image_for_matches_preflight` (the pre-flight
+  checks what the pruner removes)
+
+Plus the pruning discipline: :func:`test_pruner_docker_failures_
+recorded_not_fatal` (rc failures, a missing image (a **clean no-op** —
+the review-found noise finding: for this trigger set it's benign and
+"No such image" noise would bury real failures), a hung-daemon
+timeout), :func:`test_pruner_missing_image_is_clean_noop` (a real
+``rmi`` failure is still an actionable signal), :func:
+`test_pruner_timeout_is_passed_and_validated`, :func:
+`test_runner_prune_failure_not_fatal` (the single bounded retry — a
+persistently blocked prune is recorded, the run completes),
+:func:`test_runner_prune_retries_once_on_failure` (a transient first-
+attempt failure is cleared by the retry; the retry is bounded at one;
+the final outcome is what the reporter sees), :func:
+`test_runner_prune_outcome_persists_to_jsonl` (a *failed* prune is
+persisted as a supplemental JSONL line — the "which images leaked and
+why" record that survives a crash / a resume; a duplicate line never
+re-runs the instance — last-wins, same status; a successful prune
+writes no line), :func:
+`test_runner_broken_pruner_is_fatal` (a raising pruner is a contract
+bug → host-crash-class fatal), :func:
+`test_runner_no_prune_for_retry_statuses` (the retry class retains
+its image for the resume), :func:`test_runner_prune_under_n_gt1`
 """
 
 from __future__ import annotations
@@ -2425,3 +2475,627 @@ def test_checkpoint_resume_torn_tail_invalid_utf8_newline_terminated(tmp_path):
     recs2, dropped2 = r.load_checkpoint(p)
     assert dropped2 is False
     assert [rec["instance_id"] for rec in recs2] == ["i0", "i1"]
+
+
+# ---------------------------------------------------------------------------
+# WP3c (issue #16) — post-eval image/container pruning (PLAN §7)
+# ---------------------------------------------------------------------------
+
+
+class DockerFixture:
+    """A stateful docker double (issue #16 "testable by: docker
+    fixture"): an in-memory image store (name → layers) with a
+    **layer-refcount model** (a layer is dropped from the store only
+    when no remaining image references it — the docker image store's
+    semantics; a ``rmi`` removes only the image's *unique* layers, the
+    shared base/env layers are retained — issue #16 AC2) + a
+    container table (id → [image, status]). Honors the daemon-side
+    ``status=…`` / ``ancestor=<image>`` filters and the ``rmi``
+    "in use by a container" rule (a container — even a *non-running*
+    one — keeps the image "in use"; the ordering the pruner must get
+    right). Records every joined command; failures inject per command
+    **argv-element run** (the review-found prefix hazard — "FAKEDOCKER
+    rm c0000001" no longer bleeds onto "FAKEDOCKER rm c00000010":
+    a key matches only when its tokens are a contiguous exact run of
+    argv elements)."""
+
+    def __init__(self) -> None:
+        self.images: dict = {}      # name -> [layers]
+        self.layers: dict = {}     # layer -> {image names} (refcount)
+        self.containers: dict = {}  # id -> [image, status]
+        self.commands: list = []
+        self.fail_rc: dict = {}    # argv-element run -> rc
+        self.fail_exc: dict = {}   # argv-element run -> Exception
+        self._next = 0
+
+    def add_image(self, name: str, layers) -> None:
+        self.images[name] = list(layers)
+        for l in layers:
+            self.layers.setdefault(l, set()).add(name)
+
+    def add_container(self, image: str, status: str = "exited") -> str:
+        self._next += 1
+        cid = "c%08x" % self._next
+        self.containers[cid] = [image, status]
+        return cid
+
+    def _result(self, rc: int, stdout: bytes = b"",
+               stderr: bytes = b"") -> "types.SimpleNamespace":
+        return types.SimpleNamespace(returncode=rc, stdout=stdout,
+                                    stderr=stderr)
+
+    def _injected(self, cmd: list, table: dict):
+        # A key matches only as a contiguous run of **exact argv
+        # elements** (argument-boundary anchored — the review-found
+        # prefix hazard; a raw substring over the joined command would
+        # bleed "FAKEDOCKER rm c0000001" onto "… c00000010").
+        for key, fail in table.items():
+            toks = key.split()
+            for i in range(len(cmd) - len(toks) + 1):
+                if cmd[i:i + len(toks)] == toks:
+                    return fail
+        return None
+
+    def run(self, cmd: list, timeout_s: float):
+        joined = " ".join(cmd)
+        self.commands.append(joined)
+        exc = self._injected(cmd, self.fail_exc)
+        if exc is not None:
+            raise exc
+        rc = self._injected(cmd, self.fail_rc)
+        if rc is not None:
+            return self._result(rc, b"", b"fixture-boom")
+        if len(cmd) >= 2 and cmd[1] == "ps":
+            img = None
+            statuses = set()
+            for i, a in enumerate(cmd):
+                if a == "--filter" and i + 1 < len(cmd):
+                    if cmd[i + 1].startswith("ancestor="):
+                        img = cmd[i + 1][len("ancestor="):]
+                    elif cmd[i + 1].startswith("status="):
+                        statuses.add(cmd[i + 1][len("status="):])
+            out = []
+            for cid in sorted(self.containers):
+                cimg, status = self.containers[cid]
+                if statuses and status not in statuses:
+                    continue  # the status filter (daemon-side)
+                if img is not None and cimg != img:
+                    continue  # the ancestor filter (daemon-side)
+                out.append(cid)
+            body = ("\n".join(out) + "\n").encode() if out else b""
+            return self._result(0, body, b"")
+        if len(cmd) >= 3 and cmd[1] == "rm":
+            cid = cmd[2]
+            if cid in self.containers:
+                del self.containers[cid]
+                return self._result(0, b"", b"")
+            return self._result(1, b"", b"no such container")
+        if len(cmd) >= 3 and cmd[1] == "rmi":
+            name = cmd[2]
+            if name not in self.images:
+                return self._result(1, b"", b"No such image")
+            if any(ci[0] == name for ci in self.containers.values()):
+                # a container (even a non-running one) keeps the image
+                # in use — the ordering the pruner must get right
+                return self._result(1, b"",
+                                   b"image is in use by a container")
+            for layer in self.images[name]:
+                self.layers[layer].discard(name)
+            del self.images[name]
+            # the refcount model: a layer is dropped from the store
+            # only when no remaining image references it (AC2)
+            self.layers = {l: refs for l, refs in self.layers.items()
+                          if refs}
+            return self._result(0, ("Untagged: " + name).encode(), b"")
+        return self._result(1, b"", b"unknown subcommand")
+
+
+def _wp3c_fixture() -> "tuple":
+    """The WP3c docker-fixture setup (the layer model): the instance
+    image is built on the base + env — it shares their layers; only
+    ``i1`` is instance-unique. Returns ``(fixture, base, env,
+    instance_image, instance_id)``."""
+    fx = DockerFixture()
+    base = "swebench/sweb.base.x86_64.ubuntu2204_py311:latest"
+    env = "swebench/sweb.env.x86_64.testbed:latest"
+    inst = "swebench/sweb.eval.x86_64.django_1776_django-12345"
+    fx.add_image(base, ["b1", "b2"])
+    fx.add_image(env, ["b1", "b2", "e1", "e2"])
+    fx.add_image(inst, ["b1", "b2", "e1", "e2", "i1"])
+    return fx, base, env, inst, "django__django-12345"
+
+
+def test_pruner_removes_instance_image_and_exited_containers():
+    """AC1: ``docker rmi sweb.eval.x86_64.<instance_id>`` + remove the
+    exited containers. The fixture holds the base image, an env image,
+    the instance image, the instance's two exited containers (the
+    agent's + the eval's fresh one), a *running* container of the base
+    image and an exited base-image container. The pruner removes the
+    two instance containers + the instance image, touches nothing
+    else, and the ``rmi`` (the exact WP0-pinned reference, the
+    ``__`` → ``_1776_`` escape) lands **after** the container removal
+    (a container, even an exited one, keeps the image "in use")."""
+    fx, base, env, inst, iid = _wp3c_fixture()
+    agent_c = fx.add_container(inst)  # the agent's container (exited)
+    eval_c = fx.add_container(inst)  # the eval's fresh container (exited)
+    running_c = fx.add_container(base, status="running")
+    base_c = fx.add_container(base, status="exited")
+    p = r.Pruner("FAKEDOCKER", run=fx.run)
+    out = p.prune(iid)
+    # AC1 — the instance image + the exited containers are removed
+    assert out["image"] == inst
+    assert out["image_removed"] is True
+    assert sorted(out["containers_removed"]) == sorted([agent_c, eval_c])
+    assert out["containers_failed"] == {} and out["errors"] == []
+    assert inst not in fx.images
+    assert agent_c not in fx.containers and eval_c not in fx.containers
+    # the running container is untouched (never forced — the AC is to
+    # remove *exited* containers)
+    assert fx.containers[running_c][1] == "running"
+    # the base image + its (exited) container are untouched
+    assert base in fx.images and env in fx.images
+    assert base_c in fx.containers
+    assert not any(c.startswith("FAKEDOCKER rmi " + base)
+                   for c in fx.commands)
+    assert not any(c.startswith("FAKEDOCKER rmi " + env)
+                   for c in fx.commands)
+    assert not any(c == f"FAKEDOCKER rm {base_c}" for c in fx.commands)
+    # the exact rmi (AC1's `docker rmi sweb.eval.x86_64.<instance_id>`,
+    # the WP0 pin incl. the __ → _1776_ escape)
+    assert f"FAKEDOCKER rmi {inst}" in fx.commands
+    # the daemon-side filters are exact (incl. the created/dead states
+    # — the review-found gap: they hold the image "in use" the same
+    # way an exited one does)
+    assert fx.commands[0] == (
+        "FAKEDOCKER ps -a --filter status=exited "
+        "--filter status=created --filter status=dead "
+        "--filter ancestor=" + inst + " --format " + "{{.ID}}"
+    )
+    # the ordering: every container rm before the rmi
+    rmi_idx = fx.commands.index(f"FAKEDOCKER rmi {inst}")
+    assert min(i for i, c in enumerate(fx.commands)
+               if c == f"FAKEDOCKER rm {agent_c}"
+               or c == f"FAKEDOCKER rm {eval_c}") < rmi_idx
+    # the outcome is recorded (the append-ordered history)
+    assert p.prunes == [out]
+
+
+def test_pruner_base_env_layers_retained():
+    """AC2: ``docker rmi`` removes only the image's *unique* layers —
+    the shared base/env layers are reference-counted and retained
+    (the fixture's refcount model: a layer drops only when no
+    remaining image references it). The instance image shares
+    ``b1`` / ``b2`` (base) + ``e1`` / ``e2`` (env); only ``i1`` is
+    instance-unique. After the prune: ``i1`` drops, base + env
+    layers + the base/env images stand."""
+    fx, base, env, inst, iid = _wp3c_fixture()
+    r.Pruner("FAKEDOCKER", run=fx.run).prune(iid)
+    assert "i1" not in fx.layers  # the instance-unique layer is removed
+    assert {"b1", "b2", "e1", "e2"} <= set(fx.layers)  # base + env retained
+    assert base in fx.images and env in fx.images  # never rmied
+
+
+def test_pruner_running_container_blocks_rmi():
+    """AC1's no-force corner: a *running* container of the instance
+    image keeps the image "in use" — the pruner removes the *exited*
+    one, the ``rmi`` fails (the fixture models the docker refusal),
+    and the failure is **recorded, not raised** (the run continues;
+    the next window's pre-flight ``disk`` leg is the safety net)."""
+    fx = DockerFixture()
+    inst = "swebench/sweb.eval.x86_64.x_1776_x-1"
+    fx.add_image(inst, ["b1", "i1"])
+    running_c = fx.add_container(inst, status="running")
+    exited_c = fx.add_container(inst)
+    out = r.Pruner("FAKEDOCKER", run=fx.run).prune("x__x-1")
+    assert out["containers_removed"] == [exited_c]
+    assert fx.containers[running_c][1] == "running"  # never touched
+    assert out["image_removed"] is False  # the rmi failed (in use)
+    assert out["errors"] and "in use" in " ".join(out["errors"])
+    assert inst in fx.images  # still there — not forced
+
+
+def test_pruner_default_image_for_matches_preflight():
+    """AC1 ↔ AC3 cross-consistency: the pruner's default ``image_for``
+    is the shared WP0 pin — the **same** reference the pre-flight's
+    ``docker_image`` leg inspects (the pre-flight checks what the
+    pruner removes; a drift would have the pre-flight bless an image
+    the pruner never prunes — or vice versa)."""
+    seen = []
+    pf = r.Preflight("FAKEDEVIN", "FAKEDOCKER", disk_path="/",
+                    largest_image_bytes=1,
+                    run=_fake_run(None, 0, seen),
+                    disk_usage_fn=lambda p: _ok_disk())
+    pf("django__django-12345")
+    inspect_target = [s for s in seen if "image inspect" in s][0].split()[-1]
+    fx = DockerFixture()
+    out = r.Pruner("FAKEDOCKER", run=fx.run).prune("django__django-12345")
+    assert out["image"] == inspect_target
+    assert out["image"] == "swebench/sweb.eval.x86_64." \
+        "django_1776_django-12345"
+
+
+def test_pruner_docker_failures_recorded_not_fatal():
+    """The best-effort discipline: every docker operational failure is
+    recorded in the outcome, never raised (disk pressure is a
+    pre-flight concern — the next window's ``disk`` leg is the safety
+    net). Each case: no exception out of ``prune``."""
+    # (1) the container list fails (rc) — the rmi still runs (the
+    # steps are independent best-effort)
+    fx = DockerFixture()
+    inst = "swebench/sweb.eval.x86_64.a_1776_a-1"
+    fx.add_image(inst, ["i1"])
+    fx.fail_rc["FAKEDOCKER ps"] = 1
+    out = r.Pruner("FAKEDOCKER", run=fx.run).prune("a__a-1")
+    assert out["errors"] and "container list" in " ".join(out["errors"])
+    assert out["image_removed"] is True  # the rmi ran anyway
+    # (2) one container rm fails — the next proceeds
+    fx = DockerFixture()
+    fx.add_image(inst, ["i1"])
+    c1 = fx.add_container(inst)
+    c2 = fx.add_container(inst)
+    fx.fail_rc[f"FAKEDOCKER rm {c1}"] = 1
+    out = r.Pruner("FAKEDOCKER", run=fx.run).prune("a__a-1")
+    assert out["containers_removed"] == [c2]  # the next one proceeds
+    assert c1 in out["containers_failed"]
+    # the cascade: the failed rm leaves the container in place, so the
+    # rmi legitimately fails (the image is still "in use" — realistic
+    # docker semantics) — recorded, not fatal
+    assert out["image_removed"] is False
+    assert out["errors"] and "in use" in " ".join(out["errors"])
+    # (3) the rmi fails (rc) — recorded
+    fx = DockerFixture()
+    fx.add_image(inst, ["i1"])
+    fx.fail_rc["FAKEDOCKER rmi"] = 1
+    out = r.Pruner("FAKEDOCKER", run=fx.run).prune("a__a-1")
+    assert out["image_removed"] is False
+    assert out["errors"]
+    # (4) a missing image (an idempotent double-prune) — a **clean
+    # no-op** (the review-found noise finding): for this trigger set
+    # it's benign (an agent_error / timeout session may never have
+    # pulled the image), and with ~500 instances "No such image" noise
+    # would make real failures unfindable by an errors scan
+    fx = DockerFixture()  # the image never existed
+    out = r.Pruner("FAKEDOCKER", run=fx.run).prune("a__a-1")
+    assert out["image_removed"] is False
+    assert out["errors"] == []  # the clean no-op — errors stay an
+    # actionable signal (case (3) above: a real failure is recorded)
+    # (5) a hung daemon (a timeout on the rmi) — recorded, not raised
+    fx = DockerFixture()
+    fx.add_image(inst, ["i1"])
+    fx.fail_exc["FAKEDOCKER rmi"] = TimeoutError("daemon hung")
+    out = r.Pruner("FAKEDOCKER", run=fx.run).prune("a__a-1")
+    assert out["image_removed"] is False
+    assert out["errors"] and "TimeoutError" in " ".join(out["errors"])
+
+
+def test_pruner_timeout_is_passed_and_validated():
+    """Every docker command is bounded by ``timeout_s`` (a hung daemon
+    is a recorded error, not a stall — the run spans days); the
+    validation mirrors the pre-flight's (a number > 0; a bool is
+    refused)."""
+    seen = []
+    fx = DockerFixture()
+
+    def run(cmd, timeout_s):
+        seen.append(timeout_s)
+        return fx.run(cmd, timeout_s)
+
+    p = r.Pruner("FAKEDOCKER", run=run, timeout_s=7.5)
+    p.prune("a__a-1")
+    assert len(seen) == 2  # ps + rmi (no containers to rm)
+    assert set(seen) == {7.5}
+    # the default is bounded (a hung daemon never stalls the run)
+    p2 = r.Pruner("FAKEDOCKER", run=run)
+    p2.prune("b__b-1")
+    assert p2.timeout_s > 0
+    # the validation (the house style — bool refused uniformly)
+    with pytest.raises(r.RunnerConfigError):
+        r.Pruner(timeout_s=0)
+    with pytest.raises(r.RunnerConfigError):
+        r.Pruner(timeout_s=True)
+    with pytest.raises(r.RunnerConfigError):
+        r.Pruner(timeout_s=-1.0)
+
+
+# ---------------------------------------------------------------------------
+# WP3c (issue #16) — the runner integration
+# ---------------------------------------------------------------------------
+
+
+def _prune_env() -> "tuple":
+    """A WP3c runner test environment: an :class:`Env`, a stateful
+    docker fixture, and a :class:`~runner.Pruner` over it, with the
+    images pre-created through the pruner's own mapping (the shared
+    WP0 pin)."""
+    e = Env()
+    fx = DockerFixture()
+    pruner = r.Pruner("FAKEDOCKER", run=fx.run)
+    return e, fx, pruner
+
+
+def _precreate(fx, pruner, ids) -> None:
+    for i in ids:
+        fx.add_image(pruner.image_for(i), ["i1"])
+
+
+def test_runner_prunes_after_evaluated_instances():
+    """AC1 (the trigger matrix): the full never-re-run class triggers
+    exactly one prune each, in completion order — ``resolved`` /
+    ``failed_test`` are the "evaluated" core (the harness verdicts);
+    ``timeout`` / ``no_patch`` / ``agent_error`` end before a harness
+    verdict but are never re-run, so their images are dead weight
+    (PLAN §7). A spy asserts the ordering: the prune happens *after*
+    the instance's mark — the state machine handled the status first.
+    The ``agent_error`` here is a *single* one (the 2-consecutive
+    abort does not fire)."""
+    e, fx, pruner = _prune_env()
+    statuses = {"i0": "resolved", "i1": "failed_test", "i2": "timeout",
+               "i3": "no_patch", "i4": "agent_error"}
+    _precreate(fx, pruner, statuses)
+    pruned = []
+    real = pruner.prune
+
+    def spy(iid):
+        # at prune time the instance's mark is already recorded — the
+        # state machine handled the status first (the ordering)
+        marks = [v for v in e.reporter.events
+                if v[0] == "instance" and v[1] == iid]
+        assert len(marks) == 1, (iid, e.reporter.events)
+        pruned.append(iid)
+        return real(iid)
+
+    pruner.prune = spy
+    runner = e.make(list(statuses), statuses, pruner=pruner)
+    result = runner.run()
+    assert result.final_state == "done"
+    assert pruned == ["i0", "i1", "i2", "i3", "i4"]  # completion order
+    assert len(pruner.prunes) == 5
+    for o in pruner.prunes:
+        assert o["image_removed"] is True  # the images were present
+        assert o["errors"] == []
+
+
+def test_runner_no_prune_for_retry_statuses():
+    """The retry class is **not** pruned: ``quota_limited`` (the batch
+    stops), ``eval_error`` and ``preflight_failed`` (the run aborts)
+    all re-run on resume, and the resume's pre-flight ``docker_image``
+    leg requires the image present — so their images are retained
+    (zero prunes; the images still there)."""
+    e, fx, pruner = _prune_env()
+    ids = ["i5", "i6", "i7"]
+    _precreate(fx, pruner, ids)
+
+    def pf(inst):
+        if inst == "i7":
+            raise r.PreflightFailed("docker_image", "not present")
+
+    runner = e.make(ids,
+                   {"i5": "quota_limited", "i6": "eval_error",
+                    "i7": "eval_error"},
+                   pruner=pruner, preflight=pf)
+    result = runner.run()
+    assert result.final_state == "aborted"  # i7's pre-flight failure
+    assert [s for _, s in result.results] == [
+        "quota_limited", "eval_error", "preflight_failed"]
+    assert pruner.prunes == []  # nothing pruned
+    for i in ids:  # the images stand (the resume can find them)
+        assert pruner.image_for(i) in fx.images
+
+
+def test_runner_broken_pruner_is_fatal():
+    """A pruner that *raises* is a contract bug (the injected pruner
+    is broken — the real :class:`~runner.Pruner` records operational
+    failures instead) → a host-crash-class fatal: the run re-raises,
+    and ``run_finished`` is *not* reported (the run did not finish —
+    the same discipline as a broken session)."""
+    e = Env()
+
+    class Broken:
+        def __init__(self) -> None:
+            self.prunes = []
+
+        def prune(self, iid):
+            raise RuntimeError("pruner bug")
+
+    runner = e.make(["i0"], {"i0": "resolved"}, pruner=Broken())
+    with pytest.raises(RuntimeError, match="pruner bug"):
+        runner.run()
+    assert not any(ev[0] == "run_finished" for ev in e.reporter.events)
+
+
+def test_runner_prune_failure_not_fatal():
+    """A docker operational failure (here: every ``ps`` + ``rmi``
+    fails — persistently, so both attempts of the single bounded
+    retry fail) is recorded in the outcome, **not fatal** — the run
+    completes (the hygiene step never re-opens a state-machine
+    decision; disk pressure is the next window's pre-flight ``disk``
+    leg's job). Each instance yields 2 recorded attempts; the
+    reporter saw one (the final) outcome per instance."""
+    e, fx, pruner = _prune_env()
+    fx.fail_rc["FAKEDOCKER ps"] = 1
+    fx.fail_rc["FAKEDOCKER rmi"] = 1
+    runner = e.make(["i0", "i1"], {"i0": "resolved", "i1": "resolved"},
+                   pruner=pruner)
+    result = runner.run()
+    assert result.final_state == "done"  # the run is unaffected
+    assert len(pruner.prunes) == 4  # 2 instances × 2 attempts (the
+    # single bounded retry)
+    assert all(o["image_removed"] is False for o in pruner.prunes)
+    assert all(o["errors"] for o in pruner.prunes)
+    prune_ev = [ev for ev in e.reporter.events if ev[0] == "prune"]
+    assert len(prune_ev) == 2  # one (final) outcome per instance
+    assert all(ev[3]["errors"] for ev in prune_ev)
+
+
+def test_runner_prune_under_n_gt1():
+    """A granted N>1: the pruning is per-instance (the pruner is
+    GIL-safe — list appends, like the default reporter), every
+    never-re-run instance is pruned exactly once."""
+    e, fx, pruner = _prune_env()
+    _precreate(fx, pruner, ["i0", "i1"])
+    barrier = threading.Barrier(2, timeout=10)
+    runner = e.make(["i0", "i1"], {"i0": "resolved", "i1": "resolved"},
+                   concurrency=2, i_know_about_quota=True, pruner=pruner,
+                   factory=lambda inst: FakeSession(
+                       e.registry, "resolved", barrier=barrier))
+    result = runner.run()
+    assert result.final_state == "done"
+    assert sorted(o["instance_id"] for o in pruner.prunes) == ["i0", "i1"]
+    assert all(o["image_removed"] is True for o in pruner.prunes)
+
+
+def test_pruner_created_dead_containers_removed():
+    """The review-found gap (Medium): the ``created`` / ``dead``
+    states hold the image "in use" exactly like an exited one — an
+    ``agent_error`` session that dies between container create and
+    start leaves a ``created`` container that would otherwise block
+    the ``rmi``. The pruner removes them (the intent is "everything
+    that isn't running"); a *running* container stays untouched; the
+    ``rmi`` succeeds (no "in use" block)."""
+    fx = DockerFixture()
+    base = "swebench/sweb.base.x86_64.ubuntu2204_py311:latest"
+    inst = "swebench/sweb.eval.x86_64.x_1776_x-2"
+    fx.add_image(base, ["b1"])
+    fx.add_image(inst, ["b1", "i1"])
+    created_c = fx.add_container(inst, status="created")
+    dead_c = fx.add_container(inst, status="dead")
+    running_c = fx.add_container(base, status="running")
+    out = r.Pruner("FAKEDOCKER", run=fx.run).prune("x__x-2")
+    assert sorted(out["containers_removed"]) == sorted([created_c, dead_c])
+    assert fx.containers[running_c][1] == "running"  # never touched
+    assert out["image_removed"] is True  # no "in use" block
+    assert out["errors"] == []
+    assert base in fx.images  # the base image stands
+
+
+def test_pruner_missing_image_is_clean_noop():
+    """The review-found noise (Minor): a missing image is a **clean
+    no-op** (``image_removed`` False, no error) — for this trigger set
+    it's benign (an ``agent_error`` / ``timeout`` session may never
+    have pulled the image; a crash between mark and prune leaves
+    absence normal on any later attempt), and with ~500 instances
+    "No such image" noise would make real failures unfindable by an
+    ``errors`` scan. A *real* ``rmi`` failure (a non-absence stderr)
+    is still recorded — the signal isn't suppressed wholesale, only
+    the benign absence class."""
+    fx = DockerFixture()  # the image never existed
+    out = r.Pruner("FAKEDOCKER", run=fx.run).prune("a__a-1")
+    assert out["image_removed"] is False
+    assert out["errors"] == []  # the clean no-op
+    # a real failure (a non-absence stderr) is still an actionable
+    # signal
+    fx2 = DockerFixture()
+    inst2 = "swebench/sweb.eval.x86_64.b_1776_b-1"
+    fx2.add_image(inst2, ["i1"])
+    fx2.fail_rc["FAKEDOCKER rmi"] = 1
+    out2 = r.Pruner("FAKEDOCKER", run=fx2.run).prune("b__b-1")
+    assert out2["image_removed"] is False
+    assert out2["errors"]  # recorded — the actionable signal
+
+
+def test_runner_prune_retries_once_on_failure():
+    """The Medium mitigation — the single bounded retry: a transient
+    first-attempt failure (a daemon hiccup) is cleared by the retry
+    (the final, clean outcome is what the reporter sees); a
+    persistently blocked prune is recorded (the last attempt's
+    outcome) and the run moves on. The retry is bounded at **one** —
+    a third attempt never happens. (The deferred re-sweep across a
+    resume is the adapter WP's territory — the checkpoint's domain.)"""
+    e, fx, pruner = _prune_env()
+    _precreate(fx, pruner, ["i0"])
+    attempts = 0
+    real = pruner.prune
+
+    def flaky(iid):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            # the first attempt: a transient daemon hiccup (a pure
+            # fake — no real prune)
+            return {"errors": ["container list (rc 1)"],
+                    "image_removed": False, "containers_removed": [],
+                    "containers_failed": {}, "instance_id": iid,
+                    "image": "swebench/sweb.eval.x86_64.i0"}
+        return real(iid)
+
+    pruner.prune = flaky
+    runner = e.make(["i0"], {"i0": "resolved"}, pruner=pruner)
+    result = runner.run()
+    assert result.final_state == "done"
+    assert attempts == 2  # exactly one retry — bounded
+    ev = [ev for ev in e.reporter.events if ev[0] == "prune"]
+    assert len(ev) == 1
+    assert ev[0][3]["image_removed"] is True  # the final (clean) outcome
+    assert ev[0][3]["errors"] == []
+    # persistently blocked: the run still completes (not fatal), and
+    # the recorded outcome is the last (failed) attempt
+    e2, fx2, pruner2 = _prune_env()
+    fx2.fail_rc["FAKEDOCKER ps"] = 1
+    fx2.fail_rc["FAKEDOCKER rmi"] = 1
+    runner2 = e2.make(["i1"], {"i1": "resolved"}, pruner=pruner2)
+    result2 = runner2.run()
+    assert result2.final_state == "done"
+    ev2 = [ev for ev in e2.reporter.events if ev[0] == "prune"]
+    assert len(ev2) == 1
+    assert ev2[0][3]["errors"]  # the last attempt's outcome is recorded
+    assert len(pruner2.prunes) == 2  # both attempts in the history
+
+
+def test_runner_prune_outcome_persists_to_jsonl(tmp_path):
+    """The Major pin: a *failed* prune is persisted as a **supplemental
+    JSONL line** (a valid record — the instance's id + terminal
+    status, the outcome in ``meta["prune"]``): the "which images
+    leaked and why" record that survives a crash / a resume. A
+    duplicate line is last-wins in the resume logic (same status →
+    no re-run — a pass@1-correct resume), and a *successful* prune
+    writes no line (the happy path stays noise-free)."""
+    p = str(tmp_path / "run-1.jsonl")
+    e = Env()
+    fx = DockerFixture()
+    pruner = r.Pruner("FAKEDOCKER", run=fx.run)
+    _precreate(fx, pruner, ["i0"])
+    fx.fail_rc["FAKEDOCKER ps"] = 1
+    fx.fail_rc["FAKEDOCKER rmi"] = 1  # a persistently blocked prune
+    ckpt = r.JsonlCheckpoint(p)
+    e.make(["i0"], {"i0": "resolved"}, reporter=ckpt, pruner=pruner).run()
+    ckpt.close()
+    recs, dropped = r.load_checkpoint(p)
+    assert dropped is False
+    assert [(rec["instance_id"], rec["status"]) for rec in recs] == [
+        ("i0", "resolved"), ("i0", "resolved")]  # mark + prune line
+    assert "prune" in recs[1]["meta"]
+    assert recs[1]["meta"]["prune"]["errors"]  # the leak record
+    to_run, skipped = r.resume_queue(["i0"], recs)
+    assert to_run == []  # the duplicate line never re-runs (last-wins)
+    assert skipped == {"i0": "resolved"}
+    # a *successful* prune writes no line (no noise on the happy path)
+    p2 = str(tmp_path / "run-2.jsonl")
+    e2 = Env()
+    fx2 = DockerFixture()
+    pruner2 = r.Pruner("FAKEDOCKER", run=fx2.run)
+    _precreate(fx2, pruner2, ["i1"])
+    ckpt2 = r.JsonlCheckpoint(p2)
+    e2.make(["i1"], {"i1": "resolved"}, reporter=ckpt2,
+            pruner=pruner2).run()
+    ckpt2.close()
+    recs2, _ = r.load_checkpoint(p2)
+    assert [rec["instance_id"] for rec in recs2] == ["i1"]  # one line
+
+
+# ---------------------------------------------------------------------------
+# WP3c (issue #16) — AC3: the pre-flight disk check is sized 2 × the
+# largest expected image (implemented in WP3b's Preflight; pinned here)
+# ---------------------------------------------------------------------------
+
+
+def test_preflight_disk_sizing_two_x_largest_image():
+    """AC3: the pre-flight ``disk`` leg's floor is exactly
+    ``2 × the largest expected image`` (PLAN §7; the boundary
+    behavior — failing below, passing at — is pinned by
+    ``test_preflight_stub_failure_legs``). Together with the pruning
+    (which keeps the disk near the floor), the 2× floor holds across
+    the 500."""
+    pf = r.Preflight(largest_image_bytes=512 * 1024)
+    assert pf.min_free_bytes == 2 * 512 * 1024
+    pf2 = r.Preflight(largest_image_bytes=3.5)
+    assert pf2.min_free_bytes == 7.0  # a float sizing is exact
