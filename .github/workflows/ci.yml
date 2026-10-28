@@ -19,6 +19,30 @@ jobs:
       - run: npm ci
       - run: npm test
 
+  pack:
+    name: pack — npm tarball excludes bench/
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      # Match publish.yml: the release runs under npm@latest, so assert the
+      # packlist under the same npm. Shape drift in a future npm cannot
+      # pass silently: check-pack.js handles the npm 11 (array) and npm 12
+      # (keyed object) shapes (unit-tested) and fails closed when no file
+      # list can be extracted.
+      - run: npm install -g npm@latest
+
+      - run: npm ci
+
+      # Asserts (bench/PLAN.md §8.1) that `npm pack` never ships bench/ and
+      # that the shipped surfaces (bin/, data/) are still present.
+      - run: node scripts/check-pack.js
+
   bench:
     name: bench (python — unit + mock, zero quota)
     runs-on: ubuntu-latest
