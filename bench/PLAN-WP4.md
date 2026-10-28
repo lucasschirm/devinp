@@ -102,14 +102,22 @@ Re-verified directly against the pinned wheel
      harness.
    - `Timeout error: <n> seconds exceeded.` — appended to `test_output.txt`
      as the file's *final write* when the in-container test exec hits `-t`
-     (hence tail-anchored); the harness also logs its own `Test timed out
+     (hence tail-anchored, and the number is *this run's `-t` value* —
+     `run_evaluation.py:376`, so the marker is tied to the run's own test
+     cap — `test_output.txt` is the most patch-influenceable artifact: it
+     is the container's test output and also captures the patched code's
+     stdout); the harness also logs its own `Test timed out
      after {timeout} seconds.` `EvaluationError` message into
      `run_instance.log` — the number is *this run's `-t` value*
      (`run_evaluation.py:379`), so the marker is tied to the run's own
      test cap, not any number a patch's diff might contain.
    - `>>>>> Tests Timed Out` (`TESTS_TIMEOUT`) — the dataset eval-script's
      timeout marker, which grading reads *inside the test output*
-     (`grading.py:137`) — it is never written to `run_instance.log`.
+     (`grading.py:137`) — it is never written by the harness (the
+     dataset's eval script prints it as a line of its own, inside the
+     container) and never to `run_instance.log`; because `test_output.txt`
+     also captures the patched code's stdout, it is anchored as a *whole
+     line* (an embedded substring must not be terminal).
    - **Echo-masked instance-log markers:** the harness reflects the patch
      text into `run_instance.log` in exactly two places — the
      `Git diff before:` / `Git diff after:` echoes (one logger call each,

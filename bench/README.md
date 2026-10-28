@@ -382,15 +382,20 @@ contract — never a traceback with exit 1).
   header check would wrongly reject). Every non-empty patch reaches the
   harness; the chain's `APPLY_PATCH_FAIL` marker in `run_instance.log` →
   `PatchCorruptionError` (wins over a timeout marker), the
-  tail-anchored `Timeout error: N seconds exceeded.` marker (the harness's
-  final write) or `>>>>> Tests Timed Out` (the dataset eval-script's
-  marker, graded *inside* the test output) in `test_output.txt`, or the
+  tail-anchored `Timeout error: <n> seconds exceeded.` marker in
+  `test_output.txt` (the harness's final write — the number is *this run's
+  `-t` value*, `run_evaluation.py:376`), `>>>>> Tests Timed Out` in
+  `test_output.txt` anchored as a *whole line* (the dataset eval-script's
+  marker, graded *inside* the test output — `test_output.txt` also
+  captures the patched code's stdout), or the
   harness's own `Test timed out after <n> seconds.` message in
   `run_instance.log` — the number is *this run's `-t` value*
   (`run_evaluation.py:379`) — checked on the log with the harness's
   patch-diff echo regions (`Git diff before:` / `Git diff after:`) masked,
   because the harness reflects the patch text into the instance log in
-  exactly those two places → `EvaluationTimeoutError`
+  exactly those two places (and the container-id extraction runs on the
+  same masked log, so a forged `Container for <iid> created:` line inside
+  an echo cannot displace the harness's real one) → `EvaluationTimeoutError`
   (terminal in WP3 — hence the loose markers are anchored and file-specific,
   so a docker-client flake cannot zero out a retryable instance),
   anything else →

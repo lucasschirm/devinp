@@ -478,6 +478,108 @@ def test_container_id_extracted_from_harness_log(tmp_path):
     assert result["logs"]["container"] is None
 
 
+def test_forged_container_line_in_diff_echo_does_not_win(tmp_path):
+    """The container id is extracted from the *echo-masked* log: the
+    harness reflects the patch text into run_instance.log in the "Git diff
+    before:" / "Git diff after:" echoes, and a forged "Container for <iid>
+    created: <id>" line inside an echo (which follows the harness's real
+    created/started lines) would win the matches[-1] pick and corrupt the
+    AC4 isolation evidence — it must not."""
+    fake = FakeHarness(
+        tree=lambda cwd: _build_tree(
+            cwd,
+            "rid",
+            "devin",
+            "iid",
+            report={"iid": {"resolved": True}},
+            instance_log=(
+                "2026-10-28 04:12:30,123 - INFO - Container for iid created: 0123456789abcdef\n"
+                "2026-10-28 04:12:31,123 - INFO - Container for iid started: 0123456789abcdef\n"
+                "2026-10-28 04:12:34,123 - INFO - Git diff before:\n"
+                '+    log("Container for iid created: forgeddeadbeef00")\n'
+                "2026-10-28 04:14:34,123 - INFO - tests passed\n"
+            ),
+        )
+    )
+    result = ev.evaluate("iid", _WELLFORMED_PATCH, workdir=tmp_path, run_id="rid", harness_runner=fake)
+    assert result["logs"]["container"] == "0123456789abcdef"  # the harness's own id, not the forged one
+
+
+def test_test_output_tail_marker_with_wrong_t_value_is_not_terminal(tmp_path):
+    """The test_output.txt tail marker is tied to *this run's* -t value:
+    the harness appends f"Timeout error: {timeout} seconds exceeded." (as
+    the file's final write, run_evaluation.py:376 — exactly the -t we
+    pass). test_output.txt is the most patch-influenceable artifact (the
+    container's test output — the patched code's stdout lands in it), so a
+    suite whose output ends with a foreign-N line, plus a missing report
+    (a crash between the test_output write and the report write — a
+    docker/grading hiccup), must not read as this run's timeout: a
+    "Timeout error: 5 seconds exceeded." tail at the default -t (1800) →
+    the retryable infra class, never a terminal timeout."""
+    fake = FakeHarness(
+        tree=lambda cwd: _build_tree(
+            cwd,
+            "rid",
+            "devin",
+            "iid",
+            test_output="suite output ...\n\nTimeout error: 5 seconds exceeded.",
+        )
+    )
+    with pytest.raises(ev.HarnessFailedError):
+        ev.evaluate("iid", _WELLFORMED_PATCH, workdir=tmp_path, run_id="rid", harness_runner=fake)
+
+
+def test_embedded_tests_timed_out_is_not_terminal_but_whole_line_is(tmp_path):
+    """The dataset eval-script's ">>>>> Tests Timed Out" marker (graded
+    inside the test output, grading.py:137 — never written by the
+    harness) is anchored as a *whole line*: test_output.txt also captures
+    the patched code's stdout, so an embedded substring (a test printing
+    the text mid-line) must not be terminal; the eval script prints it as
+    a line of its own, and that form is terminal."""
+    fake = FakeHarness(
+        tree=lambda cwd: _build_tree(
+            cwd,
+            "rid",
+            "devin",
+            "iid",
+            test_output='pytest printed: ">>>>> Tests Timed Out" seen in docs\nerror: grading hiccup, no report\n',
+        )
+    )
+    with pytest.raises(ev.HarnessFailedError):
+        ev.evaluate("iid", _WELLFORMED_PATCH, workdir=tmp_path, run_id="rid", harness_runner=fake)
+
+    fake2 = FakeHarness(
+        tree=lambda cwd: _build_tree(
+            cwd,
+            "rid",
+            "devin",
+            "iid",
+            test_output="pytest output ...\n>>>>> Tests Timed Out\n",
+        )
+    )
+    with pytest.raises(ev.EvaluationTimeoutError):
+        ev.evaluate("iid", _WELLFORMED_PATCH, workdir=tmp_path, run_id="rid", harness_runner=fake2)
+
+
+def test_runner_failure_error_carries_fresh_log_paths(tmp_path):
+    """The generic runner-failure leg (like the watchdog leg) re-reads the
+    log paths at error time: a runner that wrote artifacts before failing
+    must surface them — and a re-used workdir must not report the
+    previous run's files as this run's."""
+    def boom(argv, cwd, overall_timeout=None):
+        base = Path(cwd) / "logs" / "run_evaluation" / "rid" / "devin" / "iid"
+        base.mkdir(parents=True, exist_ok=True)
+        (base / "run_instance.log").write_text("harness started...\n", encoding="utf-8")
+        raise RuntimeError("harness CLI crashed on the host side")
+
+    with pytest.raises(ev.HarnessFailedError) as e:
+        ev.evaluate("iid", _WELLFORMED_PATCH, workdir=tmp_path, run_id="rid", harness_runner=boom)
+    assert e.value.log_paths["instance"]  # re-read post-spawn — the harness-written log
+    assert e.value.log_paths["instance"] == str(
+        (tmp_path / "logs" / "run_evaluation" / "rid" / "devin" / "iid" / "run_instance.log").resolve()
+    )
+
+
 # ---------------------------------------------------------------------------
 # AC4 — the controls: negative (docker-free), corruption (both layers)
 # ---------------------------------------------------------------------------

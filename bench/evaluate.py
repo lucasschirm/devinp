@@ -51,8 +51,12 @@ harness's own artifacts to resolve the outcome:
   wins over a timeout marker — a corrupt patch is terminal and a retry would
   just re-fail the apply); in ``test_output.txt``: the tail-anchored
   ``Timeout error: <n> seconds exceeded.`` the harness appends as the file's
-  final write, or the dataset eval-script's ``>>>>> Tests Timed Out`` marker
-  (graded *inside* the test output — never written to ``run_instance.log``);
+  final write — the number is *this run's ``-t`` value*
+  (``run_evaluation.py:376``), or the dataset eval-script's
+  ``>>>>> Tests Timed Out`` marker (graded *inside* the test output — never
+  written to ``run_instance.log``) anchored as a *whole line*, because
+  ``test_output.txt`` is the container's test output and also captures the
+  patched code's stdout;
   in ``run_instance.log``: the harness's own ``Test timed out after <n>
   seconds.`` EvaluationError message — the number is *this run's ``-t``
   value* (``run_evaluation.py:379``) — checked on the log with the
@@ -254,16 +258,21 @@ _HARNESS_LOG_TEST_OUTPUT = "test_output.txt"
 # Harness-written markers (pinned swebench 5.0.2), by the file the harness
 # writes / the test output the harness grades. Nothing is re-graded.
 _APPLY_PATCH_FAIL_MARKER = ">>>>> Patch Apply Failed"  # run_instance.log
-# test_output.txt markers: "Timeout error: <n> seconds exceeded." is
-# appended by the harness as the file's final write (run_evaluation.py —
-# hence tail-anchored), and ">>>>> Tests Timed Out" is the dataset
-# eval-script's timeout marker, which grading reads *inside* the test output
-# (grading.py:137) — it is never written to run_instance.log. The
-# instance-log markers are the harness's own lines: "Test timed out after
-# {timeout} seconds." (the EvaluationError message — its number is exactly
-# this run's -t, run_evaluation.py:379) and ">>>>> Patch Apply Failed:"
-# (the first line of its own logger call, run_evaluation.py:332). The
-# harness reflects the patch text into run_instance.log in exactly two
+# test_output.txt markers (built per call — see _timeout_tail_marker_for /
+# _TESTS_TIMEOUT_LINE): "Timeout error: {timeout} seconds exceeded." is
+# appended by the harness as the file's final write (run_evaluation.py:376
+# — the number is exactly this run's -t, so the marker is tied to it, and
+# tail-anchored); ">>>>> Tests Timed Out" is the dataset eval-script's
+# timeout marker, which grading reads *inside* the test output
+# (grading.py:137) — it is never written by the harness (the dataset's
+# eval script prints it as a line of its own, inside the container), and
+# it is never written to run_instance.log; because test_output.txt also
+# captures the patched code's stdout, it is anchored as a whole line.
+# The instance-log markers are the harness's own lines: "Test timed out
+# after {timeout} seconds." (the EvaluationError message — its number is
+# exactly this run's -t, run_evaluation.py:379) and ">>>>> Patch Apply
+# Failed:" (the first line of its own logger call, run_evaluation.py:332).
+# The harness reflects the patch text into run_instance.log in exactly two
 # places — the "Git diff before:" / "Git diff after:" echoes
 # (run_evaluation.py:349/393; one logger call each, the diff is the
 # multi-line message body, so it spans un-prefixed continuation lines) —
@@ -275,10 +284,6 @@ _APPLY_PATCH_FAIL_MARKER = ">>>>> Patch Apply Failed"  # run_instance.log
 # WP3 while HarnessFailedError is the retried eval_error class — a loose
 # substring in the wrong file must not convert a retryable infra flake
 # into a terminal timeout.
-_TIMEOUT_MARKER_TEST_OUTPUT_TAIL = re.compile(
-    r"Timeout error: \d+ seconds exceeded\.\s*$"
-)
-_TIMEOUT_MARKER_TEST_OUTPUT = ">>>>> Tests Timed Out"
 # A logger line in the harness's file log starts with the asctime prefix
 # (logging.Formatter default: "YYYY-MM-DD HH:MM:SS,ms - LEVEL - message" —
 # the milliseconds are optional-robust here).
@@ -310,6 +315,29 @@ def _timeout_marker_for(timeout: int) -> re.Pattern:
     might contain. ``timeout`` is a validated positive int — digits only,
     nothing to regex-escape."""
     return re.compile(rf"Test timed out after {timeout} seconds\.")
+
+
+def _timeout_tail_marker_for(timeout: int) -> re.Pattern:
+    """The test_output.txt tail marker tied to *this* run's -t value: the
+    harness appends f"Timeout error: {timeout} seconds exceeded." as the
+    file's final write (run_evaluation.py:376 — exactly the -t we pass;
+    hence both the -t tie and the tail anchor). ``test_output.txt`` is the
+    most patch-influenceable artifact (it is the container's test output —
+    the patched code's stdout lands in it), so a suite whose output ends
+    with a foreign-N line, plus a missing report (a crash between the
+    test_output write and the report write — a docker/grading hiccup),
+    must not read as this run's timeout."""
+    return re.compile(rf"Timeout error: {timeout} seconds exceeded\.\s*$")
+
+
+# The dataset eval-script's timeout marker (the harness reads it *inside*
+# the test output, grading.py:137; it is never written by the harness —
+# the dataset's eval script prints it, inside the container). The eval
+# script prints it as a line of its own, so it is anchored as a *whole
+# line* — test_output.txt also captures the patched code's stdout, so a
+# bare embedded substring (a test printing the text mid-line) must not be
+# triaged as the eval script's verdict.
+_TESTS_TIMEOUT_LINE = re.compile(r"^>>>>> Tests Timed Out\s*$", re.MULTILINE)
 
 # The shared name character-set check (instance_id / run_id): the Docker
 # container-name charset, starting alphanumeric, without ".." (they become
@@ -538,8 +566,12 @@ def _existing_log_paths(
 def _extract_container_id(log_text: str, instance_id: str) -> Optional[str]:
     """The id of the container *the harness created* — from the harness's own
     log line (``Container for <iid> created/started: <id>``). The source of
-    truth for the isolation assertion (AC4) is the harness, not us. Absent
-    log / no line → None (never a crash; the caller logs a warning)."""
+    truth for the isolation assertion (AC4) is the harness, not us. The
+    caller passes the echo-masked log: ``matches[-1]`` is the *last* match,
+    and a forged ``Container for <iid> created:`` line inside the harness's
+    patch-diff echo (which follows the harness's real lines) would otherwise
+    win. Absent log / no line → None (never a crash; the caller logs a
+    warning)."""
     pattern = re.compile(
         r"Container for " + re.escape(instance_id) + r" (?:created|started): (\S+)"
     )
@@ -923,7 +955,13 @@ def _result_from_report(
             workdir=str(workdir),
         )
     instance_log = _read_log(paths["instance"]) or ""
-    container = _extract_container_id(instance_log, instance_id)
+    # The container id is extracted from the echo-masked log: the harness
+    # reflects the patch text into the log in the "Git diff before:"
+    # / "Git diff after:" echoes, and a forged "Container for <iid>
+    # created/started: <id>" line inside an echo (which follows the
+    # harness's real lines) would win the matches[-1] pick and corrupt the
+    # AC4 isolation evidence with a patch-influenceable id.
+    container = _extract_container_id(_mask_diff_echoes(instance_log), instance_id)
     if container is None:
         _LOG.warning(
             "no 'Container for %s created/started' line in %s — "
@@ -985,10 +1023,14 @@ def _triage_no_report(
       guard, AC4; wins over the timeout marker — a corrupt patch is a
       terminal verdict and a retry would just re-fail the apply).
     * ``Timeout error: <n> seconds exceeded.`` in test_output.txt (tail-
-      anchored — the harness appends it as the file's final write),
-      ``>>>>> Tests Timed Out`` in test_output.txt (the dataset
-      eval-script's timeout marker — graded inside the test output,
-      ``grading.py:137``; never written to run_instance.log), or the
+      anchored — the harness appends it as the file's final write, and the
+      number is *this run's -t value* — ``run_evaluation.py:376``),
+      ``>>>>> Tests Timed Out`` in test_output.txt anchored as a *whole
+      line* (the dataset eval-script's timeout marker — graded inside the
+      test output, ``grading.py:137``; never written by the harness — the
+      dataset's eval script prints it as a line of its own, inside the
+      container — and test_output.txt also captures the patched code's
+      stdout, so a bare embedded substring must not be terminal), or the
       harness's ``Test timed out after {timeout} seconds.``
       EvaluationError message in run_instance.log — the number is *this
       run's -t value* (``run_evaluation.py:379``), and the check runs on
@@ -1033,8 +1075,8 @@ def _triage_no_report(
     instance_log_harness = _mask_diff_echoes(instance_log)
     apply_fail = _APPLY_PATCH_FAIL_MARKER in instance_log_harness
     timeout_test_output = (
-        _TIMEOUT_MARKER_TEST_OUTPUT_TAIL.search(test_output) is not None
-        or _TIMEOUT_MARKER_TEST_OUTPUT in test_output
+        _timeout_tail_marker_for(timeout).search(test_output) is not None
+        or _TESTS_TIMEOUT_LINE.search(test_output) is not None
     )
     timeout_instance_log = (
         _timeout_marker_for(timeout).search(instance_log_harness) is not None
@@ -1164,10 +1206,12 @@ def evaluate(
     is the outer watchdog in seconds (the project's hang policy: a hung run
     is a failure, not a wait — the harness's ``-t`` bounds only the
     in-container test exec). It is bounded by default: with None (the
-    default, including the CLI default) the watchdog is ``timeout + 1800``
-    s — a wedged dataset download, multi-GB image pull, or Docker daemon
-    must not hang the sequential benchmark forever (the rest of the package
-    uses bounded defaults for subprocess calls, e.g. ``runner.py``
+    default, including the CLI default) the watchdog is ``timeout +
+    DEFAULT_OVERALL_TIMEOUT_MARGIN_S`` (the named margin constant — the
+    validation message interpolates it, so the help/docstring cannot drift
+    from it) — a wedged dataset download, multi-GB image pull, or Docker
+    daemon must not hang the sequential benchmark forever (the rest of the
+    package uses bounded defaults for subprocess calls, e.g. ``runner.py``
     ``timeout_s=30/15``); pass an explicit value to override. ``harness_runner`` is the test injection seam:
     a ``fn(argv, cwd, overall_timeout) -> CompletedProcess-like`` replacing
     the real subprocess (any failure it raises — or of the real spawn — is
@@ -1364,11 +1408,14 @@ def evaluate(
         # a spawn failure (missing python → FileNotFoundError, fork/exec
         # OSError), a harness CLI crash on the host side, or an injected
         # runner failing — a harness/infra failure, typed (never a raw
-        # traceback escape).
+        # traceback escape). The log paths are re-read *now* (not the
+        # pre-spawn snapshot): a runner that wrote artifacts before failing
+        # must surface them, and a re-used workdir must not report the
+        # previous run's files as this run's.
         raise HarnessFailedError(
             f"the harness runner failed: {e!r}",
             instance_id=instance_id,
-            log_paths=log_paths,
+            log_paths=_existing_log_paths(paths),
             output_tail=_tail(str(e)),
             workdir=str(workdir_abs),
         ) from e
@@ -1378,7 +1425,7 @@ def evaluate(
             f"the harness process object has no usable returncode "
             f"({exit_code!r})",
             instance_id=instance_id,
-            log_paths=log_paths,
+            log_paths=_existing_log_paths(paths),
             workdir=str(workdir_abs),
         )
     stdout = getattr(proc, "stdout", None)
@@ -1474,10 +1521,13 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         "--overall-timeout",
         type=float,
         default=None,
-        help="outer watchdog in seconds (default: bounded — timeout + 1800 "
-        "s; the harness's -t bounds only the in-container test exec and a "
-        "wedged dataset download, image pull, or Docker daemon must not "
-        "hang the run; pass an explicit value to override)",
+        help=(
+            f"outer watchdog in seconds (default: bounded — timeout + "
+            f"{DEFAULT_OVERALL_TIMEOUT_MARGIN_S} s; the harness's -t bounds "
+            "only the in-container test exec and a wedged dataset download, "
+            "image pull, or Docker daemon must not hang the run; pass an "
+            "explicit value to override)"
+        ),
     )
     parser.add_argument("--workdir", default=None)
     parser.add_argument("--run-id", default=None)
