@@ -468,12 +468,15 @@ def test_extract_patch_guards(tmp_path, live):
     assert "mod.cpython-311.pyc" not in ext["diff"]
     assert "blob.bin" not in ext["diff"]
     skipped_paths = [p for p, _ in ext["skipped"]]
-    # the excluded dir is expanded to its files (git collapses the dir
-    # in porcelain) — the pyc file is reported; the binary is per-file
-    assert "__pycache__/mod.cpython-311.pyc" in skipped_paths
+    # the excluded dir is matched at the directory level (the porcelain
+    # collapses untracked dirs to a trailing-slash entry — a
+    # ``$``-anchored pattern would miss it, and the generated ``.py``
+    # artifacts inside would leak into the patch); the binary is the
+    # per-file verdict
+    assert "__pycache__/" in skipped_paths
     assert "tests/blob.bin" in skipped_paths
     skipped_why = {p: w for p, w in ext["skipped"]}
-    assert "exclusion" in skipped_why["__pycache__/mod.cpython-311.pyc"]
+    assert "exclusion" in skipped_why["__pycache__/"]
     assert "binary" in skipped_why["tests/blob.bin"]
     # the intent-to-add staging is reverted (the working tree is not
     # modified beyond the agent's own edits)
@@ -647,11 +650,16 @@ def _checklist_setup(**over):
                 "permissions": {"requests": 1, "allowed": 1, "denied": 0},
                 "vendor_notifications": 2, "orphan_check": True,
                 "graded_by": "host_check(pytest -rA)",
-                "patch_diff": "patch.diff"}},
+                "patch_diff": "patch.diff",
+                "pruning": {"removed": ["agent checkout"],
+                           "failed": []},
+                "leak_guard": {"remotes_after": [], "warnings": []},
+                "leak_verify": {"remotes": [], "tags": [],
+                               "clean": True}}},
         ],
         skipped_on_resume={},
         interrupted_this_run=None,
-        resumed_after_interrupt=False,
+        interrupted_before=False,
         devin_ok=True,
         sessions_this_invocation=1,
         wall_budget_s=2700.0 * 10,
@@ -668,7 +676,8 @@ def test_checklist_verdict_gating(tmp_path, monkeypatch):
     # a completed run pair (the interrupt + the resume exercised):
     # item 11 PASS → GO
     items = lp.build_checklist(**_checklist_setup(
-        resumed_after_interrupt=True,
+        config=lp.PilotConfig(max_wall_s=2700.0, resume=True),
+        interrupted_before=True,
         skipped_on_resume={"a": "no_patch"}))
     assert len(items) == 14
     verdict, failed = lp._verdict(items)
@@ -691,9 +700,65 @@ def test_checklist_verdict_gating(tmp_path, monkeypatch):
     # a failure
     items = lp.build_checklist(**_checklist_setup(
         interrupted_this_run={"completed": 1},
-        resumed_after_interrupt=False))
+        interrupted_before=False))
     item11 = [i for i in items if i["item"].startswith("11")][0]
     assert item11["pass"] is None
+    # a resume that was NOT preceded by the intentional interrupt
+    # (a crash/abort resume): item 11 fails — the AC3 path is not
+    # exercised by a plain resume
+    items = lp.build_checklist(**_checklist_setup(
+        config=lp.PilotConfig(max_wall_s=2700.0, resume=True),
+        interrupted_before=False,
+        skipped_on_resume={"a": "no_patch"}))
+    item11 = [i for i in items if i["item"].startswith("11")][0]
+    assert item11["pass"] is False
+    # item 10: a record without the pruning record (or with a failed
+    # prune) → NO-GO
+    items = lp.build_checklist(**_checklist_setup(
+        records=[{
+            "instance_id": "a", "status": "resolved", "meta": {
+                "wall": {"session_s": 60.0},
+                "permissions": {"requests": 0, "allowed": 0,
+                               "denied": 0},
+                "orphan_check": True,
+                "leak_guard": {"remotes_after": [], "warnings": []},
+                "leak_verify": {"remotes": [], "tags": [],
+                               "clean": True}}}]))
+    verdict, failed = lp._verdict(items)
+    assert verdict == "NO-GO"
+    assert any("10" == f.split(" ", 1)[0] for f in failed)
+    # item 14: a dirty post-session verification → NO-GO (the guard
+    # result gates — it is not assumed from devin_ok)
+    items = lp.build_checklist(**_checklist_setup(
+        records=[{
+            "instance_id": "a", "status": "resolved", "meta": {
+                "wall": {"session_s": 60.0},
+                "permissions": {"requests": 0, "allowed": 0,
+                               "denied": 0},
+                "orphan_check": True,
+                "pruning": {"removed": [], "failed": []},
+                "leak_guard": {"remotes_after": [], "warnings": []},
+                "leak_verify": {"remotes": ["origin"], "tags": [],
+                               "clean": False}}}]))
+    verdict, failed = lp._verdict(items)
+    assert verdict == "NO-GO"
+    assert any("14" == f.split(" ", 1)[0] for f in failed)
+    # item 7: a close() failure (the orphan check never ran —
+    # ``orphan_check`` is None) → NO-GO, not a pass
+    items = lp.build_checklist(**_checklist_setup(
+        records=[{
+            "instance_id": "a", "status": "resolved", "meta": {
+                "wall": {"session_s": 60.0},
+                "permissions": {"requests": 0, "allowed": 0,
+                               "denied": 0},
+                "orphan_check": None, "close_error": "boom",
+                "pruning": {"removed": [], "failed": []},
+                "leak_guard": {"remotes_after": [], "warnings": []},
+                "leak_verify": {"remotes": [], "tags": [],
+                               "clean": True}}}]))
+    verdict, failed = lp._verdict(items)
+    assert verdict == "NO-GO"
+    assert any("7" == f.split(" ", 1)[0] for f in failed)
 
 
 # ---------------------------------------------------------------------------
@@ -726,6 +791,211 @@ def test_prepare_sandbox_instance(tmp_path, live):
         wd / "runs" / "test__repo0-1" / "xdg" / "config")
     assert "DEVIN_REFUSAL_FALLBACK" not in env
     assert "DEVIN_MODEL" not in env
+
+
+# ---------------------------------------------------------------------------
+# the review findings' regressions (the PR #37 review round)
+# ---------------------------------------------------------------------------
+
+def test_exclusion_patterns_match_collapsed_and_nested():
+    # the directory patterns must match the collapsed porcelain entry
+    # (trailing slash) and files inside an excluded dir (a generated
+    # ``.py`` under ``build/`` would otherwise leak into the patch)
+    assert lp._exclude("build/")
+    assert lp._exclude("build/lib/foo.py")
+    assert lp._exclude("__pycache__/")
+    assert lp._exclude("pkg/__pycache__/x.pyc")
+    assert lp._exclude("pkg.egg-info/")
+    assert lp._exclude(".coverage")
+    assert lp._exclude("a/.coverage/")
+    assert lp._exclude("htmlcov/")
+    assert lp._exclude(".pytest_cache/")
+    # non-excluded paths stay
+    assert not lp._exclude("buildout.py")  # name match, not a dir
+    assert not lp._exclude("src/foo.py")
+    assert not lp._exclude("buildings/")  # no component boundary
+
+
+def test_container_setup_writes_single_line_shim_and_captures_guard(
+        tmp_path, live, monkeypatch):
+    vers = tmp_path / "versions"
+    vers.mkdir()
+    monkeypatch.setenv("DEVIN_VERSIONS_DIR", str(vers))
+    calls: list = []
+
+    def fake_run(args, **kw):
+        calls.append(list(args))
+        return _fake_completed(0, b"")
+
+    monkeypatch.setattr(lp.subprocess, "run", fake_run)
+    inst = _entry(0, "/tmp/x", "abc123")
+    out = lp._container_setup(inst, str(tmp_path))
+    shim = tmp_path / "devin-shim-test__repo0-1"
+    assert shim.is_file()
+    lines = shim.read_text().splitlines()
+    assert lines[0] == "#!/bin/sh"
+    # ONE command line (the review finding: a multi-line shim exec'd
+    # ``docker exec -i`` with no container and died — the session
+    # could never start in container mode)
+    assert len(lines) == 2
+    cmd = lines[1]
+    assert cmd.startswith("exec docker exec -i ")
+    assert "\\n" not in cmd
+    assert "  -e" not in cmd  # no continuation-line flags
+    assert "sweb.eval.test__repo0-1 /usr/local/bin/devin \"$@\"" in cmd
+    assert "/home/lucas" not in cmd  # portable (the review finding)
+    # the _versions bind uses the resolved host path (not a hardcoded
+    # operator home)
+    run_call = [a for a in calls if a[0] == "docker" and a[1] == "run"][0]
+    assert f"{vers}:/devin-inject:ro" in run_call
+    # the leak-guard record is captured (the checklist item 14
+    # evidence — previously discarded)
+    assert out["leak_guard"] == {"warnings": [], "remotes_after": []}
+
+
+def test_container_mode_host_side_ops_use_host_copy(
+        tmp_path, live, monkeypatch):
+    # the agent runs in the container (cwd /testbed); the host-side
+    # extraction + leak verification must run on a host COPY (the
+    # review finding: ``git -C /testbed`` on the host failed)
+    copy = tmp_path / "runs" / "test__repo0-1" / "testbed-copy"
+    commit = _make_repo(copy, name="base.py")
+
+    import subprocess as _sp
+    real_run = _sp.run
+
+    def fake_run(args, **kw):
+        if args[0] == "docker":
+            assert args[1] == "cp"
+            return _fake_completed(0, b"")
+        return real_run(args, **kw)
+
+    monkeypatch.setattr(lp.subprocess, "run", fake_run)
+    inst = _entry(0, "/src", commit)
+    spec = lp.SessionSpec(
+        instance=inst, mode="container", devin_bin="devin",
+        model="swebench-swe-2-high", cwd="/testbed", env={},
+        wall_s=600.0, host_check=False, workdir=str(tmp_path),
+        container="sweb.eval.test__repo0-1")
+
+    class _P:  # the prompt result (the WP0-shape object)
+        stop_reason = "end_turn"
+        usage = {"totalTokens": 1}
+        updates = 1
+        duration_s = 1.0
+        raw = {}
+
+    class FakeAcp:
+        def __init__(self):
+            self.stderr_tail = ""
+
+        def start(self):
+            pass
+
+        def initialize(self):
+            pass
+
+        def create_session(self, cwd=None):
+            pass
+
+        def prompt(self, prompt, timeout=None):
+            return _P()
+
+        def close(self):
+            pass
+
+        def group_alive(self):
+            return False
+
+        def stderr_tail_now(self):
+            return ""
+
+        transcript = []
+        vendor_notifications = []
+
+    s = lp.PilotSession(spec, make_session=lambda sp: FakeAcp())
+    s.start()
+    # the "agent" edits the tree inside the container — the host copy
+    # sees the same change (docker cp semantics, simplified)
+    (copy / "base.py").write_text("# base.py\nprint('changed')\n")
+    monkeypatch.setattr(lp.PilotSession, "_eval_container",
+                        lambda self, patch: "resolved")
+    status = s.run()
+    s.close()
+    assert status == "resolved"
+    assert s._extract_repo_dir() == str(copy)
+    assert s.meta["patch_diff"] == "patch.diff"
+    assert (tmp_path / "runs" / "test__repo0-1" / "patch.diff") \
+        .is_file()
+    assert s.meta["leak_verify"]["clean"] is True
+    assert s.meta["orphan_check"] is True
+
+
+def test_aborted_run_records_state_and_fails(tmp_path, live):
+    # the WP3 terminal abort (2 consecutive agent_error): the state is
+    # recorded durably and the invocation FAILS — no GO checklist
+    # renders for an aborted run (the review finding: an aborted
+    # final state exited 0 and could still produce a GO verdict)
+    repos = _three_repos(tmp_path)
+    inst = _instances_file(tmp_path / "inst.json", repos)
+    cfg = _cfg(tmp_path, inst)
+    rc = lp.run_pilot(cfg, make_session=_mock_make_session("crash"))
+    assert rc == lp.EXIT_RUN_FAILED
+    state_files = list(tmp_path.glob("pilot-*.state.json"))
+    assert len(state_files) == 1
+    state = json.loads(state_files[0].read_text())
+    assert state["aborted"] is True
+    assert state["final_state"] == "aborted"
+    assert not (tmp_path / "wp6a-go-no-go.md").exists()
+    # the abort is visible to the next (resume) invocation
+    state2_src = state_files[0].read_text()
+    assert json.loads(state2_src)["aborted"] is True
+
+
+def test_stderr_tail_live_accessor(tmp_path, live):
+    # ``stderr_tail`` is only populated at close(); the mid-session
+    # read (the quota signal, the error paths) uses the drain
+    # thread's live accessor (the review finding: the signal could
+    # never fire)
+    inst = _entry(0, "/x", "abc")
+    spec = lp.SessionSpec(
+        instance=inst, mode="sandbox", devin_bin="devin",
+        model="m", cwd="/x", env={}, wall_s=600.0,
+        host_check=False, workdir=str(tmp_path))
+
+    class WithLive:
+        stderr_tail = "post-close value"
+
+        def stderr_tail_now(self):
+            return "live tail"
+
+    s = lp.PilotSession(spec)
+    s._acp = WithLive()
+    assert s._stderr_tail() == "live tail"
+
+    class NoLive:
+        stderr_tail = "captured at close"
+
+    s._acp = NoLive()
+    assert s._stderr_tail() == "captured at close"
+    # the quota signal sees the live tail (not the empty pre-close
+    # ``stderr_tail``)
+
+    class QuotaLive(WithLive):
+        def stderr_tail_now(self):
+            return "Rate limit exceeded, try again later"
+
+    s._acp = QuotaLive()
+    res = ac.PromptResult(stop_reason="end_turn", usage=None, updates=1,
+                         duration_s=1.0, raw={})
+    assert s._quota_signal(res) is True
+
+
+def test_devin_version_guards_missing_binary(tmp_path, live):
+    # a missing binary / a probe failure is not a traceback: the
+    # pre-flight's ``which devin`` is the loud gate that follows
+    assert lp.devin_version(str(tmp_path / "no-such-binary")) \
+        .startswith("unknown")
 
 
 # ---------------------------------------------------------------------------

@@ -211,3 +211,91 @@ invented):
   different frame shape: not verified.
 - **Vendor notifications content** — only the count (72) is recorded in
   the checkpoint; their payloads were not individually inspected.
+
+## Review round (PR #37 `pr-review` — the fixes + the checklist semantics)
+
+The first `pr-review` round raised 4 Major / 5 Medium / 3 Minor findings
+plus review-body notes. All were addressed (the zero-quota regression
+tests live in `tests/test_live_pilot.py`):
+
+**Major**
+
+1. **Malformed `docker exec` shim (container mode)** — the shim was
+   multi-line; `exec docker exec -i` would run with no container and die,
+   so a container-mode session could never start. Now a **single-line**
+   shim (the `exec` + every flag form one command; regression test asserts
+   the shape).
+2. **`git -C /testbed` on the host filesystem (container mode)** — the
+   agent's `cwd` is the in-container `/testbed`, but the host-side patch
+   extraction + leak verification ran `git -C /testbed` on the *host*.
+   Now `SessionSpec.container` + `PilotSession._extract_repo_dir()`:
+   container mode copies the tree out (`docker cp`) and the host-side
+   git ops run on the scratch host copy (pruned with the instance).
+3. **Checklist item 10 hardcoded `pass=True`** — the pruning meta was
+   written *after* the JSONL line was persisted, so the "record" it
+   claimed never landed in the line. Now the prune hook runs **before**
+   the line is merged + persisted (same-line record), and the item
+   gates on the record being present and failure-free on every line.
+4. **Checklist item 14 ignored the recorded guard result** — it rendered
+   from `devin_ok` with the guard results discarded. Now the pre-session
+   guard record is kept in the session meta (both modes) and the item
+   gates on `remotes_after == []` + the post-session verification being
+   clean on every instance.
+
+**Medium**
+
+1. **`$`-anchored exclusion patterns never matched** — the porcelain
+   collapses untracked dirs to trailing-slash entries (`build/`) and
+   files inside them end in the filename (`build/lib/foo.py`); a
+   `$`-anchored pattern matched neither, so generated `.py` artifacts
+   would leak into the patch. Patterns now use `(/|$)` boundaries.
+2. **`stderr_tail` dead during the session** — it is only populated at
+   `close()`, so the mid-session quota/rate-limit signal (PLAN §2.3)
+   could never fire. `AcpSession.stderr_tail_now()` exposes the
+   drain thread's live tail; the pilot reads it during the session and
+   falls back to the close()-captured value afterwards.
+3. **Checklist item 7 passed with no check performed** — a `close()`
+   failure left `orphan_check` `None`, which rendered as pass. Now an
+   unperformed check FAILS the item (the failure is recorded in the
+   checkpoint meta `close_error`).
+4. **Checklist item 11 passed for any resume** — now the previous run
+   must have been the *intentional* interrupt (the state file's
+   `interrupted` flag, read before this run overwrites it); a plain
+   crash/abort resume does not satisfy the item.
+5. **`aborted` final state exited 0 unrecorded** — the WP3 terminal
+   abort (2 consecutive `agent_error`, or a per-instance pre-flight
+   abort) now exits `4`, records `aborted` + `final_state` in the state
+   file (visible to the resume invocation), and renders **no checklist**
+   (no GO for an aborted run).
+
+**Minor**
+
+1. **Unguarded `devin_version` probe** — a missing binary / a hang
+   escaped the documented exit-4 path as a traceback. Now the probe
+   returns `unknown …`; the pre-flight's `which devin` leg is the loud
+   gate that follows.
+2. **Doc/code gate-order mismatch** — the code ran the model gate before
+   the pre-flight, contradicting PLAN-WP6A.md. Now the pre-flight runs
+   first (zero quota, before any session), matching the documented order.
+3. **Hardcoded `/home/lucas/…` `_versions` bind (container mode)** — now
+   resolved via `_host_versions_dir()` (`DEVIN_VERSIONS_DIR` env, then
+   the XDG locations; a missing tree is a clear pre-session error).
+
+**Review-body notes** — `bench/pyproject.toml` `py-modules` +=
+`live_pilot`; a `RunnerError` (incl. `RunnerProtocolError`) from the WP3
+layer no longer escapes `main()` as a traceback (exit 4, the resume
+class); `PilotReporter.done_count` no longer counts `preflight_failed`
+marks as sessions (the budget claim is released — they consumed no
+session). `preflight_failures` in the checklist context is the batch
+marker's record: a batch failure exits 4 before any checklist renders.
+
+**Note on the recorded verdict:** the live `GO` above was printed by the
+pre-review checklist (item 10/14 rendered from assumptions). The live
+run's *evidence* satisfies the tightened semantics (orphan checks pass on
+all three; the guard ran per instance; the interrupt + resume pair ran;
+pruning ran per instance) — but the pruning record of that run landed in
+the *next* line under the old code, so a re-render of the *old* JSONL
+under the new checklist would gate item 10 on the recorded state. The
+tightened checklist is the deliverable; if a live re-verification is
+required, the documented two-command sequence (interrupt + resume) is
+the run pair to re-execute.

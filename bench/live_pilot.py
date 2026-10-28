@@ -112,15 +112,20 @@ Requirements:
 """
 
 #: PLAN §4: the exclusion filter — these patterns are removed from the
-#: diff (never from the working tree).
+#: diff (never from the working tree). The directory patterns use
+#: ``(/|$)`` (not a bare ``$``): the porcelain status collapses an
+#: untracked directory to a trailing-slash entry (``build/``), and files
+#: inside an excluded dir end in the filename (``build/lib/foo.py``) —
+#: a ``$``-anchored pattern matches neither, and the generated ``.py``
+#: artifacts would leak into the patch.
 _EXCLUDE_PATTERNS = (
-    re.compile(r"(^|/)__pycache__$"),
-    re.compile(r"\.pytest_cache$"),
+    re.compile(r"(^|/)__pycache__(/|$)"),
+    re.compile(r"(^|/)\.pytest_cache(/|$)"),
     re.compile(r"\.pyc$"),
-    re.compile(r"\.coverage$"),
-    re.compile(r"htmlcov$"),
-    re.compile(r"\.egg-info$"),
-    re.compile(r"(^|/)build$"),
+    re.compile(r"(^|/)\.coverage(/|$)"),
+    re.compile(r"(^|/)htmlcov(/|$)"),
+    re.compile(r"\.egg-info(/|$)"),
+    re.compile(r"(^|/)build(/|$)"),
 )
 
 #: Quota / rate-limit signal markers (PLAN §2.3: the ACP stop reason,
@@ -487,7 +492,11 @@ def extract_patch(cwd: str) -> dict:
 @dataclass
 class SessionSpec:
     """One instance's agent-session configuration (the seam the tests
-    inject via ``make_session``)."""
+    inject via ``make_session``). ``container`` names the agent
+    container (container mode) — the host-side git ops (patch
+    extraction, the leak verification) then run against a host **copy**
+    of ``/testbed`` (``docker cp``), because the in-container path does
+    not exist on the host filesystem."""
     instance: dict
     mode: str
     devin_bin: str
@@ -497,6 +506,7 @@ class SessionSpec:
     wall_s: float
     host_check: bool
     workdir: str
+    container: "Optional[str]" = None
 
 
 class PilotSession(rr.AgentSession):
@@ -594,7 +604,7 @@ class PilotSession(rr.AgentSession):
             return "quota_limited"
 
         # the patch (PLAN §4)
-        ext = extract_patch(spec.cwd)
+        ext = extract_patch(self._extract_repo_dir())
         self.meta["patch_warnings"] = ext.get("warnings", [])
         self.meta["patch_skipped"] = ext.get("skipped", [])
         self.meta["patch_included"] = ext.get("included", [])
@@ -640,9 +650,12 @@ class PilotSession(rr.AgentSession):
             self.meta["orphan_check"] = not self._acp.group_alive()
             # the post-session leak-guard verification (item 14)
             self.meta["leak_verify"] = verify_leak_guard(
-                self._spec.cwd)
-        except Exception:
-            pass  # close is best-effort (the WP3 contract)
+                self._extract_repo_dir())
+        except Exception as exc:
+            # close is best-effort (the WP3 contract) — but a failed
+            # close is RECORDED (the checklist item 7 must not render
+            # "pass" for a check that did not run)
+            self.meta["close_error"] = f"{type(exc).__name__}: {exc}"
 
     # -- helpers ----------------------------------------------------------
 
@@ -655,6 +668,31 @@ class PilotSession(rr.AgentSession):
     def _artifact_dir(self) -> str:
         iid = self._spec.instance["instance_id"]
         return os.path.join(self._spec.workdir, "runs", iid)
+
+    def _extract_repo_dir(self) -> str:
+        """The repo dir the host-side git ops run against. Sandbox:
+        the agent checkout itself (``spec.cwd``). Container: the
+        in-container ``/testbed`` does not exist on the host — the
+        working tree is copied out (``docker cp``) and the host-side
+        extraction / leak verification run on the copy (the copy is
+        scratch: the intent-to-add staging touches only the copy's
+        index; the agent's container tree is never modified)."""
+        if self._spec.mode != "container" or not self._spec.container:
+            return self._spec.cwd
+        copy = os.path.join(self._artifact_dir(), "testbed-copy")
+        if not os.path.isdir(os.path.join(copy, ".git")):
+            if os.path.isdir(copy):
+                shutil.rmtree(copy)
+            p = subprocess.run(
+                ["docker", "cp",
+                 f"{self._spec.container}:testbed", copy],
+                capture_output=True, timeout=3600, check=False)
+            if p.returncode != 0 or not os.path.isdir(
+                    os.path.join(copy, ".git")):
+                raise PilotError(
+                    "docker cp of /testbed failed: "
+                    + p.stderr.decode("utf-8", "replace").strip()[:500])
+        return copy
 
     def _update_count(self) -> int:
         if self._acp is None:
@@ -675,16 +713,32 @@ class PilotSession(rr.AgentSession):
         self.meta["permissions"] = perms
         self.meta["vendor_notifications"] = len(
             self._acp.vendor_notifications)
-        self.meta["stderr_tail"] = (self._acp.stderr_tail or "")[-2000:]
+        # the mid-session stderr tail (the client's drain thread —
+        # ``stderr_tail`` itself is only populated at close(), which is
+        # too late for the error paths + the quota signal)
+        self.meta["stderr_tail"] = self._stderr_tail()[-2000:]
+
+    def _stderr_tail(self) -> str:
+        """The session stderr tail — the live accessor (the drain
+        thread's chunks) during the session, falling back to the
+        close()-captured ``stderr_tail`` afterwards."""
+        if self._acp is None:
+            return ""
+        fn = getattr(self._acp, "stderr_tail_now", None)
+        if callable(fn):
+            try:
+                return fn()
+            except Exception:
+                pass
+        return self._acp.stderr_tail or ""
 
     def _quota_signal(self, result: ac.PromptResult) -> bool:
         stop = (result.stop_reason or "").lower()
         if any(m in stop for m in _QUOTA_MARKERS):
             return True
-        if self._acp is not None:
-            tail = (self._acp.stderr_tail or "").lower()
-            if any(m in tail for m in _QUOTA_MARKERS):
-                return True
+        tail = self._stderr_tail().lower()
+        if any(m in tail for m in _QUOTA_MARKERS):
+            return True
         return False
 
     def _write_trajectory(self) -> None:
@@ -995,6 +1049,33 @@ def _host_credentials_file() -> "Optional[str]":
                        "credentials.toml")
 
 
+def _host_versions_dir() -> str:
+    """The host ``_versions`` tree (the real-binary source for the
+    in-container injection, WP0 §2) — env override, then the XDG
+    locations; a clear error when absent (the container-mode setup must
+    not bind a non-existent path)."""
+    env = os.environ.get("DEVIN_VERSIONS_DIR")
+    if env:
+        if not os.path.isdir(env):
+            raise PilotError(
+                f"DEVIN_VERSIONS_DIR={env!r} is not a directory "
+                "(the _versions tree for the real-binary injection)")
+        return env
+    candidates: list = []
+    xdg = os.environ.get("XDG_DATA_HOME")
+    if xdg:
+        candidates.append(os.path.join(xdg, "devin", "cli", "_versions"))
+    candidates.append(os.path.expanduser(
+        "~/.local/share/devin/cli/_versions"))
+    for cand in candidates:
+        if os.path.isdir(cand):
+            return cand
+    raise PilotError(
+        "the devin _versions tree was not found (tried: "
+        + ", ".join(candidates) + ") — set DEVIN_VERSIONS_DIR to the "
+        "_versions directory (container mode, WP0 §2)")
+
+
 def _container_setup(inst: dict, workdir: str) -> dict:
     """The container-mode setup (PLAN §3.1–§3.6): the ``sweb.eval``
     image start, the **real**-binary injection (the ``_versions`` tree —
@@ -1004,11 +1085,11 @@ def _container_setup(inst: dict, workdir: str) -> dict:
     it into the container with the isolated env, PLAN §3.2/§3.5)."""
     iid = inst["instance_id"]
     img = "swebench/sweb.eval.x86_64." + iid.replace("__", "_1776_")
+    versions = _host_versions_dir()
     subprocess.run(["docker", "pull", img], check=True, timeout=7200)
     subprocess.run(
         ["docker", "run", "-d", "--name", f"sweb.eval.{iid}",
-         "-v", "/home/lucas/.local/share/devin/cli/_versions:"
-             "/devin-inject:ro",
+         "-v", f"{versions}:/devin-inject:ro",
          "-w", "/testbed", img, "sleep", "infinity"],
         check=True, timeout=300)
     subprocess.run(
@@ -1028,29 +1109,41 @@ def _container_setup(inst: dict, workdir: str) -> dict:
             ["docker", "cp", src,
              f"sweb.eval.{iid}:/tmp/xdg-data/devin/credentials.toml"],
             check=True, timeout=60)
-    # the leak guard (PLAN §3.6)
-    subprocess.run(
+    # the leak guard (PLAN §3.6) — the record is kept (the checklist
+    # item 14 evidence)
+    p = subprocess.run(
         ["docker", "exec", f"sweb.eval.{iid}", "sh", "-c",
          "cd /testbed && git remote remove origin 2>/dev/null; "
          "git tag -l | xargs -r git tag -d; "
-         "git reflog expire --expire=now --all"],
-        timeout=300)
-    # the docker-exec shim (the session's devin_bin)
+         "git reflog expire --expire=now --all; "
+         "git remote"],
+        capture_output=True, timeout=300)
+    leak_guard = {
+        "warnings": ([] if p.returncode == 0 else
+                    ["leak guard: "
+                     + p.stderr.decode("utf-8", "replace").strip()]),
+        "remotes_after": (p.stdout.decode("utf-8", "replace").split()
+                          if p.returncode == 0 else []),
+    }
+    # the docker-exec shim (the session's devin_bin) — ONE line: the
+    # ``exec`` and every flag must form a single command (a multi-line
+    # shim would exec ``docker exec -i`` with no container and die)
     shim = os.path.join(workdir, f"devin-shim-{iid}")
     with open(shim, "w", encoding="utf-8", newline="") as f:
         f.write(
             "#!/bin/sh\n"
-            "exec docker exec -i\n"
-            "  -e XDG_DATA_HOME=/tmp/xdg-data\n"
-            "  -e XDG_CONFIG_HOME=/tmp/xdg-config\n"
-            "  -e PATH=/opt/miniconda3/envs/testbed/bin:/usr/local/bin:"
-            "/usr/bin:/bin\n"
-            "  -e CONDA_DEFAULT_ENV=testbed\n"
-            "  -w /testbed\n"
-            f"  sweb.eval.{iid} /usr/local/bin/devin \"$@\"\n")
+            f"exec docker exec -i "
+            "-e XDG_DATA_HOME=/tmp/xdg-data "
+            "-e XDG_CONFIG_HOME=/tmp/xdg-config "
+            "-e PATH=/opt/miniconda3/envs/testbed/bin:"
+            "/usr/local/bin:/usr/bin:/bin "
+            "-e CONDA_DEFAULT_ENV=testbed "
+            "-w /testbed "
+            f"sweb.eval.{iid} /usr/local/bin/devin \"$@\"\n")
     os.chmod(shim, 0o755)
     return {"devin_bin": shim, "env": {},
-            "container": f"sweb.eval.{iid}", "image": img}
+            "container": f"sweb.eval.{iid}", "image": img,
+            "leak_guard": leak_guard}
 
 
 # ---------------------------------------------------------------------------
@@ -1172,6 +1265,11 @@ class PilotReporter:
 
     def record_instance(self, instance_id: "Optional[str]", status: str,
                        meta: dict) -> None:
+        # the post-instance hook (the pilot's prune) runs BEFORE the
+        # line is merged + persisted — its meta write (the pruning
+        # record) must land in the same JSONL line, not a later one
+        if instance_id is not None and self._on_instance_done is not None:
+            self._on_instance_done(instance_id, status)
         merged = dict(meta)
         if instance_id is not None and instance_id in self._meta:
             for k, v in self._meta[instance_id].items():
@@ -1180,10 +1278,11 @@ class PilotReporter:
                   "eval_log"):
             merged.setdefault(k, None)
         self._ckpt.record_instance(instance_id, status, merged)
-        if instance_id is not None:
+        # the session arithmetic: a ``preflight_failed`` mark consumed
+        # no session (the budget claim is released — the WP3b contract)
+        # and does not count toward the --interrupt-after check
+        if instance_id is not None and status != "preflight_failed":
             self.done_count += 1
-            if self._on_instance_done is not None:
-                self._on_instance_done(instance_id, status)
 
     def checkpoint(self, reason: str, meta: dict) -> None:
         self._ckpt.checkpoint(reason, meta)
@@ -1234,6 +1333,16 @@ def prune_instance(config: PilotConfig, workdir: str,
                     out["removed"].append(label)
                 except Exception as exc:
                     out["failed"].append(f"{label}: {exc}")
+    # the container-mode /testbed host copy (the scratch tree the
+    # host-side extraction ran on — removed in both modes; a no-op in
+    # sandbox mode where it was never created)
+    copy = os.path.join(workdir, "runs", iid, "testbed-copy")
+    if os.path.isdir(copy):
+        try:
+            shutil.rmtree(copy)
+            out["removed"].append("testbed copy")
+        except Exception as exc:
+            out["failed"].append(f"testbed copy: {exc}")
     return out
 
 
@@ -1306,7 +1415,7 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
                    records: list,
                    skipped_on_resume: dict,
                    interrupted_this_run: "Optional[dict]",
-                   resumed_after_interrupt: bool,
+                   interrupted_before: bool,
                    devin_ok: "Optional[bool]",
                    sessions_this_invocation: int,
                    wall_budget_s: float,
@@ -1333,9 +1442,14 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
     perms_req = 0
     perms_all_answered = True
     vendor_seen = 0
-    orphans_ok = True
+    orphan_checked = True
+    orphan_unchecked = False
     untrusted = False
-    eval_legs = []
+    pruning_ok = True
+    pruning_obs: list = []
+    leak_ok = True
+    leak_obs: list = []
+    eval_legs: list = []
     for rec in records:
         m = rec.get("meta") or {}
         w = (m.get("wall") or {}).get("session_s")
@@ -1355,8 +1469,35 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
                 p.get("denied", 0)):
             perms_all_answered = False
         vendor_seen += int(m.get("vendor_notifications", 0))
-        if m.get("orphan_check") is False:
-            orphans_ok = False
+        # item 7: a check that did not run (a close() failure —
+        # ``orphan_check`` stays None) is a FAIL, not a pass
+        oc = m.get("orphan_check")
+        if oc is None:
+            orphan_unchecked = True
+        elif oc is False:
+            orphan_checked = False
+        # item 10: the pruning record must be present in the line and
+        # free of failures (written before the line is persisted)
+        pr = m.get("pruning")
+        if not isinstance(pr, dict) or pr.get("failed"):
+            pruning_ok = False
+        pruning_obs.append(
+            f"{rec.get('instance_id')}: "
+            + (f"removed {pr.get('removed')}" if isinstance(pr, dict)
+               else "no record in the checkpoint line")
+            + (f"; FAILED {pr.get('failed')}" if isinstance(pr, dict)
+               and pr.get("failed") else ""))
+        # item 14: the recorded guard + post-session verification
+        lg = m.get("leak_guard") or {}
+        lv = m.get("leak_verify") or {}
+        if lv.get("clean") is not True or lg.get("remotes_after"):
+            leak_ok = False
+        leak_obs.append(
+            f"{rec.get('instance_id')}: verify="
+            + (f"clean={lv.get('clean')} remotes={lv.get('remotes')} "
+               f"tags={lv.get('tags')}" if lv else "no record")
+            + (f"; guard remotes_after={lg.get('remotes_after')} "
+               f"warnings={lg.get('warnings')}" if lg else ""))
         if m.get("suspected_untrusted_cwd"):
             untrusted = True
         gb = m.get("graded_by")
@@ -1379,9 +1520,12 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
         f"reason={g.get('reason')!r}" if g else "not run",
         bool(g.get("allowed")))
     add("3 pre-flight (zero quota, every batch + instance)",
-        "auth + runtime + disk legs pass before any session",
-        "; ".join(preflight_failures) or "all legs passed",
-        preflight_ok)
+        "auth + runtime + disk legs pass before any session; the "
+        "runner re-runs the legs before each batch and each instance",
+        "; ".join(preflight_failures)
+        or "all legs passed (re-run by the runner per batch + per "
+           "instance)",
+        bool(preflight_ok))
     add("4 NDJSON framing + vendor notifications (WP0 §1)",
         "the initialize result is received; vendor notifications are "
         "logged, never errors",
@@ -1405,8 +1549,15 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
     add("7 session/close + group kill + no orphans (WP0 §1)",
         "close sent best-effort; the process group killed; no orphan "
         "devin survives",
-        f"orphan check: {'pass' if orphans_ok else 'FAIL'}",
-        orphans_ok if records else devin_ok)
+        (f"orphan check: "
+         + ("PASS on all " + str(len(records)) + " instance(s)"
+            if orphan_checked and not orphan_unchecked
+            else ("FAILED (an orphan survived)" if not orphan_checked
+                 else "NOT PERFORMED (a close() failure — recorded in "
+                      "the checkpoint meta close_error)")))
+        if records else "no instances",
+        (orphan_checked and not orphan_unchecked)
+        if records else devin_ok)
     add("8 visible usage (WP0 §1) or the §2.6 proxy",
         "usage.{inputTokens, outputTokens, cachedReadTokens, "
         "totalTokens} captured verbatim, else the sessions + wall + "
@@ -1427,17 +1578,23 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
     add("10 pruning (PLAN §7)",
         "the per-instance state removed after eval; the shared base "
         "retained",
-        "prune_instance ran per terminal instance (the per-instance "
-        "record is in the checkpoint meta); the clone cache / base "
-        "layers retained",
-        True)
-    if resumed_after_interrupt or (skipped_on_resume and config.resume):
-        obs = "resumed: " + ", ".join(
+        "; ".join(pruning_obs) or "no instances",
+        (pruning_ok and bool(records)) if records else devin_ok)
+    if (skipped_on_resume and config.resume and interrupted_before):
+        obs = "resumed after the intentional interrupt: " + ", ".join(
             f"{k} skipped ({v})" for k, v in sorted(
                 skipped_on_resume.items()))
-        if resumed_after_interrupt:
-            obs += " — after the intentional interrupt"
         p = True
+    elif config.resume and skipped_on_resume:
+        # a resume with skipped instances, but the previous run was not
+        # the intentional interrupt (a crash/abort resume — the AC3
+        # path is not exercised)
+        obs = ("resumed (skipped: "
+               + ", ".join(f"{k} ({v})"
+                          for k, v in sorted(skipped_on_resume.items()))
+               + ") — but the previous run was not the intentional "
+                 "interrupt (AC3 not exercised)")
+        p = False
     elif interrupted_this_run:
         obs = (f"interrupted after "
                f"{interrupted_this_run.get('completed')} instance(s); "
@@ -1470,10 +1627,8 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
     add("14 leak guard (PLAN §3.6)",
         "no origin remote, no tags, reflogs expired (verified "
         "post-session)",
-        "the pre-session guard ran on every sandbox checkout; the "
-        "post-session verification is recorded per instance in the "
-        "checkpoint meta (leak_verify)",
-        devin_ok)
+        "; ".join(leak_obs) or "no instances",
+        (leak_ok and bool(records)) if records else devin_ok)
     return items
 
 
@@ -1537,10 +1692,15 @@ def render_checklist_md(items: list, config: PilotConfig,
 def devin_version(devin_bin: str) -> str:
     """The version line (``devin version``; the WP2 double speaks
     ``--version`` — the fallback keeps the mock-driven CI runs
-    informative)."""
+    informative). A missing binary / a hang is NOT a hard failure here
+    (the pre-flight's ``which devin`` check is the loud exit-4 gate
+    that follows — this probe only feeds the record)."""
     for args in (("version",), ("--version",)):
-        p = subprocess.run([devin_bin, *args], capture_output=True,
-                          timeout=30)
+        try:
+            p = subprocess.run([devin_bin, *args], capture_output=True,
+                              timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            return "unknown (devin binary not found / probe failed)"
         out = (p.stdout or b"").decode("utf-8", "replace").strip()
         if out and p.returncode == 0:
             return out.splitlines()[0]
@@ -1600,7 +1760,7 @@ def run_pilot(config: PilotConfig,
         items = build_checklist(
             config=config, dry_run=True, gate=None, preflight_ok=None,
             preflight_failures=[], records=[], skipped_on_resume={},
-            interrupted_this_run=None, resumed_after_interrupt=False,
+            interrupted_this_run=None, interrupted_before=False,
             devin_ok=None, sessions_this_invocation=0,
             wall_budget_s=config.max_wall_s
             * config.max_sessions_per_day, wall_used_s=0.0)
@@ -1622,23 +1782,9 @@ def run_pilot(config: PilotConfig,
     print(f"[pilot] devin: {ver} · model: {config.model} · mode: "
           f"{config.mode} · run: {run_id}")
 
-    # the fail-closed model gate (WP3b)
-    try:
-        models = rr.fetch_models_list(config.devin_bin)
-    except rr.ModelGateError as exc:
-        print(f"[pilot] model gate REFUSED (fail-closed): {exc}")
-        return EXIT_RUN_FAILED
-    gate_res = rr.gate_cost_tier(models, config.model)
-    gate = {"allowed": gate_res.allowed,
-           "cost_tier": gate_res.cost_tier,
-           "reason": gate_res.reason,
-           "free_models": list(gate_res.free_models)}
-    if not gate_res.allowed:
-        print(f"[pilot] model gate REFUSED: {gate_res.reason}")
-        return EXIT_RUN_FAILED
-
-    # the pre-flight (zero quota — before any session; the runner also
-    # re-runs it per batch + per instance)
+    # the documented gate order (PLAN-WP6A.md): opt-in (above) →
+    # pre-flight (zero quota, before any session; the runner also
+    # re-runs it per batch + per instance) → model gate (fail-closed)
     pf = make_preflight(config)
     preflight_ok = True
     preflight_failures: list = []
@@ -1657,8 +1803,27 @@ def run_pilot(config: PilotConfig,
                               {"reason": str(exc), "phase": "batch"})
         return EXIT_RUN_FAILED
 
-    # the resume (WP3b) — the interrupted / partial state
+    # the fail-closed model gate (WP3b)
+    try:
+        models = rr.fetch_models_list(config.devin_bin)
+    except rr.ModelGateError as exc:
+        print(f"[pilot] model gate REFUSED (fail-closed): {exc}")
+        return EXIT_RUN_FAILED
+    gate_res = rr.gate_cost_tier(models, config.model)
+    gate = {"allowed": gate_res.allowed,
+           "cost_tier": gate_res.cost_tier,
+           "reason": gate_res.reason,
+           "free_models": list(gate_res.free_models)}
+    if not gate_res.allowed:
+        print(f"[pilot] model gate REFUSED: {gate_res.reason}")
+        return EXIT_RUN_FAILED
+
+    # the resume (WP3b) — the interrupted / partial state (the state
+    # file is the previous invocation's — it is overwritten at the end
+    # of this run)
     state = _load_state(workdir, run_id)
+    interrupted_before = bool(state.get("interrupted"))
+    aborted_before = bool(state.get("aborted"))
     skipped_on_resume: dict = {}
     to_run = [i["instance_id"] for i in insts]
     if os.path.isfile(jsonl):
@@ -1673,8 +1838,10 @@ def run_pilot(config: PilotConfig,
             return EXIT_CONFIG
         print(f"[pilot] resuming: skipped {skipped_on_resume}; "
               f"to run: {to_run}")
-    resumed_after_interrupt = bool(config.resume
-                                  and state.get("interrupted"))
+    if aborted_before:
+        print("[pilot] the previous run ended ABORTED (the state "
+              "file) — the resume continues the retry-eligible "
+              "instances")
     if not to_run:
         print("[pilot] nothing to run (all instances finished in a "
               "previous invocation)")
@@ -1708,8 +1875,13 @@ def run_pilot(config: PilotConfig,
                 devin_bin=cprep["devin_bin"], model=config.model,
                 cwd="/testbed", env=cprep["env"],
                 wall_s=config.max_wall_s,
-                host_check=bool(config.host_check), workdir=workdir)
+                host_check=bool(config.host_check), workdir=workdir,
+                container=cprep["container"])
         s = PilotSession(spec, make_session=make_session)
+        # the pre-session guard record (the checklist item 14 evidence —
+        # kept in the session meta so the line merger persists it)
+        s.meta["leak_guard"] = (prep if config.mode == "sandbox"
+                               else cprep)["leak_guard"]
         meta_by_instance[iid] = s.meta
         return s
 
@@ -1733,9 +1905,17 @@ def run_pilot(config: PilotConfig,
 
     interrupted = False
     run_failed = False
+    aborted = False
     try:
         result = runner.run()
         print(f"[pilot] run finished: {result.final_state}")
+        if result.final_state == "aborted":
+            # the WP3 terminal abort (2 consecutive agent_error, or a
+            # per-instance pre-flight abort): recorded durably (the
+            # state file) and the invocation FAILS — no GO checklist
+            # renders for an aborted run (an abort is the host-crash
+            # class: the operator fixes and resumes)
+            aborted = True
     except IntentionalInterrupt as exc:
         interrupted = True
         print(f"[pilot] INTERRUPT (exit {EXIT_INTERRUPT}): {exc}")
@@ -1744,15 +1924,24 @@ def run_pilot(config: PilotConfig,
         print(f"[pilot] RUN FAILED (host-crash class — resume-eligible, "
               f"PLAN §2.5): {type(exc).__name__}: {exc}")
 
-    # the state (the interrupt / resume bookkeeping)
+    # the state (the interrupt / abort / resume bookkeeping)
     records, _ = rr.load_checkpoint(jsonl)
     _write_state(workdir, run_id, {
         "run_id": run_id, "mode": config.mode, "model": config.model,
         "devin_cli_version": ver, "interrupted": interrupted,
+        "aborted": aborted,
+        "final_state": ("aborted" if aborted
+                       else ("interrupted" if interrupted
+                           else "done")),
         "completed_this_invocation": rep_.done_count,
         "ts": time.time(),
     })
     ckpt.close()
+    if aborted:
+        print(f"[pilot] ABORTED (exit {EXIT_RUN_FAILED}): the run "
+              "aborted — recorded in the state file; the "
+              "retry-eligible instances are the resume class")
+        return EXIT_RUN_FAILED
 
     # the WP5 report + the go/no-go record
     inst_records = [r for r in records
@@ -1786,7 +1975,7 @@ def run_pilot(config: PilotConfig,
         records=inst_records, skipped_on_resume=skipped_on_resume,
         interrupted_this_run=None if not interrupted
         else {"completed": rep_.done_count},
-        resumed_after_interrupt=resumed_after_interrupt,
+        interrupted_before=interrupted_before,
         devin_ok=bool(inst_records) and not run_failed,
         sessions_this_invocation=rep_.done_count,
         wall_budget_s=config.max_wall_s * config.max_sessions_per_day,
@@ -1871,6 +2060,12 @@ def main(argv: "Optional[list]" = None) -> int:
         return EXIT_CONFIG
     except PilotError as exc:
         print(f"[pilot] FAILED: {type(exc).__name__}: {exc}")
+        return EXIT_RUN_FAILED
+    except rr.RunnerError as exc:
+        # the WP3 protocol layer (RunnerProtocolError and friends) must
+        # not escape as a traceback: a protocol failure is a run
+        # failure (exit 4, the resume class)
+        print(f"[pilot] RUNNER ERROR: {type(exc).__name__}: {exc}")
         return EXIT_RUN_FAILED
 
 

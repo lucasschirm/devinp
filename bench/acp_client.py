@@ -1127,10 +1127,20 @@ class AcpSession:
                         and len(self._stderr_chunks) > 1:
                     total -= len(self._stderr_chunks.pop(0))
 
-    def _capture_stderr(self) -> None:
+    def stderr_tail_now(self) -> str:
+        """The current stderr tail — readable **during** the session
+        (the drain thread accumulates the chunks continuously; a caller
+        that never joins the thread still sees what has drained so
+        far). ``close()`` updates :attr:`stderr_tail` with the final
+        drain after the thread is joined — but the mid-session
+        quota / rate-limit signal (PLAN §2.3) reads **this**, not
+        :attr:`stderr_tail` (which is empty until close)."""
         with self._stderr_lock:
             data = b"".join(self._stderr_chunks)
-        self.stderr_tail = data[-4000:].decode("utf-8", "replace")
+        return data[-4000:].decode("utf-8", "replace")
+
+    def _capture_stderr(self) -> None:
+        self.stderr_tail = self.stderr_tail_now()
 
     def _close_stdin(self) -> None:
         self._close_pipe(self._proc.stdin if self._proc is not None else None)

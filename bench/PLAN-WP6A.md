@@ -86,25 +86,36 @@ pilot report + leaderboard artifacts).
   instance — `docker run -d swebench/sweb.eval.x86_64.<owner>__<repo>-<PR>:latest`
   as `sweb.eval.<instance_id>` (distinct from WP4's eval container name
   `sweb.eval.<instance_id>.<run_id>`), inject the **real** binary (the
-  `_versions` tree — never the wrapper, WP0 §2), per-instance **ephemeral
+  `_versions` tree — never the wrapper, WP0 §2; the host tree is resolved
+  portably: `DEVIN_VERSIONS_DIR` env, then the XDG locations — a missing
+  tree is a clear pre-session error), per-instance **ephemeral
   `XDG_DATA_HOME`/`XDG_CONFIG_HOME`** seeded only with the auth token, isolated
   config (empty MCP servers / rules / plugins — `devin acp` has no `--config`
   flag, WP0 §1 correction (a) ⇒ the isolated XDG *is* the isolation),
   `git -C /testbed remote remove origin` + strip tags/reflogs (upstream-leak
-  guard, PLAN §3.6), spawn `devin acp --model <M>` with
+  guard, PLAN §3.6 — **the guard record is kept in the instance meta**
+  (the checklist item 14 evidence)), the session's `devin_bin` is a
+  **single-line** `docker exec` shim (the `exec` + every flag form one
+  command — a multi-line shim would `exec docker exec -i` with no
+  container and die), spawn `devin acp --model <M>` with
   `PATH=/opt/miniconda3/envs/testbed/bin:$PATH`, `CONDA_DEFAULT_ENV=testbed`,
   `cwd=/testbed`, `DEVIN_REFUSAL_FALLBACK` unset (PLAN §3.4 — `AcpSession`
-  enforces this itself). Eval = WP4 `evaluate()` (fresh harness container,
-  official `run_evaluation`). Pruning = `docker rmi` the instance image +
-  `docker rm` the exited agent container after eval (PLAN §7; shared base/
+  enforces this itself). The host-side git ops (patch extraction, the
+  post-session leak verification) run on a **host copy** of `/testbed`
+  (`docker cp` — the in-container path does not exist on the host;
+  the copy is scratch and pruned with the instance). Eval = WP4
+  `evaluate()` (fresh harness container, official `run_evaluation`). Pruning =
+  `docker rmi` the instance image + `docker rm` the exited agent container
+  + delete the host copy after eval (PLAN §7; shared base/
   env layers retained).
 * **`sandbox` (documented no-container fallback — the pilot's actual mode in
   this environment, deviation recorded in the checklist + meta):** per
-  instance — `git clone <repo> <workdir>/<instance_id>/testbed` @
+  instance — `git clone <repo> <workdir>/runs/<instance_id>/testbed` @
   `base_commit` (a shared bare clone cache acts as the retained "base
   layer"), the same leak guard (remote removed, tags/reflogs stripped —
-  verified post-session), the same ephemeral-XDG + isolated-config +
-  refusal-fallback hygiene, `cwd=<workdir>/<instance_id>/testbed` **under the
+  verified post-session; **the pre-session guard record is kept in the
+  instance meta**), the same ephemeral-XDG + isolated-config +
+  refusal-fallback hygiene, `cwd=<workdir>/runs/<instance_id>/testbed` **under the
   operator's trusted workspace root** (WP0 §8), host `python3` on PATH (the
   conda `testbed` env is a container-only fact — deviation recorded).
   **Host check** (the closest end-to-end leg available without a container
@@ -127,7 +138,7 @@ pilot report + leaderboard artifacts).
 | observed | container | sandbox |
 |---|---|---|
 | pre-flight leg fails | `preflight_failed` | `preflight_failed` |
-| rate-limit / quota text (stop reason / stderr / non-zero exit) | `quota_limited` | `quota_limited` |
+| rate-limit / quota text (stop reason / **live-drained** stderr / non-zero exit) | `quota_limited` | `quota_limited` |
 | wall cap (45 min) → `AcpTimeoutError` (client already `session/cancel`ed + group-killed) | `timeout` | `timeout` |
 | `end_turn` + empty diff | `no_patch` | `no_patch` |
 | process crash / transport / protocol / refusal stop reason | `agent_error` | `agent_error` |
@@ -167,15 +178,24 @@ vendor notifications logged-not-errored), (5) the 5 wire method names used
 (incl. `session/request_permission` when observed), (6) permission flow
 (requests observed, all answered per policy; zero observed is recorded as such
 — WP0's trivial-task caveat), (7) `session/close` sent + group-kill + **no
-orphan** (pgid check — WP0 §1), (8) visible usage captured or proxy
-recorded, (9) per-instance wall ≤ cap, (10) pruning ran (per-instance
-removal; base retained), (11) resume after the intentional interrupt (terminal
-skipped, no duplicates, session arithmetic), (12) budget within
+orphan** (pgid check — WP0 §1; a `close()` failure leaves the check
+**unperformed** → the item FAILS, it does not silently pass), (8) visible
+usage captured or proxy recorded, (9) per-instance wall ≤ cap, (10) pruning
+(per-instance record present **in the same checkpoint line** and free of
+failures; base retained), (11) resume after the intentional interrupt
+(terminal skipped, no duplicates, session arithmetic — a plain crash/abort
+resume does **not** satisfy the item; the previous run must have been the
+intentional interrupt), (12) budget within
 `max_sessions_per_day` / wall budget, (13) eval leg verdict (container:
 official harness; sandbox: host check or documented skip — **deviation,
-non-gating**), (14) leak guard verified post-session (no `origin` remote, no
-post-base tags, reflogs empty).
-**GO ⟺ items 1–12 + 14 all pass.** The decision + measured numbers are
+non-gating**), (14) leak guard **verified post-session, gated on the
+recorded results** (the pre-session guard's `remotes_after` is empty + the
+post-session verification is clean: no `origin` remote, no post-base tags).
+**GO ⟺ items 1–12 + 14 all pass.** An **aborted** run (the WP3 terminal
+`aborted` — 2 consecutive `agent_error`, or a per-instance pre-flight
+abort) exits `4` with the abort recorded in the state file and **no
+checklist rendered** (it is the host-crash class: the operator fixes and
+resumes). The decision + measured numbers are
 written to `<workdir>/wp6a-go-no-go.md` (auto-generated) and committed to
 `bench/notes/wp6a-go-no-go.md` with the run artifacts referenced.
 
