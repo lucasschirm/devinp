@@ -99,6 +99,7 @@ npm install     # installs dev deps (esbuild, oclif, fastify, ansis)
 npm run build   # bundle src/ → bin/run.js + bin/command.js (self-contained)
 npm run dev     # build + run
 npm test        # node --test against sample/models.json
+node scripts/check-pack.js  # assert npm pack excludes bench/ (runs in CI)
 ```
 
 `bin/` is generated and gitignored; `prepare`/`prepack` build it automatically
@@ -110,6 +111,12 @@ so `npm publish`, git-URL installs, and `npm link` always ship a fresh bundle.
 [npm trusted publishing](https://docs.npmjs.com/trusted-publishers) (OIDC —
 no `NPM_TOKEN`). Requires the trusted publisher to be configured on npmjs.com:
 repository `lucasschirm/devinp`, workflow `publish.yml`.
+
+`bench/` is a separate Python package, so `publish.yml` ignores `bench/**`
+(`paths-ignore`) — bench-only pushes never trigger a release. CI
+(`.github/workflows/ci.yml`, `pack` job → `scripts/check-pack.js`) additionally
+asserts on every push/PR that `npm pack` contents exclude `bench/` and still
+ship `bin/` + `data/`.
 
 ## License
 
