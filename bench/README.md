@@ -21,6 +21,16 @@ override needs an explicit config + a token budget); the zero-quota
 pre-flight (auth → daemon → image → disk ≥ 2 × largest image, before
 every batch and every instance → `preflight_failed`)) + unit tests
 against fixtures + stub-failure legs (zero quota, CI).
+**WP3c (issue #16) complete** — `runner.py` (post-eval
+image/container pruning, PLAN §7: after each *done-for-good*
+instance — the never-re-run class — the runner removes the
+instance's exited containers (the agent's + the eval's) then
+`docker rmi`s the instance-specific image, retaining the shared
+base/env layers; best-effort — a docker operational failure is
+recorded, the pre-flight disk leg (sized 2 × the largest expected
+image) is the safety net; a raising pruner is a contract bug →
+fatal) + unit tests against a stateful docker fixture (zero quota,
+CI).
 
 ## Layout
 
@@ -35,8 +45,8 @@ against fixtures + stub-failure legs (zero quota, CI).
 | `probes/acp_probe.py` | NDJSON JSON-RPC probe for `devin acp` (4 modes) |
 | `acp_client.py` | **WP1** — NDJSON JSON-RPC 2.0 client core (pure stdlib) |
 | `mock_devin.py` | **WP2** — `mock_devin` test double: a fake `devin` binary (canned ACP agent, modes `ok`/`no_patch`/`hang`/`quota`/`crash`, canned `models list` fixture) |
-| `runner.py` | **WP3a + WP3b** — sequential queue (concurrency 1 by default), quota-budget state machine (`running → budget_exhausted → sleeping → resume`), overlap guard + concurrency flag contract, abort on 2 consecutive `agent_error`; checkpoint/resume with pass@1-correct retry semantics (`JsonlCheckpoint`, `resume_queue`), the dynamic cost-tier model gate (fail-closed, `gate_cost_tier`/`parse_models_list`/`fetch_models_list`), the zero-quota pre-flight (`Preflight`, before every batch + every instance) (pure stdlib) |
-| `tests/` | **WP1** — unit tests + in-process mock `devin` server; **WP2** — `mock_devin` integration tests (driven through the real WP1 client); **WP3a** — `runner` unit tests (instrumented fake sessions); **WP3b** — resume fixtures (incl. EOF corruption + retry-class rules), cost-tier gate fixtures (paid model, shape change, paid override), pre-flight stub-failure tests |
+| `runner.py` | **WP3a + WP3b + WP3c** — sequential queue (concurrency 1 by default), quota-budget state machine (`running → budget_exhausted → sleeping → resume`), overlap guard + concurrency flag contract, abort on 2 consecutive `agent_error`; checkpoint/resume with pass@1-correct retry semantics (`JsonlCheckpoint`, `resume_queue`), the dynamic cost-tier model gate (fail-closed, `gate_cost_tier`/`parse_models_list`/`fetch_models_list`), the zero-quota pre-flight (`Preflight`, before every batch + every instance, disk leg sized 2 × the largest expected image), post-eval image/container pruning (`Pruner`, PLAN §7 — the instance's exited containers + image after each done-for-good instance; shared base/env layers retained) (pure stdlib) |
+| `tests/` | **WP1** — unit tests + in-process mock `devin` server; **WP2** — `mock_devin` integration tests (driven through the real WP1 client); **WP3a** — `runner` unit tests (instrumented fake sessions); **WP3b** — resume fixtures (incl. EOF corruption + retry-class rules), cost-tier gate fixtures (paid model, shape change, paid override), pre-flight stub-failure tests; **WP3c** — `Pruner` unit tests against a stateful docker fixture (image/container removal, base/env layer retention, the no-force corner) + runner integration (the never-re-run trigger, the retry-class retention, the failure discipline) |
 | `conftest.py` | pytest path shim for the flat layout |
 | `pyproject.toml` / `requirements.lock` | Python ≥3.11; `swebench==5.0.2` pinned |
 
@@ -140,10 +150,10 @@ python -m pytest tests/          # zero-cost, mock only, no quota
   parse errors for non-JSON lines — the server keeps serving, never
   crashes (the WP0 negative-control behavior).
 
-## The runner (WP3a + WP3b, issues #14 + #15)
+## The runner (WP3a + WP3b + WP3c, issues #14 + #15 + #16)
 
 `runner.py` — the sequential queue, quota-budget state machine and
-overlap guard (PLAN.md §2.1–2.3, §5 WP3; pruning is WP3c, issue #16):
+overlap guard (PLAN.md §2.1–2.3, §5 WP3):
 
 ```bash
 cd bench
@@ -275,6 +285,31 @@ WP3b (issue #15, PLAN §2.4–2.7):
   releases the budget claim (no session was ever started), and aborts
   the run — the operator fixes the infra and resumes, where the
   instance is retry-eligible.
+
+WP3c (issue #16, PLAN §7):
+
+- **Post-eval image/container pruning**: 500
+  `sweb.eval.x86_64.*` images ≈ 1–2 TB — `Pruner` (wired into the
+  runner's `pruner` kwarg; off by default, the adapter WP wires it,
+  like the pre-flight) runs after each instance is **done for good**
+  (the never-re-run class `PRUNE_STATUSES` — the "evaluated" core
+  `resolved`/`failed_test` + the non-evaluated terminal outcomes
+  `timeout`/`no_patch`/`agent_error`; the **retry class retains its
+  image** — the resume pre-flight's `docker_image` leg requires it):
+  it lists the instance's **exited** containers (the agent's + the
+  eval's — both created from the instance image; the daemon-side
+  `status=exited` + `ancestor=<image>` filters; a running container
+  is never touched — never forced) and removes them **before**
+  `docker rmi`-ing the instance image (a container — even an exited
+  one — keeps the image "in use"). `docker rmi` removes only the
+  image's *unique* layers — the shared base/env layers are
+  reference-counted and retained (the pruner never touches anything
+  but the instance image). A docker operational failure (rc / a
+  hung-daemon timeout) is **recorded, not fatal** (disk pressure is
+  a pre-flight concern — the next window's pre-flight `disk` leg,
+  sized **2 × the largest expected image**, is the safety net);
+  a *raising* pruner is a contract bug → a host-crash-class fatal.
+  Unit: a stateful docker fixture (zero quota, CI).
 
 ## SWE-bench pin (WP0 result)
 
