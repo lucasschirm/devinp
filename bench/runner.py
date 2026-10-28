@@ -126,27 +126,43 @@ Acceptance criteria (issue #16, PLAN §7) and where they live:
    "evaluated" core of issue #16 AC1; ``timeout`` / ``no_patch`` /
    ``agent_error`` end before a harness verdict but are never re-run
    either, so their images are dead weight — PLAN §7's disk goal is
-   the 500), the runner removes the instance's **exited** containers
-   (the agent's + the eval's — both created from the instance image;
-   ``docker ps -a --filter status=exited --filter
-   ancestor=<image>`` → ``docker rm`` — **before** the ``rmi``: a
-   container, even an *exited* one, keeps the image "in use"; a
-   *running* container is never touched — the AC is to remove
-   *exited* containers, and the pruner never forces one) and then
-   ``docker rmi`` the instance image (issue #16 AC1). ``docker rmi``
-   removes only the layers **unique to the image** — the shared
-   base/env layers (and any other tag) are reference-counted by the
-   image store and retained automatically; the pruner never touches
-   anything but the instance image (issue #16 AC2). A docker
-   operational failure (a non-zero ``rc`` — an idempotent
-   double-prune, or an image still in use by a running container — or
-   a hung-daemon timeout) is **recorded in the outcome, not fatal**
-   (disk pressure is a pre-flight concern — the next window's
-   pre-flight ``disk`` leg is the safety net). A pruner that
-   *raises* is a contract bug → a host-crash-class fatal (fail-loud,
-   like a broken session). The pre-flight ``disk`` leg is sized to
+   the 500), the runner removes the instance's **non-running**
+   containers (the agent's + the eval's — both created from the
+   instance image; ``docker ps -a --filter status=exited --filter
+   status=created --filter status=dead --filter ancestor=<image>`` →
+   ``docker rm`` — **before** the ``rmi``: a container, even a
+   *non-running* one, keeps the image "in use" — the ``created`` /
+   *dead* states are included because an ``agent_error`` session that
+   dies between create and start leaves a ``created`` container that
+   would otherwise block the ``rmi``; a *running* container is never
+   touched — the AC is to remove *exited* containers, and the pruner
+   never forces one) and then ``docker rmi`` the instance image
+   (issue #16 AC1). ``docker rmi`` removes only the layers **unique
+   to the image** — the shared base/env layers (and any other tag) are
+   reference-counted by the image store and retained automatically;
+   the pruner never touches anything but the instance image (issue
+   #16 AC2). A *missing* image (never pulled, or already removed by an
+   earlier attempt) is a **clean no-op** — no error recorded: for this
+   trigger set it is benign, and with ~500 instances "No such image"
+   noise would make real failures unfindable by an ``errors`` scan. A
+   docker operational failure (a non-zero ``rc`` — an image still in
+   use by a running container — or a hung-daemon timeout) is
+   **recorded in the outcome, not fatal** (disk pressure is a
+   pre-flight concern — the next window's pre-flight ``disk`` leg is
+   the safety net); a *blocked* prune is retried **once** (a single
+   bounded retry — the transient class; a persistently blocked prune
+   is recorded — the last attempt's outcome — and the run moves on). A
+   pruner that *raises* is a contract bug → a host-crash-class fatal
+   (fail-loud, like a broken session). Each outcome is reported via
+   the optional :meth:`Reporter.prune_recorded` hook — a *failed*
+   prune is what post-run tooling / a resumed run needs to find (a
+   leaked image), and :class:`JsonlCheckpoint` persists it as a
+   supplemental line (a valid record — the instance's status — with
+   the outcome in ``meta["prune"]``; a duplicate line is last-wins in
+   the resume logic, same status → no re-run; a successful prune
+   writes no line). The pre-flight ``disk`` leg is sized to
    **2 × the largest expected image** (issue #16 AC3 —
-   :class:`Preflight``.min_free_bytes`, WP3b): the two together are
+   :class:`Preflight`.min_free_bytes, WP3b): the two together are
    PLAN §7 — the pruning keeps the disk near the floor so the 2×
    floor holds across the 500.
 
@@ -1158,6 +1174,17 @@ class Reporter(Protocol):
     def run_finished(self, result: "RunResult") -> None:
         """The run ended (not called on a propagated host-crash)."""
 
+    def prune_recorded(self, instance_id: "str | None", status: str,
+                      outcome: dict) -> None:
+        """**Optional** hook (WP3c): a pruned instance's final outcome
+        (the :class:`Pruner` result dict — after the single bounded
+        retry). The runner calls it only if the reporter provides it
+        (a duck-typed extension — a reporter that lacks it stays
+        conforming). A *failed* prune (``errors`` / ``containers_failed``)
+        is what post-run tooling / a resumed run needs to find: which
+        images leaked, and why — the in-memory ``pruner.prunes`` alone
+        dies with the process on a days-spanning run."""
+
 
 class RecordingReporter:
     """The default reporter: appends every event to :attr:`events` in
@@ -1175,6 +1202,10 @@ class RecordingReporter:
 
     def checkpoint(self, reason: str, meta: dict) -> None:
         self.events.append(("checkpoint", reason, dict(meta)))
+
+    def prune_recorded(self, instance_id: "str | None", status: str,
+                      outcome: dict) -> None:
+        self.events.append(("prune", instance_id, status, dict(outcome)))
 
     def run_finished(self, result: "RunResult") -> None:
         self.events.append(("run_finished", result.final_state))
@@ -1210,6 +1241,17 @@ class JsonlCheckpoint:
     glues its first record onto the torn tail (which would be mid-file
     corruption on the next load, or a silently dropped *completed*
     record — a re-run of a finished instance, a pass@1 violation).
+
+    **The prune line (WP3c):** a *failed* prune is persisted via
+    :meth:`prune_recorded` as a **supplemental** line — a valid record
+    (the instance's id + terminal status, the outcome in
+    ``meta["prune"]``): the "which images leaked and why" record that
+    survives a crash / a resume (the in-memory ``pruner.prunes`` alone
+    dies with the process on a days-spanning run). A *successful*
+    prune writes no line (the instance's terminal mark is the record;
+    the happy path stays noise-free). A duplicate line (same instance,
+    same status) is safe in the resume logic — last-wins, same status:
+    no re-run.
     """
 
     def __init__(self, path: str,
@@ -1258,6 +1300,25 @@ class JsonlCheckpoint:
         # The per-line flush is the checkpoint: everything that finished
         # is already on disk; there is nothing extra to persist.
         pass
+
+    def prune_recorded(self, instance_id: "str | None", status: str,
+                      outcome: dict) -> None:
+        # Only a *failed* prune is persisted (the "which images leaked
+        # and why" record; a success writes no line — the instance's
+        # terminal mark is the record, the happy path stays
+        # noise-free). The line is a valid record (the instance's id +
+        # terminal status, the outcome in ``meta["prune"]``), so the
+        # torn-line repair + the resume logic treat it like any record
+        # — a duplicate line is last-wins, same status: no re-run.
+        if instance_id is None or status not in TERMINAL_STATUSES:
+            return  # a batch-level / non-terminal line is not a record
+        if not (outcome.get("errors") or outcome.get("containers_failed")):
+            return  # a clean prune needs no line
+        line = {"instance_id": instance_id, "status": status,
+                "meta": {"prune": dict(outcome)}, "ts": self._clock()}
+        self._file.write(json.dumps(line) + "\n")
+        self._file.flush()
+        os.fsync(self._file.fileno())
 
     def run_started(self, meta: dict) -> None:
         pass  # run-level — not an instance line
@@ -1446,21 +1507,28 @@ class Pruner:
     :class:`Runner`, the ``pruner`` kwarg, on :data:`PRUNE_STATUSES` —
     the never-re-run class; the retry class retains its image for the
     resume's pre-flight ``docker_image`` leg), the runner prunes the
-    **instance-specific** image and the instance's **exited** containers
-    (the agent's container + the eval's fresh container — both created
-    from the instance image), retaining only the shared base/env layers.
+    **instance-specific** image and the instance's **non-running**
+    containers (the agent's container + the eval's fresh container —
+    both created from the instance image), retaining only the shared
+    base/env layers.
 
     The steps, in order:
 
-    1. List the instance image's **exited** containers: ``docker ps -a
-       --filter status=exited --filter ancestor=<image> --format
-       {{.ID}}`` — the filters are **daemon-side** (no client-side
-       image-string parsing; ``ancestor=<image>`` matches exactly the
-       containers created from the instance image; ``status=exited``
-       guarantees a *running* container is never touched — the AC is to
-       remove *exited* containers, and the pruner never forces one).
+    1. List the instance image's **non-running** containers (the
+       ``exited`` / ``created`` / ``dead`` states — the ``created`` /
+       ``dead`` states hold the image "in use" exactly like an exited
+       one: an ``agent_error`` session that dies between container
+       create and start leaves a ``created`` container that would
+       otherwise block the ``rmi``): ``docker ps -a --filter
+       status=exited --filter status=created --filter status=dead
+       --filter ancestor=<image> --format {{.ID}}`` — the filters are
+       **daemon-side** (no client-side image-string parsing;
+       ``ancestor=<image>`` matches exactly the containers created
+       from the instance image; the status filters guarantee a
+       *running* container is never touched — the AC is to remove
+       *exited* containers, and the pruner never forces one).
     2. ``docker rm <id>`` each — **before** the ``rmi`` (a container —
-       even an *exited* one — keeps the image "in use", so the
+       even a *non-running* one — keeps the image "in use", so the
        ``rmi`` would fail); a per-container failure is recorded and the
        rest proceed (best-effort).
     3. ``docker rmi <image>`` — removes only the layers **unique to the
@@ -1468,21 +1536,36 @@ class Pruner:
        reference-counted by the image store and retained automatically
        (issue #16 AC2 — the pruner never touches anything but the
        instance image; it never issues ``rmi`` for a base/env image).
+       A *missing* image (never pulled, or already removed by an
+       earlier attempt) is a **clean no-op** — ``image_removed`` is
+       ``False`` and no error is recorded: for this trigger set it is
+       benign, and with ~500 instances "No such image" noise would
+       make real failures unfindable by an ``errors`` scan.
 
     **Best-effort discipline:** a docker operational failure (a non-zero
-    ``rc`` — e.g. ``docker rmi`` against a still-absent image (an
-    idempotent double-prune) or an image still in use by a *running*
-    container — or a hung-daemon timeout) is **recorded in the outcome,
-    not raised**: disk pressure is a pre-flight concern (the next
-    window's pre-flight ``disk`` leg — 2 × the largest expected image,
-    issue #16 AC3 / WP3b — is the safety net; aborting a days-spanning
-    run over one ``rmi`` failure is a different class). A :meth:`prune`
-    that *raises* is therefore a **contract bug** (the injected pruner
-    is broken) — the runner treats it as a host-crash-class fatal
-    (fail-loud), like a broken session. The outcome dict (one per
-    :meth:`prune`, appended to :attr:`prunes`, also :attr:`last_prune`)
-    carries ``instance_id`` / ``image`` / ``containers_removed`` /
-    ``containers_failed`` / ``image_removed`` / ``errors``.
+    ``rc`` — e.g. ``docker rmi`` against an image still in use by a
+    *running* container — or a hung-daemon timeout) is **recorded in
+    the outcome, not raised**: disk pressure is a pre-flight concern
+    (the next window's pre-flight ``disk`` leg — 2 × the largest
+    expected image, issue #16 AC3 / WP3b — is the safety net; aborting
+    a days-spanning run over one ``rmi`` failure is a different
+    class). A :meth:`prune` that *raises* is therefore a **contract
+    bug** (the injected pruner is broken) — the runner treats it as a
+    host-crash-class fatal (fail-loud), like a broken session. A
+    *blocked* prune (a recorded failure) is retried **once** by the
+    runner — a single bounded retry that covers the transient class
+    (a busy daemon, a lock); a persistently blocked prune is recorded
+    (the last attempt's outcome) and the run moves on (the deferred
+    re-sweep across a resume is the adapter WP's territory, the
+    checkpoint's domain). The outcome dict (one per :meth:`prune`
+    attempt, append-ordered on :attr:`prunes`) carries
+    ``instance_id`` / ``image`` / ``containers_removed`` /
+    ``containers_failed`` / ``image_removed`` / ``errors``, and each
+    final outcome is reported via the optional
+    :meth:`Reporter.prune_recorded` hook — a *failed* prune is what
+    post-run tooling / a resumed run needs to find (a leaked image):
+    the in-memory ``prunes`` list alone dies with the process on a
+    days-spanning run.
 
     ``run`` / ``image_for`` are injectable (the unit tests run a
     stateful docker fixture — the issue #16 "testable by" lever —
@@ -1511,7 +1594,6 @@ class Pruner:
             else _default_image_for
         self._run = run if run is not None else self._default_run
         self.prunes: list = []  # one outcome per prune (GIL-safe appends)
-        self.last_prune: "dict | None" = None
 
     @property
     def timeout_s(self) -> float:
@@ -1527,23 +1609,28 @@ class Pruner:
         return subprocess.run(cmd, capture_output=True, timeout=timeout_s)
 
     @staticmethod
-    def _tail(proc: Any, what: str) -> str:
-        """A failed command's error detail (the same stderr-tail
-        discipline as :class:`Preflight``._cmd` — a non-sliceable
-        ``stderr`` is treated as empty, not a leak)."""
+    def _stderr(proc: Any) -> str:
+        """A bounded stderr tail — the tail itself, no prefix (the
+        same non-sliceable-``stderr``-is-empty discipline as
+        :class:`Preflight` ``._cmd``)."""
         tail = getattr(proc, "stderr", b"") or b""
         if isinstance(tail, str):
             tail = tail.encode("utf-8", "replace")
         if not isinstance(tail, (str, bytes)):
             tail = b""
-        return f"{what}: {tail[-200:].decode('utf-8', 'replace').strip()!r}"
+        return tail[-200:].decode("utf-8", "replace").strip()
+
+    def _tail(self, proc: Any, what: str) -> str:
+        """A failed command's error detail (the same stderr-tail
+        discipline as :class:`Preflight` ``._cmd``)."""
+        return f"{what}: {self._stderr(proc)!r}"
 
     def prune(self, instance_id: str) -> dict:
         """One instance's post-eval pruning — see the class docstring
         for the steps and the failure discipline. Never raises on a
         docker operational failure (it is recorded in the returned
         outcome)."""
-        img = self._image_for(instance_id)
+        img = self.image_for(instance_id)
         out: dict = {
             "instance_id": instance_id,
             "image": img,
@@ -1552,13 +1639,16 @@ class Pruner:
             "image_removed": False,
             "errors": [],
         }
-        # Step 1 — the instance image's exited containers (the
-        # daemon-side filters — see the class docstring).
+        # Step 1 — the instance image's non-running containers (the
+        # exited / created / dead states — the daemon-side filters,
+        # see the class docstring).
         ids: list = []
         try:
             proc = self._run(
                 [self._docker, "ps", "-a",
                  "--filter", "status=exited",
+                 "--filter", "status=created",
+                 "--filter", "status=dead",
                  "--filter", f"ancestor={img}",
                  "--format", "{{.ID}}"], self._timeout_s)
         except Exception as exc:
@@ -1581,7 +1671,7 @@ class Pruner:
                     if cid:
                         ids.append(cid)
         # Step 2 — remove them (best-effort per container; **before**
-        # the ``rmi`` — a container, even an exited one, keeps the
+        # the ``rmi`` — a container, even a non-running one, keeps the
         # image "in use").
         for cid in ids:
             try:
@@ -1600,12 +1690,15 @@ class Pruner:
             p = self._run([self._docker, "rmi", img], self._timeout_s)
             if getattr(p, "returncode", 1) == 0:
                 out["image_removed"] = True
+            elif "no such image" in self._stderr(p).lower():
+                # a missing image is the clean no-op (the class
+                # docstring — the benign class for this trigger set).
+                pass
             else:
                 out["errors"].append(self._tail(p, "rmi"))
         except Exception as exc:
             out["errors"].append(f"rmi: {type(exc).__name__}: {exc}")
         self.prunes.append(out)
-        self.last_prune = out
         return out
 
 
@@ -1692,12 +1785,18 @@ class Runner:
     the run (the batch-phase failure records an ``instance_id: None``
     marker line).
     ``pruner`` (PLAN §7, issue #16 AC1) is the post-eval
-    image/container pruning hook — after each instance is done for good
-    (the never-re-run class, :data:`PRUNE_STATUSES`), it removes the
-    instance's exited containers + its instance image (best-effort —
-    see :class:`Pruner`: a docker operational failure is recorded, not
-    fatal; a *raising* pruner is a contract bug — a host-crash-class
-    fatal, like a broken session).
+    image/container pruning hook — after each instance is done for
+    good (the never-re-run class, :data:`PRUNE_STATUSES`), it removes
+    the instance's non-running (exited / created / dead) containers +
+    its instance image (best-effort — see :class:`Pruner`: a docker
+    operational failure is recorded, not fatal; a *raising* pruner is a
+    contract bug — a host-crash-class fatal, like a broken session). A
+    blocked prune is retried **once** (the single bounded retry — the
+    transient class; a persistently blocked prune is recorded and the
+    run moves on), and each final outcome is reported via the optional
+    :meth:`Reporter.prune_recorded` hook (a *failed* prune is persisted
+    by :class:`JsonlCheckpoint` as a supplemental line — the "which
+    images leaked and why" record that survives a crash / a resume).
 
     * The default concurrency is **1** (sequential); a granted N>1 runs
       N worker threads (the user's quota risk).
@@ -2073,9 +2172,21 @@ class Runner:
         # ``docker_image`` leg requires it). A pruner that *raises* is
         # a contract bug → a host-crash-class fatal (fail-loud, like a
         # broken session); a real :class:`Pruner`'s docker operational
-        # failures are recorded, not raised.
+        # failures are recorded, not raised. A *blocked* prune is
+        # retried **once** (the single bounded retry — the transient
+        # class; a persistently blocked prune is recorded — the last
+        # attempt's outcome — and the run moves on), and each final
+        # outcome is reported via the optional
+        # :meth:`Reporter.prune_recorded` hook (a *failed* prune is
+        # what post-run tooling / a resumed run needs to find — a
+        # leaked image).
         if self._pruner is not None and status in PRUNE_STATUSES:
-            self._pruner.prune(inst)
+            out = self._pruner.prune(inst)
+            if out["errors"] or out["containers_failed"]:
+                out = self._pruner.prune(inst)  # the single retry
+            record = getattr(self._reporter, "prune_recorded", None)
+            if record is not None:
+                record(inst, status, out)
 
     # -- status handling ---------------------------------------------------
 
