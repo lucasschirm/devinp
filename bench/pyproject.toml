@@ -27,4 +27,5 @@ testpaths = ["tests", "probes"]
 # probes / tests are dev-only, notes/ is recon data). Without this,
 # setuptools flat-layout discovery fails on the multiple top-level
 # directories.
-py-modules = ["acp_client", "mock_devin", "runner", "evaluate", "report"]
+py-modules = ["acp_client", "live_pilot", "mock_devin", "runner",
+            "evaluate", "report"]
