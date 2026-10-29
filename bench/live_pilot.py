@@ -213,6 +213,15 @@ class PilotConfig:
         if self.mode not in ("container", "sandbox"):
             raise PilotConfigError(
                 f"mode must be 'container' or 'sandbox' (got {self.mode!r})")
+        # ``--host-check`` is a sandbox-mode flag (the documented no-
+        # container fallback) — in container mode the eval leg is the
+        # official WP4 harness, and the flag would be accepted but
+        # inert (run() takes the container branch first). Reject it
+        # loud instead
+        if self.host_check is True and self.mode == "container":
+            raise PilotConfigError(
+                "--host-check is a sandbox-mode flag — the container "
+                "mode's eval leg is the official WP4 harness")
         if self.interrupt_after is not None:
             if (isinstance(self.interrupt_after, bool)
                     or not isinstance(self.interrupt_after, int)
@@ -584,17 +593,20 @@ def extract_patch(cwd: str) -> dict:
             continue
         included.append(path)
 
-    # the pre-staged entries (the agent ran ``git add -N`` — porcelain
-    # ``" A"`` — or a real ``git add`` — ``"A "`` — on a junk file):
-    # the exclusion list applies regardless of the staging state — the
-    # pycache / binary junk is UNSTAGED and reported; legitimate staged
-    # source files are left staged
+    # the staged entries (the agent ran ``git add -N`` — porcelain
+    # ``" A"`` — a real ``git add`` — ``"A "`` — or staged-then-
+    # modified — ``"AM"``): the FULL guard applies regardless of the
+    # staging state (the exclusion list, the binary guard, AND the
+    # source/test lexical gate — ``git diff HEAD`` captures staged
+    # entries, so a staged non-source file or an excluded-dir file
+    # must not reach the patch): a rejected entry is UNSTAGED and
+    # reported; a legitimate staged source file is left staged
     for path, status in porcelain.items():
-        if status in ("A ", " A") and (_exclude(path)
-                                     or _is_binary(os.path.join(cwd, path))):
-            why = "exclusion pattern" if _exclude(path) else "binary content"
-            _git(cwd, "reset", "--", path)
-            skipped.append([path, f"pre-staged entry: {why} — unstaged"])
+        if status in ("A ", " A", "AM"):
+            why = _guard(path)
+            if why:
+                _git(cwd, "reset", "--", path)
+                skipped.append([path, f"pre-staged entry: {why} — unstaged"])
 
     # the included set is files only (the collapsed dirs were expanded
     # above) — the staging is a flat ``git add -N`` (never on a dir:
@@ -1166,8 +1178,13 @@ def _parse_pytest_ra(out: str, requested: list) -> "Optional[dict]":
     id→state map (``passed``/``failed``/``error``/``skipped``/
     ``xfailed``/``xpassed``) or None when nothing parsed (an infra
     failure, not a verdict)."""
+    # ``XFAIL`` is its own state: the official SWE-bench grading
+    # requires a ``PASSED`` line, so an xfailed FAIL_TO_PASS does NOT
+    # count as passed (it lands in ``failed_f2p``); ``XPASS``
+    # (unexpectedly passed) is likewise not a ``PASSED`` line
+    # (fail-closed)
     out_map = {"PASSED": "passed", "FAILED": "failed", "ERROR": "error",
-              "SKIPPED": "skipped", "XFAIL": "passed", "XPASS": "failed"}
+              "SKIPPED": "skipped", "XFAIL": "xfailed", "XPASS": "failed"}
     node_outcomes: dict = {}
     file_outcomes: dict = {}
     for line in out.splitlines():
@@ -1181,6 +1198,11 @@ def _parse_pytest_ra(out: str, requested: list) -> "Optional[dict]":
         # ``FAILED <id> - <reason>`` / ``ERROR <id> - <reason>`` — the
         # reason is not part of the id
         node = re.split(r"\s+-\s+", rest, 1)[0].strip()
+        # ``XFAIL <id> [reason]`` / ``XPASS <id> [reason]`` — some
+        # pytest versions bracket the reason with a space separator
+        # (a parameterized id's ``[args]`` is attached to the name
+        # without a space, so the space-requirement keeps it intact)
+        node = re.sub(r"\s+\[[^\]]*\]$", "", node).strip()
         if "::" in node:
             node_outcomes.setdefault(node, out_map[kind])
         else:
@@ -1261,6 +1283,14 @@ def prepare_sandbox_instance(inst: dict, workdir: str) -> dict:
         shutil.copyfile(
             host_creds,
             os.path.join(xdg_data, "devin", "credentials.toml"))
+        # ``copyfile`` drops the permission bits — a mode-600
+        # ``credentials.toml`` would land at the umask default
+        # (typically 0644), leaving the devin auth token
+        # world-readable for the session's duration. Preserve the
+        # source's mode
+        shutil.copymode(host_creds,
+                       os.path.join(xdg_data, "devin",
+                                   "credentials.toml"))
     env = dict(os.environ)
     env.pop("DEVIN_REFUSAL_FALLBACK", None)  # PLAN §3.4 (the client
     # also enforces this — defense in depth)
@@ -1355,41 +1385,52 @@ def _container_setup(inst: dict, workdir: str) -> dict:
     img = _image_for(inst)
     versions = _host_versions_dir()
     subprocess.run(["docker", "pull", img], check=True, timeout=7200)
-    subprocess.run(
-        ["docker", "run", "-d", "--name", f"sweb.eval.{iid}",
-         "-v", f"{versions}:/devin-inject:ro",
-         "-w", "/testbed", img, "sleep", "infinity"],
-        check=True, timeout=300)
-    subprocess.run(
-        ["docker", "exec", f"sweb.eval.{iid}", "sh", "-c",
-         "mkdir -p /usr/local/bin && "
-         "cp /devin-inject/current/bin/devin /usr/local/bin/devin "
-         "&& chmod +x /usr/local/bin/devin"],
-        check=True, timeout=300)
-    # the ephemeral XDG (PLAN §3.2) — the credentials only
-    subprocess.run(
-        ["docker", "exec", f"sweb.eval.{iid}", "sh", "-c",
-         "mkdir -p /tmp/xdg-data/devin /tmp/xdg-config"],
-        check=True, timeout=60)
-    src = _host_credentials_file()
-    if src and os.path.isfile(src):
+    # a failure anywhere after ``docker run -d`` (the injection, the
+    # XDG seeding, the guard, the shim write) would leave
+    # ``sweb.eval.<iid>`` running — the instance gets no checkpoint
+    # line, so ``prune_instance`` would never remove the named
+    # container (a leak). Best-effort cleanup on any failure
+    try:
         subprocess.run(
-            ["docker", "cp", src,
-             f"sweb.eval.{iid}:/tmp/xdg-data/devin/credentials.toml"],
+            ["docker", "run", "-d", "--name", f"sweb.eval.{iid}",
+             "-v", f"{versions}:/devin-inject:ro",
+             "-w", "/testbed", img, "sleep", "infinity"],
+            check=True, timeout=300)
+        subprocess.run(
+            ["docker", "exec", f"sweb.eval.{iid}", "sh", "-c",
+             "mkdir -p /usr/local/bin && "
+             "cp /devin-inject/current/bin/devin /usr/local/bin/devin "
+             "&& chmod +x /usr/local/bin/devin"],
+            check=True, timeout=300)
+        # the ephemeral XDG (PLAN §3.2) — the credentials only
+        subprocess.run(
+            ["docker", "exec", f"sweb.eval.{iid}", "sh", "-c",
+             "mkdir -p /tmp/xdg-data/devin /tmp/xdg-config"],
             check=True, timeout=60)
-    # the leak guard (PLAN §3.6) — the record is kept (the checklist
-    # item 14 evidence)
-    p = subprocess.run(
-        ["docker", "exec", f"sweb.eval.{iid}", "sh", "-c",
-         "cd /testbed && { "
-         "git remote remove origin 2>/dev/null; "
-         "git checkout --detach 2>/dev/null; "
-         "git for-each-ref --format='%(refname:short)' refs/heads/ "
-         "| xargs -r -n1 git branch -D 2>/dev/null; "
-         "git tag -l | xargs -r git tag -d 2>/dev/null; "
-         "git reflog expire --expire=now --all 2>/dev/null; "
-         "git remote; }"],
-        capture_output=True, timeout=300)
+        src = _host_credentials_file()
+        if src and os.path.isfile(src):
+            subprocess.run(
+                ["docker", "cp", src,
+                 f"sweb.eval.{iid}:/tmp/xdg-data/devin/credentials.toml"],
+                check=True, timeout=60)
+        # the leak guard (PLAN §3.6) — the record is kept (the
+        # checklist item 14 evidence)
+        p = subprocess.run(
+            ["docker", "exec", f"sweb.eval.{iid}", "sh", "-c",
+             "cd /testbed && { "
+             "git remote remove origin 2>/dev/null; "
+             "git checkout --detach 2>/dev/null; "
+             "git for-each-ref --format='%(refname:short)' refs/heads/ "
+             "| xargs -r -n1 git branch -D 2>/dev/null; "
+             "git tag -l | xargs -r git tag -d 2>/dev/null; "
+             "git reflog expire --expire=now --all 2>/dev/null; "
+             "git remote; }"],
+            capture_output=True, timeout=300)
+    except Exception:
+        subprocess.run(
+            ["docker", "rm", "-f", f"sweb.eval.{iid}"],
+            capture_output=True, timeout=300, check=False)
+        raise
     leak_guard = {
         "warnings": ([] if p.returncode == 0 else
                     ["leak guard: "
@@ -1525,13 +1566,23 @@ def make_preflight(config: PilotConfig,
         if config.mode == "container":
             def _versions() -> None:
                 try:
-                    _host_versions_dir()
+                    vdir = _host_versions_dir()
                 except PilotError as exc:
                     # a missing ``_versions`` tree would be the
                     # setup's mid-batch fatal — surface it at the
                     # zero-quota gate instead
                     raise rr.PreflightFailed(
                         "versions", str(exc)) from exc
+                # the tree must actually carry the injected binary —
+                # a dir that exists but lacks ``current/bin/devin``
+                # would still fail the setup's ``cp`` mid-batch
+                if not os.path.isfile(
+                        os.path.join(vdir, "current", "bin", "devin")):
+                    raise rr.PreflightFailed(
+                        "versions",
+                        f"the _versions tree {vdir!r} has no "
+                        "current/bin/devin (the setup's binary "
+                        "injection would fail)")
             checks.append(("versions", _versions))
             checks.append(
                 ("docker_daemon",
@@ -1751,6 +1802,7 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
                    gate: "Optional[dict]", preflight_ok: "Optional[bool]",
                    preflight_failures: list,
                    records: list,
+                   attempt_records: "Optional[list]" = None,
                    skipped_on_resume: dict,
                    interrupted_this_run: "Optional[dict]",
                    resume_after_interrupt: bool,
@@ -1774,9 +1826,6 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
                 None)
         return items
 
-    walls = []
-    usage_seen = False
-    total_tokens = 0
     perms_req = 0
     perms_all_answered = True
     perms_send_failures = 0
@@ -1789,19 +1838,31 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
     leak_ok = True
     leak_obs: list = []
     eval_legs: list = []
-    for rec in records:
-        m = rec.get("meta") or {}
+    # the session-level stats (item 8's token totals, item 9's wall,
+    # the calibration) count **ATTEMPTS** — every line with an
+    # instance id: a superseded ``eval_error``→rerun attempt's wall
+    # and tokens must not silently drop from the record (the same
+    # basis as item 12). The per-instance items below (7, 10, 14,
+    # permissions) use the deduped last-line-per-instance view
+    att = attempt_records if attempt_records is not None else records
+    attempt_wall: list = []
+    attempt_tokens = 0
+    attempt_usage_seen = False
+    for r in att:
+        m = r.get("meta") or {}
         w = (m.get("wall") or {}).get("session_s")
         if isinstance(w, (int, float)) and not isinstance(w, bool):
-            walls.append(w)
+            attempt_wall.append((r.get("status"), w))
         u = m.get("usage")
         if isinstance(u, dict):
-            usage_seen = True
+            attempt_usage_seen = True
             for k in ("totalTokens", "total_tokens"):
                 v = u.get(k)
                 if isinstance(v, (int, float)) and not isinstance(v, bool):
-                    total_tokens += int(v)
+                    attempt_tokens += int(v)
                     break
+    for rec in records:
+        m = rec.get("meta") or {}
         p = m.get("permissions") or {}
         perms_req += int(p.get("requests", 0))
         if int(p.get("requests", 0)) != int(p.get("allowed", 0)) + int(
@@ -1907,19 +1968,31 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
         "usage.{inputTokens, outputTokens, cachedReadTokens, "
         "totalTokens} captured verbatim, else the sessions + wall + "
         "byte-size proxy",
-        f"usage seen: {usage_seen}; total visible tokens: "
-        f"{total_tokens}; proxy (wall + prompt/patch bytes) recorded "
-        "per instance",
-        usage_seen or bool(walls))
-    cap_ok = all(w <= config.max_wall_s for w in walls)
+        f"usage seen: {attempt_usage_seen}; total visible tokens "
+        f"(attempts, incl. reruns): {attempt_tokens}; proxy (wall + "
+        "prompt/patch bytes) recorded per instance",
+        attempt_usage_seen or bool(attempt_wall))
+    # a ``timeout`` session's wall is measured AFTER the deadline +
+    # the cancel/close grace + the group-kill wait — deterministically
+    # cap + ~1s or more, so the comparison would fail by
+    # construction. The cap contract for a timeout is the kill
+    # itself (status == timeout is the evidence); the comparison
+    # applies to the non-timeout sessions
+    over_cap = [w for st, w in attempt_wall
+                if st != "timeout" and w > config.max_wall_s]
+    cap_ok = not over_cap
+    timeouts = sum(1 for st, _ in attempt_wall if st == "timeout")
     add("9 per-instance wall ≤ cap",
         f"≤ {config.max_wall_s:.0f}s (the 45-min cap)",
-        f"max session wall: "
-        f"{max(walls) if walls else 0:.1f}s"
+        f"max session wall (attempts): "
+        f"{max(w for _, w in attempt_wall) if attempt_wall else 0:.1f}s"
+        + (f" — {timeouts} timeout session(s) excluded from the "
+           f"comparison (killed at the cap by construction)"
+           if timeouts else "")
         + (" — suspected_untrusted_cwd on at least one instance (WP0 "
            "§8: the sandbox must live under a trusted workspace "
            "root)" if untrusted else ""),
-        cap_ok if walls else devin_ok)
+        cap_ok if attempt_wall else devin_ok)
     add("10 pruning (PLAN §7)",
         "the per-instance state removed after eval; the shared base "
         "retained",
@@ -2361,7 +2434,12 @@ def run_pilot(config: PilotConfig,
     # ``resolved`` line) must not flip the checklist items
     finals, _ = rep.dedupe(records)
     inst_records = list(finals.values())
-    cal = calibrate(inst_records, config)
+    # the calibration + item 8/9 stats count ATTEMPTS (every line
+    # with an instance id) — a superseded eval_error→rerun attempt
+    # measured wall + tokens that must not drop out of the record
+    # (the same basis as the item-12 budget gate)
+    attempts = [r for r in records if r.get("instance_id")]
+    cal = calibrate(attempts, config)
     meta = {
         "run_id": run_id,
         "devin_cli_version": ver,
@@ -2413,7 +2491,8 @@ def run_pilot(config: PilotConfig,
     items = build_checklist(
         config=config, dry_run=False, gate=gate,
         preflight_ok=preflight_ok, preflight_failures=preflight_failures,
-        records=inst_records, skipped_on_resume=skipped_on_resume,
+        records=inst_records, attempt_records=attempts,
+        skipped_on_resume=skipped_on_resume,
         interrupted_this_run=None if not interrupted
         else {"completed": rep_.done_count},
         resume_after_interrupt=(interrupted_before

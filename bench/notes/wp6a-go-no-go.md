@@ -605,3 +605,62 @@ findings. All addressed (zero-quota regression tests in
    Regression: `test_early_exits_remove_stale_record` (the
    `--largest-bytes 0` exit-2 path and the live-refused exit-3 path
    both remove a planted stale file).
+
+## Review round 5 (PR #37 `pr-review` — the fifth pass)
+
+The fifth `pr-review` pass raised 4 Medium / 4 Minor findings
+(none blocking). All addressed (zero-quota regression tests in
+`tests/test_live_pilot.py`):
+
+**Medium**
+
+1. **Staged entries bypassed the lexical gate** — `A `/` A` entries
+   were checked only against `_exclude`/`_is_binary` (never
+   `_looks_source_or_test`) and `AM` entries not at all, yet
+   `git diff HEAD` captures both. Now the **full** guard applies to
+   staged entries (a staged non-source or excluded-dir file is
+   unstaged + reported; a legitimate staged source file, incl. a
+   staged-then-modified `AM`, is included). Regression:
+   `test_staged_entries_get_full_guard`.
+2. **Item 9 could never pass for a `timeout` instance** — the
+   recorded wall is measured after the deadline + cancel/close grace
+   + group-kill wait, so it exceeds the cap by construction. Timeout
+   sessions are now excluded from the comparison (the kill itself is
+   the cap evidence — `status == timeout`); a non-timeout over-cap
+   session still fails. Regression:
+   `test_item9_timeout_exempt_and_non_timeout_enforced`.
+3. **`XFAIL` counted as `passed`** — the official SWE-bench grading
+   requires a `PASSED` line, so an xfailed `FAIL_TO_PASS` is now
+   `failed_test` (`XFAIL` is its own state; `XPASS` is likewise not
+   a `PASSED` line — fail-closed). The `-rA` parser also strips a
+   bracketed reason with a space separator (`XFAIL id [reason]`)
+   without touching parameterized ids (`id[args]` — attached, no
+   space). Regression: `test_xfail_counts_unresolved`.
+4. **`shutil.copyfile` dropped the permission bits** — a mode-600
+   `credentials.toml` would land world-readable (0644) under the run
+   dir. The host XDG seed now preserves the source's mode
+   (`shutil.copymode`). Regression:
+   `test_credentials_copy_preserves_mode`.
+
+**Minor**
+
+1. **A setup failure after `docker run -d` leaked the container** —
+   no checkpoint line, so `prune_instance` never removed the named
+   container. Any post-`run` failure now removes `sweb.eval.<iid>`
+   (best-effort `docker rm -f`) before the error propagates.
+   Regression: `test_container_setup_cleanup_on_failure`.
+2. **The calibration + item 8 token totals used the deduped finals
+   while item 12 counts attempts** — a superseded attempt's measured
+   wall + tokens dropped from the record. All three now use the
+   attempt basis (every line with an instance id); the per-instance
+   items keep the deduped view. Regression:
+   `test_calibration_and_item8_count_attempts`.
+3. **The `versions` leg checked only dir existence** — a tree without
+   `current/bin/devin` passed the gate and failed mid-batch at the
+   setup's `cp`. The leg now requires the binary inside. Regression:
+   `test_versions_preflight_requires_binary`.
+4. **`--host-check` was accepted but inert in container mode** — now
+   an explicit `--host-check` + container mode is a config error (the
+   flag is the documented sandbox fallback; the container eval leg is
+   the official WP4 harness). Regression:
+   `test_host_check_flag_rejected_in_container_mode`.

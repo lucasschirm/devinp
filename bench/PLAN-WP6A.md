@@ -88,8 +88,9 @@ pilot report + leaderboard artifacts).
    not pre-flight finished instances' container images (the prune `docker
    rmi`'d them) or re-pull images a finished run already consumed.
    - `versions` — **container mode only**: the host `_versions` tree
-     resolves (a missing tree is a pre-flight failure, not a mid-batch
-     setup fatal).
+     resolves **and contains `current/bin/devin`** (a missing tree or a
+     missing binary is a pre-flight failure, not a mid-batch setup
+     fatal at the injection `cp`).
 3. **Model gate (real, WP3b):** `gate_cost_tier(fetch_models_list(devin_bin),
    model)` — fail-closed; `swe-2-high` is `cost_tier == "Free"` (WP0 §7).
 
@@ -102,8 +103,14 @@ pilot report + leaderboard artifacts).
   `sweb.eval.<instance_id>.<run_id>`), inject the **real** binary (the
   `_versions` tree — never the wrapper, WP0 §2; the host tree is resolved
   portably: `DEVIN_VERSIONS_DIR` env, then the XDG locations — a missing
-  tree is a clear pre-session error), per-instance **ephemeral
-  `XDG_DATA_HOME`/`XDG_CONFIG_HOME`** seeded only with the auth token, isolated
+  tree is a clear pre-session error — any failure of the post-
+  `docker run` steps removes the container first (best-effort `docker
+  rm -f sweb.eval.<iid>`), so a setup failure never orphans the named
+  container that `prune_instance` would otherwise never reach),
+  per-instance **ephemeral
+  `XDG_DATA_HOME`/`XDG_CONFIG_HOME`** seeded only with the auth token (the
+  host copy preserves the source's permission bits — a mode-600
+  `credentials.toml` must not land world-readable under the run dir), isolated
   config (empty MCP servers / rules / plugins — `devin acp` has no `--config`
   flag, WP0 §1 correction (a) ⇒ the isolated XDG *is* the isolation),
   `git -C /testbed remote remove origin` + strip tags/reflogs + **delete all
@@ -195,7 +202,23 @@ pre-flight / prune consume (a custom file whose pinned image
 diverges from the derivation must pull the pinned one), and the
 ``429`` quota marker matches as a whole number (a bare substring
 false-positives on incidental digits and parks the batch in the
-midnight backoff).
+midnight backoff). **Staged** entries (porcelain `A ` / ` A` / `AM`)
+get the FULL guard — the exclusion list, the binary guard, AND the
+source/test lexical gate (`git diff HEAD` captures staged entries, so a
+staged non-source or excluded-dir file must be unstaged + reported,
+while a legitimate staged source file, incl. a staged-then-modified
+`AM`, is included). `XFAIL` is its own state (not `passed` — the
+official SWE-bench grading requires a `PASSED` line, so an xfailed
+`FAIL_TO_PASS` is `failed_test`); `XPASS` is likewise not a `PASSED`
+line (fail-closed). `--host-check` is a sandbox-mode flag: an explicit
+`--host-check` + container mode is a config error (in container mode
+the flag would be accepted but inert — the eval leg is the official
+WP4 harness). The calibration + item 8 token/wall stats count
+**attempts** (every checkpoint line with an instance id — a
+superseded `eval_error`→rerun attempt's wall + tokens must not drop
+from the record), the same basis as the item-12 budget gate; the
+per-instance items (7, 10, 14, permissions) keep the deduped
+last-line-per-instance view.
 
 **Status mapping (harness → the WP3 `TERMINAL_STATUSES` set, unchanged):**
 
@@ -244,7 +267,7 @@ vendor notifications logged-not-errored), (5) the 5 wire method names used
 — WP0's trivial-task caveat), (7) `session/close` sent + group-kill + **no
 orphan** (pgid check — WP0 §1; a `close()` failure leaves the check
 **unperformed** → the item FAILS, it does not silently pass), (8) visible
-usage captured or proxy recorded, (9) per-instance wall ≤ cap, (10) pruning
+usage captured or proxy recorded, (9) per-instance wall ≤ cap (a `timeout` session is excluded from the comparison — its wall is measured after the deadline + cancel/close grace + group-kill wait, so it exceeds the cap by construction; the kill itself is the cap evidence), (10) pruning
 (per-instance record present **in the same checkpoint line** and free of
 failures; base retained), (11) resume after the intentional interrupt
 (terminal skipped, no duplicates, session arithmetic — a plain crash/abort

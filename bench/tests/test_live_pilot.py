@@ -1850,3 +1850,211 @@ def test_real_devin_smoke(tmp_path):
     assert not s.group_alive()  # the no-orphan check (WP0 §1)
     assert marker.exists(), "the trivial task did not complete (the " \
         "WP0 §8 untrusted-cwd dead turn? check the cwd trust)"
+
+
+# --- round 5 (PR #37 fifth pr-review pass) -----------------------------
+
+
+def test_staged_entries_get_full_guard(tmp_path, live):
+    # the review finding: staged entries (porcelain ``"A "`` / ``" A"`` /
+    # ``"AM"``) were checked only against the exclusion list + binary
+    # guard, never the source/test lexical gate, and ``"AM"`` not at
+    # all — yet ``git diff HEAD`` captures them. Now the FULL guard
+    # applies: a staged non-source file or an excluded-dir file is
+    # unstaged + reported; a legitimate staged source file (incl. a
+    # staged-then-modified ``"AM"``) is included.
+    repo = tmp_path / "repo"
+    _make_repo(repo, name="mod.py")
+    (repo / "docs").mkdir()
+    staged_md = repo / "docs" / "staged.md"
+    staged_md.write_text("staged non-source\n")
+    _git(repo, "add", "--", "docs/staged.md")
+    (repo / "src2").mkdir()
+    am = repo / "src2" / "am.py"
+    am.write_text("x = 1\n")
+    _git(repo, "add", "--", "src2/am.py")
+    am.write_text("x = 2\n")  # staged-then-modified: porcelain "AM"
+    p = _git(repo, "status", "--porcelain", "-z")
+    assert b"A  docs" in p.stdout or b"A\tdocs" in p.stdout
+    ext = lp.extract_patch(str(repo))
+    assert "staged.md" not in ext["diff"]
+    why = {pp: w for pp, w in ext["skipped"]}
+    assert any("pre-staged" in w for w in why.values())
+    # the "AM" source file IS in the diff (with its final content)
+    assert "am.py" in ext["diff"]
+    assert "x = 2" in ext["diff"]
+    # the rejected entry is unstaged again
+    p2 = _git(repo, "status", "--porcelain", "-z")
+    assert b"docs/staged.md" not in p2.stdout
+
+
+def test_item9_timeout_exempt_and_non_timeout_enforced(tmp_path, live):
+    # the review finding: a ``timeout`` session's wall is measured after
+    # the deadline + cancel/close grace + group-kill wait, so it is
+    # deterministically over the cap — item 9 would fail by
+    # construction. Now timeout sessions are excluded (the kill itself
+    # is the evidence); a non-timeout over-cap session still fails.
+    rec_to = {"instance_id": "t", "status": "timeout", "meta": {
+        "wall": {"session_s": 2705.0},
+        "stop_reason": "timeout",
+        "permissions": {"requests": 0, "allowed": 0, "denied": 0},
+        "vendor_notifications": 0, "orphan_check": True,
+        "pruning": {"removed": [], "failed": []},
+        "leak_guard": {"remotes_after": [], "warnings": []},
+        "leak_verify": {"remotes": [], "tags": [], "clean": True}}}
+    items = lp.build_checklist(**_checklist_setup(
+        records=[rec_to],
+        attempt_records=[rec_to],
+        sessions_used=1, wall_used_s=2705.0))
+    i9 = next(i for i in items if i["item"].startswith("9 "))
+    assert i9["pass"] is True
+    assert "timeout session" in i9["observed"]
+    rec_over = dict(rec_to, instance_id="o", status="resolved",
+                   meta=dict(rec_to["meta"],
+                            wall={"session_s": 2701.0}))
+    items2 = lp.build_checklist(**_checklist_setup(
+        records=[rec_over],
+        attempt_records=[rec_over],
+        sessions_used=1, wall_used_s=2701.0))
+    i9b = next(i for i in items2 if i["item"].startswith("9 "))
+    assert i9b["pass"] is False
+
+
+def test_xfail_counts_unresolved(tmp_path, live, monkeypatch):
+    # the review finding: ``out_map`` mapped ``XFAIL`` to "passed", so
+    # an xfailed FAIL_TO_PASS counted toward ``resolved`` — the
+    # official SWE-bench grading requires a ``PASSED`` line. Now
+    # ``XFAIL`` is its own state and the host check's
+    # ``results.get(t) != "passed"`` comparison treats it as a failed
+    # F2P (and a failed P2P).
+    out = ("short test summary info\n"
+           "XFAIL tests/test_mod.py::test_fail [reason]\n")
+    res = lp._parse_pytest_ra(
+        out, ["tests/test_mod.py::test_fail"])
+    assert res == {"tests/test_mod.py::test_fail": "xfailed"}
+    # the verdict logic: an "xfailed" F2P is not "passed"
+    results = res
+    failed_f2p = [t for t in ["tests/test_mod.py::test_fail"]
+                 if results.get(t) != "passed"]
+    assert failed_f2p == ["tests/test_mod.py::test_fail"]
+    # XPASS is likewise not a PASSED line (fail-closed)
+    out2 = ("short test summary info\n"
+           "XPASS tests/test_mod.py::test_p2p [reason]\n")
+    res2 = lp._parse_pytest_ra(out2, ["tests/test_mod.py::test_p2p"])
+    assert res2 == {"tests/test_mod.py::test_p2p": "failed"}
+
+
+def test_credentials_copy_preserves_mode(tmp_path, live, monkeypatch):
+    # the review finding: ``shutil.copyfile`` drops the permission
+    # bits — a mode-600 ``credentials.toml`` would land at the umask
+    # default (typically 0644), leaving the devin auth token
+    # world-readable. Now the source's mode is preserved.
+    src = tmp_path / "credentials.toml"
+    src.write_text("[auth]\ntoken = secret\n")
+    os.chmod(src, 0o600)
+    monkeypatch.setattr(lp, "_host_credentials_file", lambda: str(src))
+    repos = _three_repos(tmp_path)
+    inst = _instances_file(tmp_path / "inst.json", repos)
+    i0 = lp.load_instances(inst)[0]
+    wd = tmp_path / "wd"
+    lp.prepare_sandbox_instance(i0, str(wd))
+    dst = wd / "runs" / i0["instance_id"] / "xdg" / "data" / "devin" / \
+        "credentials.toml"
+    assert dst.exists()
+    assert oct(dst.stat().st_mode & 0o777) == oct(0o600)
+
+
+def test_container_setup_cleanup_on_failure(tmp_path, live, monkeypatch):
+    # the review finding: a ``check=True`` failure in
+    # ``_container_setup`` after ``docker run -d`` left
+    # ``sweb.eval.<iid>`` running — no checkpoint line, so
+    # ``prune_instance`` never removes the named container. Now any
+    # post-``run`` failure removes the container (best effort) before
+    # the error propagates.
+    inst = {"instance_id": "owner__repo-1", "cwd": "/testbed",
+            "repo": "https://e/x", "base_commit": "b1"}
+    calls = []
+
+    class R:
+        def __init__(self, rc=0, out=b""):
+            self.returncode, self.stdout, self.stderr = rc, out, b""
+
+    def fake_run(cmd, **kw):
+        calls.append(list(cmd))
+        r = R(0, b"")
+        if cmd[1] == "exec":
+            r = R(1, b"")
+        if kw.get("check") and r.returncode != 0:
+            raise subprocess.CalledProcessError(
+                r.returncode, cmd)
+        return r
+
+    monkeypatch.setattr(lp.subprocess, "run", fake_run)
+    monkeypatch.setattr(lp, "_host_versions_dir",
+                       lambda: str(tmp_path / "versions"))
+    try:
+        lp._container_setup(inst, str(tmp_path))
+    except Exception:
+        pass
+    assert any(c[1] == "rm" and c[2] == "-f"
+               and c[3] == "sweb.eval.owner__repo-1" for c in calls)
+
+
+def test_calibration_and_item8_count_attempts(tmp_path, live):
+    # the review finding: ``calibrate`` + item 8's token totals used
+    # the deduped finals while item 12 counts attempts — a
+    # superseded attempt's measured wall and tokens dropped from the
+    # record. Now all three use the attempt basis.
+    superseded = {"instance_id": "a", "status": "eval_error",
+                  "meta": {"wall": {"session_s": 60.0},
+                          "usage": {"totalTokens": 100}}}
+    final = {"instance_id": "a", "status": "resolved",
+             "meta": {"wall": {"session_s": 90.0},
+                     "usage": {"totalTokens": 300},
+                     "permissions": {"requests": 1, "allowed": 1,
+                                    "denied": 0},
+                     "vendor_notifications": 0,
+                     "orphan_check": True,
+                     "pruning": {"removed": [], "failed": []},
+                     "leak_guard": {"remotes_after": [], "warnings": []},
+                     "leak_verify": {"remotes": [], "tags": [],
+                                    "clean": True}}}
+    cfg = lp.PilotConfig(max_wall_s=2700.0)
+    cal = lp.calibrate([superseded, final], cfg)
+    assert cal["per_session_wall_s"] == [60.0, 90.0]
+    assert cal["total_visible_tokens"] == 400
+    items = lp.build_checklist(**_checklist_setup(
+        records=[final],
+        attempt_records=[superseded, final],
+        sessions_used=2, wall_used_s=150.0))
+    i8 = next(i for i in items if i["item"].startswith("8 "))
+    assert "tokens (attempts, incl. reruns): 400" in i8["observed"]
+
+
+def test_versions_preflight_requires_binary(tmp_path, live, monkeypatch):
+    # the review finding: the container-mode ``versions`` leg validated
+    # only that the ``_versions`` dir exists — a tree without
+    # ``current/bin/devin`` passed the zero-quota gate and failed
+    # mid-batch at the setup's ``cp``. Now the binary must be inside.
+    vdir = tmp_path / "versions"
+    (vdir / "current").mkdir(parents=True)  # no bin/devin
+    monkeypatch.setattr(lp, "_host_versions_dir", lambda: str(vdir))
+    pf = lp.make_preflight(
+        lp.PilotConfig(mode="container"),
+        instances=[{"instance_id": "a", "image": "img"}])
+    with pytest.raises(rr.PreflightFailed) as excinfo:
+        pf(None)
+    assert excinfo.value.check == "versions"
+
+
+def test_host_check_flag_rejected_in_container_mode(tmp_path):
+    # the review finding: ``--host-check`` was accepted but inert in
+    # container mode (run() takes the container branch first). Now an
+    # explicit ``--host-check`` + container mode is a config error
+    # (the flag is the documented sandbox fallback; the container eval
+    # leg is the official WP4 harness).
+    with pytest.raises(lp.PilotConfigError):
+        lp.PilotConfig(mode="container", host_check=True)
+    # the default (None) stays valid in both modes
+    assert lp.PilotConfig(mode="container").host_check is False
+    assert lp.PilotConfig(mode="sandbox").host_check is True
