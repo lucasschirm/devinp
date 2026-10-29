@@ -2039,8 +2039,13 @@ def test_versions_preflight_requires_binary(tmp_path, live, monkeypatch):
     vdir = tmp_path / "versions"
     (vdir / "current").mkdir(parents=True)  # no bin/devin
     monkeypatch.setattr(lp, "_host_versions_dir", lambda: str(vdir))
+    # ``devin_bin=MOCK_PATH``: the pre-flight's ``binary`` leg (checked
+    # before ``versions`` in container mode) must pass regardless of
+    # whether the CI runner has a ``devin`` on PATH — without this the
+    # gate would fail on ``binary`` and never reach the ``versions``
+    # leg under test
     pf = lp.make_preflight(
-        lp.PilotConfig(mode="container"),
+        lp.PilotConfig(mode="container", devin_bin=MOCK_PATH),
         instances=[{"instance_id": "a", "image": "img"}])
     with pytest.raises(rr.PreflightFailed) as excinfo:
         pf(None)
