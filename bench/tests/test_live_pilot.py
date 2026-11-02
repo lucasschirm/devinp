@@ -3628,7 +3628,7 @@ def test_wp6b_round7_corrupt_source_line_meta(tmp_path, live):
     try:
         lp.load_imported(cfg, str(wd2), insts)
     except lp.PilotConfigError as exc:
-        assert "non-numeric ts" in str(exc), exc
+        assert "_parse_ts" in str(exc), exc
     else:
         raise AssertionError("a non-numeric ts was accepted")
     # a well-formed source still passes (no over-rejection)
@@ -3714,3 +3714,66 @@ def test_wp6b_round7_pin_fetch_cycle_guard(tmp_path, monkeypatch):
     assert [r["row_idx"] for r in rows2] == [0, 1]
 
 
+
+
+def test_wp6b_round8_ts_wp5_contract(tmp_path, live):
+    """The round-8 Medium fix (issue #22 AC2): the ts guard admits
+    only what the WP5 ``date_range`` / ``_parse_ts`` contract
+    admits — a ``None`` / ``bool`` / non-finite / non-positive ts
+    (which the old isinstance guard admitted — ``rec.get("ts",
+    ...)`` writes the literal value when the key is present) then
+    fails ``rep.generate`` as ``report_failed`` and wedges every
+    later --resume on the same durable line. Fail-closed instead."""
+    repos, inst = _two_pilot_b_repos(tmp_path)
+    ids = [e["instance_id"] for e in repos]
+    wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
+    wd1.mkdir()
+    src = wd1 / "run-src.jsonl"
+    cfg = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               host_check=False, pilot="b",
+               import_run="src", import_workdir=str(wd1))
+    insts = json.loads(Path(inst).read_text())["instances"]
+    for bad in (None, True, False, float("nan"), float("inf"),
+               float("-inf"), 0, -5):
+        with open(src, "w") as f:
+            f.write(json.dumps({"instance_id": ids[0],
+                                "status": "resolved", "ts": bad,
+                                "meta": {}}) + "\n")
+        try:
+            lp.load_imported(cfg, str(wd2), insts)
+        except lp.PilotConfigError:
+            pass
+        else:
+            raise AssertionError(f"ts {bad!r} was accepted")
+    # a valid finite positive ts still passes
+    with open(src, "w") as f:
+        f.write(json.dumps({"instance_id": ids[0],
+                            "status": "resolved", "ts": 1793220874.9,
+                            "meta": {}}) + "\n")
+    imported, _ = lp.load_imported(cfg, str(wd2), insts)
+    assert ids[0] in imported
+
+
+def test_wp6b_round8_preflight_failed_wall_counts(tmp_path):
+    """The round-8 Minor fix (issue #22 AC4 / item 12): a
+    preflight_failed line is not a SESSION (no session ran — the
+    pre-flight leg failed) and does not count toward the session
+    count — but its REAL wall (a failed pre-flight leg — the
+    image-pull class — can be minutes) counts toward the wall gate
+    (the WP6a wall_used_s basis counted it; the old code dropped
+    the whole line, under-counting the window's wall)."""
+    day = 20759
+    ts = day * 86400 + 100
+    recs = [
+        {"instance_id": "a", "status": "resolved", "ts": ts,
+         "meta": {"wall_s": 100.0}},
+        {"instance_id": "b", "status": "preflight_failed",
+         "ts": ts + 1, "meta": {"wall_s": 300.0}},
+        {"instance_id": "c", "status": "resolved", "ts": ts + 2,
+         "meta": {"wall_s": 50.0}},
+    ]
+    out = lp._window_buckets(recs)
+    assert out[day]["sessions"] == 2, out  # the preflight line is
+    # not a session
+    assert out[day]["wall_s"] == 450.0, out  # but its wall (300s)
+    # counts

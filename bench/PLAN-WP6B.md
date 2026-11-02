@@ -97,10 +97,15 @@ import).** For each imported instance: the source line and this
 run's final line for the same instance must agree on **status,
 session wall, total tokens, and patch bytes** — the import is
 faithful **and** the reused instance was not re-run (a re-run would
-append a divergent final line and fail the item). Plus the session
-arithmetic: (imported) + (sessions this run) == (unique instances with
-a final line) — i.e. exactly 25 unique sessions across the two runs,
-zero double-counting.
+append a divergent final line and fail the item). Plus the
+arithmetic — on **unique instances** (a pass@1 retry — e.g. an
+`eval_error` re-run — is two sessions for ONE unique instance, so
+session counts do not add): (imported unique instances) +
+(unique NEW instances with a final line in this run) == (total
+unique instances with a final line) — i.e. exactly 25 unique
+instances across the two runs, zero double-counting (the window
+arithmetic, item 12, separately accounts the session / attempt
+counts, retries included).
 
 ## AC3 — the failure taxonomy + the root-caused `eval_error`
 

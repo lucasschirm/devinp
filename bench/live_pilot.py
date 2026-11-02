@@ -84,6 +84,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import shutil
@@ -544,11 +545,30 @@ def load_imported(config: PilotConfig, workdir: str,
                 f"non-dict meta ({type(meta).__name__}) — a "
                 "corrupt source (fail-closed before any session)")
         ts = rec.get("ts")
-        if ts is not None and not isinstance(ts, (int, float)):
-            raise PilotConfigError(
-                f"--import-run source line for {iid!r} carries a "
-                f"non-numeric ts ({type(ts).__name__}) — a "
-                "corrupt source (fail-closed before any session)")
+        # the WP5 ``date_range`` / ``_parse_ts`` contract (the
+        # round-8 Medium fix, issue #22): a seeded line's ``ts`` is
+        # written verbatim (``rec.get("ts", ...)`` returns the
+        # literal value when the key is PRESENT — an explicit
+        # ``null`` too, not the default), so a present ts must be a
+        # finite, positive, non-bool number (the WP5 contract);
+        # absent is fine (the seeding default, a fresh ts, applies).
+        # A non-conforming present value (None / bool / non-finite /
+        # non-positive) would be seeded verbatim and fail
+        # ``rep.generate`` as ``report_failed``, wedging every
+        # later --resume on the same durable line — fail-closed
+        # instead
+        if "ts" in rec:
+            if (ts is None
+                    or isinstance(ts, bool)
+                    or not isinstance(ts, (int, float))
+                    or not math.isfinite(ts) or ts <= 0):
+                raise PilotConfigError(
+                    f"--import-run source line for {iid!r} carries "
+                    f"a ts the WP5 _parse_ts contract rejects "
+                    f"({ts!r}) — a corrupt source (fail-closed "
+                    "before any session; a seeded non-finite / "
+                    "non-positive / bool / null ts would wedge "
+                    "every later --resume in report_failed)")
         status = rec.get("status")
         if status in rr.NEVER_RERUN_STATUSES:
             imported[iid] = rec
@@ -2940,14 +2960,20 @@ def _window_buckets(records: list) -> dict:
     for r in records:
         if not r.get("instance_id"):
             continue
-        if r.get("status") == "preflight_failed":
-            continue
         if (r.get("meta") or {}).get("imported_from"):
             continue  # the import — the source run's accounting
         ts = r.get("ts") or 0.0
         day = int(ts // 86400)
         w = out.setdefault(day, {"sessions": 0, "wall_s": 0.0})
-        w["sessions"] += 1
+        # a preflight_failed line is not a SESSION (no session ran —
+        # the pre-flight leg failed), so it does not count toward
+        # the session count — but its REAL wall (a failed pre-flight
+        # leg — the image-pull class — can be minutes) counts
+        # toward the wall gate (the WP6a wall_used_s basis counted
+        # it; dropping the line dropped the wall — the round-8
+        # fix)
+        if r.get("status") != "preflight_failed":
+            w["sessions"] += 1
         wall = (r.get("meta") or {}).get("wall_s", 0.0)
         if isinstance(wall, (int, float)) and not isinstance(wall, bool):
             w["wall_s"] += float(wall)
