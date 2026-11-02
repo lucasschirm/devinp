@@ -528,6 +528,27 @@ def load_imported(config: PilotConfig, workdir: str,
     for iid, rec in finals.items():
         if iid not in known:
             continue  # stale — not in this run's instance file
+        # the fail-closed source-line validation (the round-7
+        # Medium fix, issue #22): a non-dict ``meta`` (or a
+        # non-numeric ``ts``) passes the load_checkpoint / dedupe
+        # validation (they only check instance_id / status) and
+        # would crash the seeding loop MID-SEED (exit 4) instead
+        # of the documented fail-closed config error (exit 2,
+        # before any session) — and the persisted early import
+        # record would make every later --resume hit the same
+        # crash. Validate here, before any session.
+        meta = rec.get("meta")
+        if meta is not None and not isinstance(meta, dict):
+            raise PilotConfigError(
+                f"--import-run source line for {iid!r} carries a "
+                f"non-dict meta ({type(meta).__name__}) — a "
+                "corrupt source (fail-closed before any session)")
+        ts = rec.get("ts")
+        if ts is not None and not isinstance(ts, (int, float)):
+            raise PilotConfigError(
+                f"--import-run source line for {iid!r} carries a "
+                f"non-numeric ts ({type(ts).__name__}) — a "
+                "corrupt source (fail-closed before any session)")
         status = rec.get("status")
         if status in rr.NEVER_RERUN_STATUSES:
             imported[iid] = rec
@@ -586,14 +607,30 @@ def _copy_imported_artifacts(rec: dict, src_workdir: str,
             # already in place (shutil.copyfile onto itself would
             # raise SameFileError)
         if os.path.isfile(dst):
-            continue  # the idempotent fast path: the destination is
-            # already complete (the source run's files are
-            # immutable) — a crash between a line's fsync and its
-            # copy is healed by the source copy on the next
-            # invocation
+            # the idempotent fast path — with a size check: a
+            # PARTIALLY-COPIED dst (shutil.copyfile is not atomic —
+            # a mid-copy crash leaves a truncated file) must not be
+            # treated as complete: the WP5 check_artifacts R2
+            # byte-compare then fails the cross-check at report
+            # time (a permanent report_failed wedge — the same
+            # class rounds 3–4 were fixing). The source file is
+            # immutable (a completed run's artifact), so size
+            # equality IS completeness; a size-mismatched (or
+            # pre-fix truncated) dst is re-copied below (the
+            # atomic copy — a new mid-copy crash leaves no
+            # partial dst at all, only an orphan .part that the
+            # next copy overwrites)
+            if not (os.path.isfile(src)
+                   and os.path.getsize(src) == os.path.getsize(dst)):
+                pass  # fall through to the (atomic) copy
+            else:
+                continue
         if os.path.isfile(src):
             os.makedirs(os.path.dirname(dst), exist_ok=True)
-            shutil.copyfile(src, dst)
+            # the atomic copy: <dst>.part + os.replace (the rename
+            # is atomic on POSIX) — see the fast-path note above
+            shutil.copyfile(src, dst + ".part")
+            os.replace(dst + ".part", dst)
 
 
 def seed_import_lines(jsonl_path: str, imported: dict,
@@ -2685,9 +2722,16 @@ def _render_pilot_b_sections(wp6b: dict) -> list:
                      "| instance | class | detail |",
                      "|---|---|---|"]
             for r in rc:
+                # the detail is operator text (a root-cause detail
+                # — e.g. a git/pytest stderr line): a ``|`` or a
+                # newline in it would corrupt the markdown table
+                # (the checklist rows escape the same way)
+                detail = str(r["detail"] or "-")
+                detail = (detail.replace("|", "\\|")
+                         .replace("\n", " ")[:160])
                 lines.append(f"| {r['instance_id']} | "
                             f"{r['root_cause'] or 'UNCLASSIFIED'} | "
-                            f"{r['detail'] or '-'} |")
+                            f"{detail} |")
         lines.append("")
     win = wp6b.get("windows") or []
     if win:
@@ -2800,10 +2844,42 @@ def _load_state(workdir: str, run_id: str) -> dict:
 
 
 def _write_state(workdir: str, run_id: str, state: dict) -> None:
+    """Crash-atomic (the round-7 Major fix, issue #22): the state
+    write is tmp + fsync + ``os.replace`` — a mid-write crash (a
+    process kill / power loss during the write) leaves the
+    previous state file intact (or NO file on a fresh workdir — a
+    visible anomaly the operator resolves by re-invoking the import
+    window; the seeding is idempotent), so the resume's import
+    re-derivation (the state's full source set — the round-3 early
+    record — + the checkpoint fallback, round 2) is never clobbered
+    by a torn write. The old ``open("w")`` truncated in place: a
+    mid-write crash left a torn JSON that :func:`_load_state`
+    swallowed to ``{}`` — the early import record (the round-3
+    recovery) could be destroyed by its own write path (zero seeds
+    + a torn state → the resume derives nothing, the never-rerun
+    instances run fresh, item 16 renders n/a — the same silent
+    under-derivation the round-3 early record was added to close).
+    """
     os.makedirs(workdir, exist_ok=True)
-    with open(_state_path(workdir, run_id), "w", encoding="utf-8",
-              newline="") as f:
+    p = _state_path(workdir, run_id)
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="") as f:
         json.dump(state, f, indent=2)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, p)  # atomic on POSIX (the same filesystem)
+    # best-effort directory fsync (the rename's durability — a
+    # power loss immediately after the rename can drop it without
+    # this; best-effort: not every platform exposes a directory fd)
+    try:
+        dfd = os.open(os.path.dirname(p) or ".", os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        pass
 
 
 def _remove_stale_record(workdir: str) -> None:
@@ -3130,7 +3206,18 @@ def run_pilot(config: PilotConfig,
     # ``meta.imported_from`` + the original ``ts``; the source line
     # is the line minus the marker). Both filtered to the current
     # instance file (a stale id is ignored — the load_imported
-    # semantics)
+    # semantics). Crash-atomic contract (the round-7 Major fix,
+    # issue #22): the state write is tmp + fsync + os.replace
+    # (:func:`_write_state`) — a mid-write crash leaves the
+    # previous state intact (or NO file on a fresh workdir — a
+    # VISIBLE anomaly, never a torn JSON swallowed to {} by
+    # :func:`_load_state`): the fallback trusts the seeded lines
+    # as the complete import BECAUSE a torn state can no longer
+    # destroy the recovery info — and a completely lost state (a
+    # fresh-workdir crash before the first state write lands) is
+    # the visible anomaly the operator resolves by re-invoking the
+    # import window (the seeding is idempotent; the state is
+    # rewritten).
     if (not imported and config.resume):
         known = {i["instance_id"] for i in insts}
         if (state.get("imported")

@@ -65,7 +65,7 @@ def _get(url: str) -> dict:
 def fetch_all_rows() -> list:
     rows = []
     offset = 0
-    last_first = None
+    seen_first = set()
     while True:
         data = _get(API.format(offset=offset))
         page = data["rows"]
@@ -74,11 +74,13 @@ def fetch_all_rows() -> list:
             break
         # a persistently partial=True response (a misbehaving API)
         # would make the offset loop unbounded — the no-progress
-        # guard (a page repeating the previous first row = no
-        # forward movement)
-        if page and page[0].get("row_idx") == last_first:
+        # guard: ANY page first-row repeat (immediate OR after other
+        # pages — a cycling API with two or more distinct pages is
+        # caught, which an immediate-only check left unbounded)
+        first = page[0].get("row_idx")
+        if first in seen_first:
             break
-        last_first = page[0].get("row_idx")
+        seen_first.add(first)
         if not data.get("partial", False) and len(page) < 100:
             break
         offset += 100

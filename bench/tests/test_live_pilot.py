@@ -3477,3 +3477,240 @@ def test_wp6b_round6_host_check_path_failure_classifies_env(
         session.meta["eval_error_root_cause"]
 
 
+
+
+def test_wp6b_round7_truncated_dst_recopied(tmp_path):
+    """The round-7 Major fix (issue #22 AC2): the isfile(dst) fast
+    path no longer trusts a PARTIALLY-COPIED artifact —
+    shutil.copyfile is not atomic, so a mid-copy crash left a
+    truncated dst that every later invocation skipped (the
+    self-heal only covered a MISSING dst) and the WP5
+    check_artifacts R2 byte-compare then failed the cross-check at
+    report time (a permanent report_failed wedge — the same class
+    rounds 3-4 were fixing). Now: the fast path checks the size
+    (the source is immutable — size equality IS completeness) and
+    the copy is atomic (<dst>.part + os.replace — a new mid-copy
+    crash leaves no partial dst, only an orphan .part the next
+    copy overwrites)."""
+    srcwd, dstwd = tmp_path / "src", tmp_path / "dst"
+    srcwd.mkdir()
+    dstwd.mkdir()
+    (srcwd / "trajectory.jsonl").write_text("complete-content\n" * 10)
+    # a TRUNCATED dst (a pre-fix mid-copy crash): re-copied
+    (dstwd / "trajectory.jsonl").write_text("complete-con")
+    rec = {"instance_id": "x", "status": "resolved", "ts": 1.0,
+           "meta": {"trajectory": "trajectory.jsonl"}}
+    lp._copy_imported_artifacts(rec, str(srcwd), str(dstwd))
+    assert (dstwd / "trajectory.jsonl").read_text() \
+        == (srcwd / "trajectory.jsonl").read_text()
+    # the complete dst: the fast path (no re-copy — mtime would
+    # change if re-copied)
+    import os
+    mtime = (dstwd / "trajectory.jsonl").stat().st_mtime_ns
+    lp._copy_imported_artifacts(rec, str(srcwd), str(dstwd))
+    assert (dstwd / "trajectory.jsonl").stat().st_mtime_ns == mtime
+    # a missing src with a present dst: left as-is (the WP5
+    # fail-loud semantics — the cross-check flags it)
+    rec2 = {"instance_id": "x", "status": "resolved", "ts": 1.0,
+            "meta": {"eval_log": "eval.log"}}
+    (dstwd / "eval.log").write_text("dst-only")
+    lp._copy_imported_artifacts(rec2, str(srcwd), str(dstwd))
+    assert (dstwd / "eval.log").read_text() == "dst-only"
+    # the atomic copy: a mid-copy crash leaves no partial dst
+    import shutil as _sh
+    real_copyfile = _sh.copyfile
+
+    def boom(src, dst, **kw):
+        if dst.endswith(".part"):
+            open(dst, "w").write("partial")  # simulate a crash
+            raise OSError("simulated mid-copy crash")
+        return real_copyfile(src, dst, **kw)
+    import subprocess  # noqa: F401
+    real_replace = os.replace
+    (dstwd / "traj2.jsonl").unlink(missing_ok=True)
+    (srcwd / "traj2.jsonl").write_text("t2\n")
+    rec3 = {"instance_id": "x", "status": "resolved", "ts": 1.0,
+            "meta": {"trajectory": "traj2.jsonl"}}
+    try:
+        _sh2 = lp.shutil
+        old_cf = _sh2.copyfile
+        _sh2.copyfile = boom
+        try:
+            lp._copy_imported_artifacts(rec3, str(srcwd), str(dstwd))
+        except OSError:
+            pass
+        finally:
+            _sh2.copyfile = old_cf
+    except Exception:
+        pass
+    # after the simulated crash: NO partial dst (only the .part)
+    assert not (dstwd / "traj2.jsonl").is_file()
+    # the next invocation heals (the dst is absent — a fresh copy)
+    lp._copy_imported_artifacts(rec3, str(srcwd), str(dstwd))
+    assert (dstwd / "traj2.jsonl").read_text() == "t2\n"
+
+
+def test_wp6b_round7_state_write_crash_atomic(tmp_path, monkeypatch):
+    """The round-7 Major fix (issue #22): _write_state is
+    crash-atomic (tmp + fsync + os.replace) — a mid-write crash
+    (a process kill / power loss during the write) leaves the
+    PREVIOUS state file intact, so the resume's import
+    re-derivation (the state's full source set + the checkpoint
+    fallback) is never clobbered by a torn write (the old
+    open("w") truncated in place — a mid-write crash left a torn
+    JSON that _load_state swallowed to {})."""
+    wd = tmp_path / "wd"
+    wd.mkdir()
+    rid = "t"
+    first = {"a": 1, "imported_run": "src",
+             "import_source": {"x": {"instance_id": "x"}}}
+    lp._write_state(str(wd), rid, first)
+    # a crash mid-write: os.replace never runs
+    import os
+    real_replace = os.replace
+
+    def no_rename(src, dst, **kw):
+        raise OSError("simulated crash mid-write (before the rename)")
+    monkeypatch.setattr(lp.os, "replace", no_rename)
+    try:
+        lp._write_state(str(wd), rid, {"b": 2})
+    except OSError:
+        pass
+    # the previous state is INTACT (no in-place truncation)
+    st = json.loads((wd / f"pilot-{rid}.state.json").read_text())
+    assert st == first, st
+    monkeypatch.undo()
+    # a normal write still works
+    lp._write_state(str(wd), rid, {"b": 2})
+    st2 = json.loads((wd / f"pilot-{rid}.state.json").read_text())
+    assert st2 == {"b": 2}, st2
+
+
+def test_wp6b_round7_corrupt_source_line_meta(tmp_path, live):
+    """The round-7 Medium fix (issue #22 AC2): a corrupt source
+    line with a non-dict meta (or a non-numeric ts) passes the
+    load_checkpoint / dedupe validation (they only check
+    instance_id / status) and would crash the seeding loop
+    MID-SEED (exit 4) instead of the documented fail-closed config
+    error (exit 2, before any session) — and the persisted early
+    import record made every later --resume hit the same crash.
+    load_imported now validates both, before any session."""
+    repos, inst = _two_pilot_b_repos(tmp_path)
+    ids = [e["instance_id"] for e in repos]
+    wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
+    # a corrupt source: a line whose meta is a STRING (plus a
+    # good line, so the known-set filtering passes)
+    src = wd1 / "run-src.jsonl"
+    wd1.mkdir()
+    with open(src, "w") as f:
+        f.write(json.dumps({"instance_id": ids[0],
+                            "status": "resolved", "ts": 1.0,
+                            "meta": "a-non-dict-meta"}) + "\n")
+        f.write(json.dumps({"instance_id": ids[1],
+                            "status": "resolved", "ts": 2.0,
+                            "meta": {}}) + "\n")
+    cfg = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               host_check=False, pilot="b",
+               import_run="src", import_workdir=str(wd1))
+    insts = json.loads(Path(inst).read_text())["instances"]
+    try:
+        lp.load_imported(cfg, str(wd2), insts)
+    except lp.PilotConfigError as exc:
+        assert "non-dict meta" in str(exc), exc
+    else:
+        raise AssertionError("a non-dict meta was accepted")
+    # a non-numeric ts is rejected too (it would break the
+    # window-bucket day arithmetic downstream)
+    with open(src, "w") as f:
+        f.write(json.dumps({"instance_id": ids[0],
+                            "status": "resolved", "ts": "not-a-timestamp",
+                            "meta": {}}) + "\n")
+    try:
+        lp.load_imported(cfg, str(wd2), insts)
+    except lp.PilotConfigError as exc:
+        assert "non-numeric ts" in str(exc), exc
+    else:
+        raise AssertionError("a non-numeric ts was accepted")
+    # a well-formed source still passes (no over-rejection)
+    with open(src, "w") as f:
+        f.write(json.dumps({"instance_id": ids[0],
+                            "status": "resolved", "ts": 1.0,
+                            "meta": {}}) + "\n")
+    imported, _ = lp.load_imported(cfg, str(wd2), insts)
+    assert ids[0] in imported
+
+
+def test_wp6b_round7_root_cause_table_escapes(tmp_path):
+    """The round-7 Minor fix (issue #22 AC3 record): the detail
+    (operator text — a root-cause detail) is escaped into the
+    markdown table like the checklist rows — a | or a newline in it
+    would corrupt the table."""
+    wp6b = {"per_repo": {}, "expected_repos": [],
+            "import": {}, "taxonomy": {},
+            "root_causes": [
+                {"instance_id": "a__b-1", "root_cause": "env",
+                 "detail": "git apply | failed\nto a new line"}],
+            "windows": []}
+    out = lp._render_pilot_b_sections(wp6b)
+    joined = "\n".join(out)
+    assert "| failed" in joined  # the escaped pipe renders as text
+    assert "\\|" in joined  # the escape is present in the source
+    assert "to a new line" in joined
+    # the row: 2 outer delimiters + 2 unescaped cell separators +
+    # 1 escaped pipe (\| — the escaped char is not a delimiter to
+    # a markdown parser, but it is a raw '|' char) = 5 raw chars;
+    # a literal unescaped pipe inside the cell would be a 6th
+    row = [l for l in out
+           if l.startswith("| a__b-1")][0]
+    assert row.count("|") == 5, row
+    assert row.endswith("|")  # a clean row end (no dangling cell)
+
+
+def test_wp6b_round7_pin_fetch_cycle_guard(tmp_path, monkeypatch):
+    """The round-7 Minor fix: the no-progress guard catches a
+    misbehaving API CYCLING two or more distinct pages (an
+    immediate-only repeat check left a 2+-page cycle unbounded)."""
+    import scripts.pin_pilot_b_instances as pin
+    # the cycle: page A, page B, page A again (a distinct first
+    # row each time — an immediate-only repeat check would loop
+    # forever; the seen-set guard terminates on the repeat)
+    seq = [
+        {"partial": True,
+         "rows": [{"row_idx": 0, "row": {}},
+                  {"row_idx": 1, "row": {}}]},
+        {"partial": True,
+         "rows": [{"row_idx": 2, "row": {}},
+                  {"row_idx": 3, "row": {}}]},
+        {"partial": True,
+         "rows": [{"row_idx": 0, "row": {}},
+                  {"row_idx": 1, "row": {}}]},
+    ]
+    calls = {"i": 0}
+
+    def fake_get(url):
+        d = seq[min(calls["i"], len(seq) - 1)]
+        calls["i"] += 1
+        return d
+    monkeypatch.setattr(pin, "_get", fake_get)
+    pin.fetch_all_rows()
+    assert calls["i"] == 3, calls["i"]  # terminated on the repeat
+    # the normal termination (a non-partial short page) is
+    # unaffected
+    seq2 = [
+        {"partial": True,
+         "rows": [{"row_idx": 0, "row": {}}]},
+        {"partial": False,
+         "rows": [{"row_idx": 1, "row": {}}]},
+    ]
+    calls2 = {"i": 0}
+
+    def fake_get2(url):
+        d = seq2[min(calls2["i"], len(seq2) - 1)]
+        calls2["i"] += 1
+        return d
+    monkeypatch.setattr(pin, "_get", fake_get2)
+    rows2 = pin.fetch_all_rows()
+    assert calls2["i"] == 2, calls2["i"]
+    assert [r["row_idx"] for r in rows2] == [0, 1]
+
+
