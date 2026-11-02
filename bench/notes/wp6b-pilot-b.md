@@ -1,7 +1,9 @@
 # WP6b Pilot B — live measurement record (issue #22)
 
-The 25-instance stratified pilot (all 12 Verified repos, 2 each; the 3
-largest capped at 3 — see `pilot_b_instances.json` + the
+The 25-instance stratified pilot (all 12 Verified repos, 1 each; the
+remaining 13 seats dealt round-robin in descending repo size, capped
+at each repo's split row count — in the pinned set: django 3, sympy
+3, nine repos 2, flask 1 — see `pilot_b_instances.json` + the
 `scripts/pin_pilot_b_instances.py` selection rule), sandbox mode, the
 Pilot-A checkpoint imported via `--import-run pilotA` (the
 never-rerun statuses reused verbatim, the retry-class `eval_error`

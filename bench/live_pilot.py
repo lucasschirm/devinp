@@ -544,6 +544,12 @@ def _copy_imported_artifacts(rec: dict, src_workdir: str,
             # default is this run's workdir): the artifact is
             # already in place (shutil.copyfile onto itself would
             # raise SameFileError)
+        if os.path.isfile(dst):
+            continue  # the idempotent fast path: the destination is
+            # already complete (the source run's files are
+            # immutable) — a crash between a line's fsync and its
+            # copy is healed by the source copy on the next
+            # invocation
         if os.path.isfile(src):
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             shutil.copyfile(src, dst)
@@ -563,9 +569,11 @@ def seed_import_lines(jsonl_path: str, imported: dict,
     resume never glues an import line onto a torn tail (which the
     next open would drop — a silent re-run of a never-rerun
     instance); the post-repair idempotency read then sees the clean
-    file. The referenced artifacts are copied from
-    ``src_workdir`` (the WP5 cross-check — see
-    :func:`_copy_imported_artifacts`). A mid-file corruption is a
+    file. The referenced artifacts are copied from ``src_workdir``
+    for **every** imported id on every invocation (the WP5
+    cross-check — see :func:`_copy_imported_artifacts` — idempotent
+    per file: a crash between a line's fsync and its artifact copy
+    self-heals on the next invocation). A mid-file corruption is a
     :class:`PilotConfigError` (exit 2, before any session). Returns
     the instance ids actually seeded."""
     if not imported:
@@ -601,16 +609,25 @@ def seed_import_lines(jsonl_path: str, imported: dict,
             continue
         rec = imported[iid]
         m = dict(rec.get("meta") or {})
-        m["imported_from"] = import_run
+        m["imported_from"] = import_run or "imported"
         line = {"instance_id": iid, "status": rec.get("status"),
                 "meta": m, "ts": rec.get("ts", time.time())}
         with open(jsonl_path, "a", encoding="utf-8", newline="") as f:
             f.write(json.dumps(line) + "\n")
             f.flush()
             os.fsync(f.fileno())
-        if src_workdir:
-            _copy_imported_artifacts(rec, src_workdir, dst_workdir)
         seeded.append(iid)
+    # the referenced-artifact copy for EVERY imported id (not just
+    # the newly seeded ones — a crash between a line's fsync and
+    # its artifact copy leaves a durable line with missing
+    # artifacts that every later resume skips; the idempotent
+    # per-file copy self-heals that on this invocation instead of
+    # leaving the WP5 cross-check to fail report_failed with no
+    # automated recovery)
+    if src_workdir:
+        for iid in sorted(imported):
+            _copy_imported_artifacts(imported[iid], src_workdir,
+                                    dst_workdir)
     return seeded
 
 
@@ -2785,15 +2802,20 @@ def _window_buckets(records: list) -> dict:
     resets the budget counters (a new window is a fresh budget), and
     continues the remaining queue in the same process, the 500-run
     model: one process spans days across windows). Imported lines
-    keep the source run's ``ts`` — they land in the source window,
-    never this run's daily budget. A run that spans one window
-    renders the verbatim WP6a item-12 text."""
+    are EXCLUDED from this run's accounting — a never-rerun reuse
+    burned no session of this run's budget; the source run
+    accounted for it (bucketing them by their source ``ts`` — e.g.
+    a same-UTC-day source — would fold the source run's sessions
+    into this run's window and falsely fail the gate). A run that
+    spans one window renders the verbatim WP6a item-12 text."""
     out: dict = {}
     for r in records:
         if not r.get("instance_id"):
             continue
         if r.get("status") == "preflight_failed":
             continue
+        if (r.get("meta") or {}).get("imported_from"):
+            continue  # the import — the source run's accounting
         ts = r.get("ts") or 0.0
         day = int(ts // 86400)
         w = out.setdefault(day, {"sessions": 0, "wall_s": 0.0})
@@ -3024,25 +3046,39 @@ def run_pilot(config: PilotConfig,
     interrupted_before = bool(state.get("interrupted"))
     aborted_before = bool(state.get("aborted"))
     resume_exercised_before = bool(state.get("resume_exercised"))
-    # the WP6b import re-derivation (issue #22 AC2): the documented
-    # multi-window flow drops --import-run on the continuation
-    # windows — but item 16 must still gate on the completing
-    # (verdict-producing) record, so the source lines are persisted
-    # in the state file by the importing invocation and re-derived
-    # here (filtered to the current instance file — a stale id is
-    # ignored, the load_imported semantics)
+    # the early import record (issue #22 AC2 — the mid-seed crash
+    # class): a host crash mid-seeding leaves only PART of the
+    # import in the checkpoint — a checkpoint re-derivation on the
+    # follow-up --resume would treat that subset as the complete
+    # import, and the unseeded never-rerun instances would re-run
+    # (a silent AC2 violation item 16 cannot see, its comparison
+    # set being the same truncated subset). Persisting the FULL
+    # import bookkeeping BEFORE the seeding makes the state source
+    # (the full set) take precedence on that resume — the missing
+    # lines re-seed (the idempotent seeding skips the present
+    # ones), and item 16's comparison set is the true source set
+    if imported and config.import_run:
+        state["imported"] = sorted(imported)
+        state["import_source"] = imported
+        state["imported_run"] = config.import_run
+        state["import_workdir"] = config.import_workdir
+        state["import_retry_class"] = {
+            k: v for k, v in sorted(import_retry.items())}
+        _write_state(workdir, run_id, state)
     # the WP6b import re-derivation (issue #22 AC2): the documented
     # multi-window flow drops --import-run on the continuation
     # windows — but item 16 must still gate on the completing
     # (verdict-producing) record. Two sources: the state file's
-    # ``import_source`` (persisted at the end of a finished
-    # invocation), or — when a graceful early exit (the pre-flight
-    # failure, the model-gate refusal, a load_checkpoint protocol
-    # error) leaves it unpersisted — the checkpoint's own seeded
-    # lines (they carry ``meta.imported_from`` + the original ``ts``;
-    # the source line is the line minus the marker). Both filtered
-    # to the current instance file (a stale id is ignored — the
-    # load_imported semantics)
+    # ``import_source`` (persisted by the early import record —
+    # BEFORE the seeding — so a mid-seed crash resume sees the FULL
+    # set; the end-of-run write repeats it), or — when a graceful
+    # early exit (the pre-flight failure, the model-gate refusal, a
+    # load_checkpoint protocol error) left no state — the
+    # checkpoint's own seeded lines (they carry
+    # ``meta.imported_from`` + the original ``ts``; the source line
+    # is the line minus the marker). Both filtered to the current
+    # instance file (a stale id is ignored — the load_imported
+    # semantics)
     if (not imported and config.resume):
         known = {i["instance_id"] for i in insts}
         if (state.get("imported")
@@ -3052,9 +3088,10 @@ def run_pilot(config: PilotConfig,
                         state["import_source"].items()
                         if iid in known}
             if imported:
+                label = state.get("imported_run") or "?"
                 print(f"[pilot] import re-derived from the state "
                       f"file ({len(imported)} line(s) from "
-                      f"{state.get('imported_run', '?')})")
+                      f"{label})")
         elif os.path.isfile(jsonl):
             try:
                 pre_recs, _ = rr.load_checkpoint(jsonl)
@@ -3071,17 +3108,33 @@ def run_pilot(config: PilotConfig,
             imported = {iid: line for iid, line in imported.items()
                        if iid in known}
             if imported:
-                label = state.get("imported_run", "?")
+                label = state.get("imported_run") or "?"
                 print(f"[pilot] import re-derived from the "
                       f"checkpoint's seeded lines ({len(imported)} "
                       f"line(s) from {label})")
     # the WP6b import seeding (issue #22 AC2) — BEFORE the resume
     # read: the imported (never-rerun) lines must be in the
-    # checkpoint when ``resume_queue`` decides what to skip
+    # checkpoint when ``resume_queue`` decides what to skip. The
+    # referenced-artifact copy runs for EVERY imported id (not just
+    # the newly seeded ones — a crash between a line's fsync and
+    # its artifact copy leaves a durable line with missing
+    # artifacts; the idempotent per-file copy self-heals that on
+    # the next invocation). The source workdir is the flag's, or
+    # the state file's on the continuation windows (the flag is
+    # dropped there; the state record persists it)
     if imported:
+        # the import marker: the flag's source run id, or the state
+        # record's on the continuation windows (the flag is dropped
+        # there) — a None marker would break the re-derivation +
+        # the window/calibration exclusion (they key on it)
+        marker = (config.import_run
+                 or state.get("imported_run")
+                 or "imported")
         seeded = seed_import_lines(
-            jsonl, imported, config.import_run,
-            src_workdir=config.import_workdir or workdir)
+            jsonl, imported, marker,
+            src_workdir=(config.import_workdir
+                        or state.get("import_workdir")
+                        or workdir))
         if seeded:
             label = (config.import_run
                     or state.get("imported_run")
@@ -3270,11 +3323,27 @@ def run_pilot(config: PilotConfig,
                            else ("run_failed" if run_failed
                                 else "done"))),
         "completed_this_invocation": rep_.done_count,
-        "imported_run": config.import_run,
-        "imported": sorted(imported),
-        "import_source": imported,
-        "import_workdir": config.import_workdir,
-        "import_retry_class": {k: v for k, v in sorted(import_retry.items())},
+        # the import bookkeeping: the current invocation's flag
+        # values, or — on a continuation window (the flag is
+        # dropped there; the source re-derived from this record) —
+        # the previous invocation's (without this, the end-of-run
+        # write nulls imported_run / import_workdir and the next
+        # window's seeding cannot self-heal the referenced
+        # artifacts from the source workdir)
+        "imported_run": (config.import_run
+                        if config.import_run
+                        else state.get("imported_run")),
+        "imported": sorted(imported) or state.get("imported", []),
+        "import_source": (imported
+                         or state.get("import_source", {})),
+        "import_workdir": (config.import_workdir
+                          if config.import_workdir
+                          else state.get("import_workdir")),
+        "import_retry_class": ({k: v
+                               for k, v in
+                               sorted(import_retry.items())}
+                              or state.get("import_retry_class",
+                                          {})),
         "ts": time.time(),
     })
     ckpt.close()
@@ -3295,8 +3364,13 @@ def run_pilot(config: PilotConfig,
     # the calibration + item 8/9 stats count ATTEMPTS (every line
     # with an instance id) — a superseded eval_error→rerun attempt
     # measured wall + tokens that must not drop out of the record
-    # (the same basis as the item-12 budget gate)
-    attempts = [r for r in records if r.get("instance_id")]
+    # (the same basis as the item-12 budget gate). Imported lines
+    # are EXCLUDED: they are the source run's sessions (never-rerun
+    # reuse — no session of this run spent), and folding their
+    # source-run wall/usage into this run's per-session stats would
+    # misstate the run the calibration measures
+    attempts = [r for r in records if r.get("instance_id")
+               and not (r.get("meta") or {}).get("imported_from")]
     cal = calibrate(attempts, config)
     meta = {
         "run_id": run_id,
