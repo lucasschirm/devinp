@@ -2422,11 +2422,13 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
                     if (r.get("meta") or {}).get(
                         "eval_error_root_cause")
                     not in ("env", "parser", "patch")]
+        unclassified_obs = (
+            f" — UNCLASSIFIED: "
+            + ", ".join(sorted(str(u) for u in unclassed))
+            if unclassed else "")
         obs17 = (f"{len(ee)} eval_error line(s), "
                 f"{len(ee) - len(unclassed)} classified"
-                + (f" — UNCLASSIFIED: {', '.join(sorted(
-                    str(u) for u in unclassed))}"
-                   if unclassed else ""))
+                + unclassified_obs)
         if ee:
             by_class: dict = {}
             for r in ee:
