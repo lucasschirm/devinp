@@ -4035,3 +4035,117 @@ def test_wp6b_round11_ref_path_schema_validation(tmp_path, live):
                                     "eval_log": "eval.log"}}) + "\n")
     imported, _ = lp.load_imported(cfg, str(wd2), insts)
     assert ids[0] in imported
+
+
+def test_wp6b_round12_null_meta_normalized(tmp_path, live):
+    """The round-12 Major fix (issue #22 AC2): a source line with
+    no meta key (or meta: null) previously crashed the _ref_path
+    schema loop (meta.get(k) on None — an uncaught AttributeError
+    that escaped run_pilot to main's generic handler, exit 4,
+    contradicting the fail-closed contract, and every --resume
+    re-hit the same crash). Now: a missing / null meta is
+    schema-conformant (all references absent) — normalized to {}
+    and imported without error."""
+    repos, inst = _two_pilot_b_repos(tmp_path)
+    ids = [e["instance_id"] for e in repos]
+    wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
+    wd1.mkdir()
+    src = wd1 / "run-src.jsonl"
+    cfg = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               host_check=False, pilot="b",
+               import_run="src", import_workdir=str(wd1))
+    insts = json.loads(Path(inst).read_text())["instances"]
+    for payload in ({"instance_id": ids[0], "status": "resolved",
+                    "ts": 1.0},
+                   {"instance_id": ids[1], "status": "resolved",
+                    "ts": 2.0, "meta": None}):
+        with open(src, "w") as f:
+            f.write(json.dumps(payload) + "\n")
+        imported, _ = lp.load_imported(cfg, str(wd2), insts)
+        assert payload["instance_id"] in imported
+        assert imported[payload["instance_id"]].get("meta") in (None, {})
+
+
+def test_wp6b_round12_zero_overlap_import_fail_closed(tmp_path, live):
+    """The round-12 Medium fix (issue #22 AC2): a --import-run
+    source that shares NO instance ids with the instance file
+    (an existing but unrelated run id — it passes every other
+    fail-closed check) previously produced an empty import: item
+    16 rendered n/a (non-gating) and the record could GO with
+    zero AC2 overlap evidence, indistinguishable from a
+    legitimate non-import run. Fail-closed: a config error
+    before any session. A source whose shared ids are all
+    retry-class still passes (the import re-runs them — item 16
+    renders the explicit vacuous state)."""
+    repos, inst = _two_pilot_b_repos(tmp_path)
+    ids = [e["instance_id"] for e in repos]
+    wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
+    wd1.mkdir()
+    src = wd1 / "run-src.jsonl"
+    cfg = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               host_check=False, pilot="b",
+               import_run="src", import_workdir=str(wd1))
+    insts = json.loads(Path(inst).read_text())["instances"]
+    # zero overlap (an unrelated id)
+    with open(src, "w") as f:
+        f.write(json.dumps({"instance_id": "other__repo-9999",
+                            "status": "resolved", "ts": 1.0})
+               + "\n")
+    try:
+        lp.load_imported(cfg, str(wd2), insts)
+    except lp.PilotConfigError:
+        pass
+    else:
+        raise AssertionError("a zero-overlap import was accepted")
+    # all shared ids retry-class: passes (the import re-runs them)
+    with open(src, "w") as f:
+        f.write(json.dumps({"instance_id": ids[0],
+                            "status": "eval_error", "ts": 1.0})
+               + "\n")
+    imported, retry = lp.load_imported(cfg, str(wd2), insts)
+    assert not imported and ids[0] in retry
+    # item 16 renders the explicit vacuous state (not a bare
+    # "n/a (no import)")
+    items = lp.build_checklist(
+        config=cfg, dry_run=False, gate=None, preflight_ok=None,
+        preflight_failures=[], records=[], skipped_on_resume={},
+        interrupted_this_run=None, resume_after_interrupt=False,
+        devin_ok=None, sessions_used=0, wall_budget_s=1.0,
+        wall_used_s=0.0, pilot_b=True, imported={},
+        import_attempted=True)
+    it16 = next(i for i in items if i["item"].startswith("16 "))
+    assert "import attempted — zero imported instances" in it16["observed"]
+    # and a legitimate non-import run renders the plain n/a
+    items2 = lp.build_checklist(
+        config=cfg, dry_run=False, gate=None, preflight_ok=None,
+        preflight_failures=[], records=[], skipped_on_resume={},
+        interrupted_this_run=None, resume_after_interrupt=False,
+        devin_ok=None, sessions_used=0, wall_budget_s=1.0,
+        wall_used_s=0.0, pilot_b=True, imported={},
+        import_attempted=False)
+    it16b = next(i for i in items2 if i["item"].startswith("16 "))
+    assert "n/a (no import" in it16b["observed"]
+
+
+def test_wp6b_round12_item12_wp5_sessions_annotation(tmp_path, live):
+    """The round-12 Medium fix (issue #22 AC2): the WP5 report's
+    'Sessions used (attempts)' counts every non-preflight_failed
+    line in the record (the WP5 record-level methodology — the
+    imported lines are part of the record), while this run's
+    budget arithmetic (item 12 / the calibrate basis) excludes
+    them. Item 12's observation now states the difference
+    explicitly when imports are present (the same record no
+    longer contradicts the WP5 report)."""
+    repos, inst = _two_pilot_b_repos(tmp_path)
+    cfg = _cfg(tmp_path, inst, host_check=False, pilot="b")
+    items = lp.build_checklist(
+        config=cfg, dry_run=False, gate=None, preflight_ok=None,
+        preflight_failures=[], records=[], skipped_on_resume={},
+        interrupted_this_run=None, resume_after_interrupt=False,
+        devin_ok=None, sessions_used=3, wall_budget_s=100.0,
+        wall_used_s=1.0, pilot_b=True,
+        imported={"a__r-1": {"instance_id": "a__r-1"}},
+        import_attempted=True, window_buckets=None)
+    it12 = next(i for i in items if i["item"].startswith("12 "))
+    assert "the WP5 report's sessions-used also counts the 1 " \
+        "imported line(s)" in it12["observed"], it12["observed"]

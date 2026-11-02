@@ -544,6 +544,19 @@ def load_imported(config: PilotConfig, workdir: str,
                 f"--import-run source line for {iid!r} carries a "
                 f"non-dict meta ({type(meta).__name__}) — a "
                 "corrupt source (fail-closed before any session)")
+        # the round-12 Major fix (issue #22 AC2): a missing / null
+        # meta is schema-conformant (all references absent) —
+        # normalize it to {} for the guards below. The old code let
+        # None reach the _ref_path schema loop — meta.get(k)
+        # crashed with an uncaught AttributeError that escaped
+        # run_pilot to main's generic handler (exit 4),
+        # contradicting this function's documented fail-closed
+        # contract (a corrupt source is a config error, exit 2,
+        # before any session) — and every --resume re-invoked
+        # load_imported and re-hit the same crash, the exact wedge
+        # class the meta / ts / ref guards were added to close
+        if meta is None:
+            meta = {}
         ts = rec.get("ts")
         # the WP5 ``date_range`` / ``_parse_ts`` contract (the
         # round-8 Medium fix, issue #22): a seeded line's ``ts`` is
@@ -633,6 +646,25 @@ def load_imported(config: PilotConfig, workdir: str,
             raise PilotConfigError(
                 f"--import-run source line for {iid!r} carries "
                 f"unknown status {status!r}")
+    # the zero-overlap fail-closed guard (the round-12 Medium fix,
+    # issue #22 AC2): a --import-run source that shares NO instance
+    # ids with this run's instance file (an existing but unrelated
+    # run id — it passes every other fail-closed check: the source
+    # exists, is readable, well-formed) previously produced an empty
+    # import: item 16 rendered n/a (non-gating) and the verdict-
+    # bearing record could GO with zero AC2 overlap evidence, with
+    # nothing in the record distinguishing it from a legitimate
+    # non-import run. Fail-closed: a config error before any
+    # session (a source / instance mismatch is an operator error —
+    # the wrong --import-run or the wrong --instances)
+    if (config.import_run and not imported
+            and not retry_class):
+        raise PilotConfigError(
+            f"--import-run {config.import_run!r} shared no "
+            "instance ids with this run's instance file — a "
+            "source / instance mismatch (fail-closed: a "
+            "zero-overlap import has no AC2 evidence and would "
+            "let the record GO with item 16 n/a)")
     return imported, retry_class
 
 
@@ -1130,8 +1162,14 @@ class SessionSpec:
     container: "Optional[str]" = None
     # the run's label for the eval-leg artifact names (issue #22 —
     # the WP4 artifacts are per-run; a pilot-B run must not label its
-    # artifacts ``pilotA-...``). The default keeps the WP6a form
-    # byte-identical
+    # artifacts ``pilotA-...``). The default is a fallback for a
+    # direct spec construction — run_pilot always passes
+    # run_id=config.run_id (the pilot's default run id is
+    # pilot-<timestamp>), so a pilot run's WP4 artifact / container
+    # labels are run_id-labelled by construction (the round-12
+    # comment fix: the old "the default keeps the WP6a form
+    # byte-identical" claim was stale — the default is dead code
+    # on the pilot path)
     run_id: str = "pilotA"
 
 
@@ -2319,6 +2357,7 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
                    pilot_b: bool = False,
                    stratified_repos: "Optional[list]" = None,
                    imported: "Optional[dict]" = None,
+                   import_attempted: bool = False,
                    repo_by_iid: "Optional[dict]" = None,
                    arithmetic_total: int = 3,
                    window_buckets: "Optional[dict]" = None) -> list:
@@ -2599,7 +2638,14 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
             n12 = sessions_used
             w12 = wall_used_s
         obs12 = (f"sessions (attempts, incl. reruns): {n12}; "
-                f"wall used: {w12:.1f}s")
+                f"wall used: {w12:.1f}s"
+                + (f" — the WP5 report's sessions-used also "
+                   f"counts the {len(imported or {})} imported "
+                   f"line(s) (the source run's sessions — the "
+                   f"WP5 record-level methodology); this run's "
+                   f"budget arithmetic (item 12 / the calibrate "
+                   f"basis) excludes them"
+                   if imported else ""))
         p12 = (n12 <= config.max_sessions_per_day
               and w12 <= wall_budget_s)
     add("12 within the calibrated budget",
@@ -2697,11 +2743,32 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
                 "; ".join(frag) or "no imported instances",
                 ok16)
         else:
-            add("16 2-run overlap/variance (WP6b AC2)",
-                "an ``--import-run`` source (the 3 Pilot A "
-                "instances)",
-                "n/a (no import — non-gating)",
-                None)
+            if import_attempted:
+                # the round-12 Medium fix (issue #22 AC2): an
+                # --import-run (this or an earlier window — the
+                # state re-derivation) was attempted but zero
+                # never-rerun instances were imported (the shared
+                # ids were all retry-class — the zero-id case is a
+                # fail-closed config error in load_imported). Item
+                # 16 renders the explicit vacuous state (the AC2
+                # overlap check is vacuous for an empty imported
+                # set; the retry-class re-runs are recorded
+                # separately) instead of a bare "n/a (no import)"
+                # indistinguishable from a legitimate non-import
+                # run
+                add("16 2-run overlap/variance (WP6b AC2)",
+                    "an ``--import-run`` source (the 3 Pilot A "
+                    "instances)",
+                    "n/a (import attempted — zero imported "
+                    "instances; the AC2 overlap check is vacuous; "
+                    "the retry-class re-runs are recorded)",
+                    None)
+            else:
+                add("16 2-run overlap/variance (WP6b AC2)",
+                    "an ``--import-run`` source (the 3 Pilot A "
+                    "instances)",
+                    "n/a (no import — non-gating)",
+                    None)
         # 17 — the root-caused eval_error (AC3)
         ee = [r for r in records if r.get("status") == "eval_error"]
         unclassed = [r.get("instance_id") for r in ee
@@ -3730,7 +3797,16 @@ def run_pilot(config: PilotConfig,
         wall_used_s=wall_used_s,
         pilot_b=config.pilot == "b",
         stratified_repos=_stratified_repos(config),
-        imported=imported, repo_by_iid=_repo_by_iid(insts),
+        imported=imported,
+        # the round-12 Medium fix (issue #22 AC2): item 16 must
+        # distinguish an attempted-but-zero-import from a
+        # legitimate non-import run — the attempt is this
+        # invocation's --import-run or an earlier window's
+        # (the state re-derivation)
+        import_attempted=(bool(config.import_run)
+                         or bool(state.get("imported_run")
+                                or state.get("import_source"))),
+        repo_by_iid=_repo_by_iid(insts),
         arithmetic_total=len(insts),
         window_buckets=buckets)
     # the pilot-B record sections (issue #22) — the per-repo
