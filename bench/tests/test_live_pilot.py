@@ -2283,6 +2283,12 @@ def test_item12_per_window_budget(tmp_path, monkeypatch):
 def test_dry_run_pilot_b_writes_17_skeleton(tmp_path, live):
     repos = _three_repos(tmp_path)
     inst = _instances_file(tmp_path / "inst.json", repos)
+    # the round-14 Medium fix (issue #22 AC1): a pilot-B run
+    # requires the instance file's _meta.stratified_repos — add
+    # it (the AC1 evidence is pilot B's definition)
+    doc = json.loads((tmp_path / "inst.json").read_text())
+    doc["_meta"]["stratified_repos"] = [r["repo"] for r in repos]
+    (tmp_path / "inst.json").write_text(json.dumps(doc))
     wd = tmp_path / "wd"
     # the round-13 Medium fix: a pilot-B dry run requires the
     # import (the AC2 evidence is pilot B's definition) — the
@@ -3834,6 +3840,12 @@ def test_wp6b_round9_interrupted_resume_record_item11(tmp_path, live):
     following resume invocation (the first branch)."""
     repos = _three_repos(tmp_path)
     inst = _instances_file(tmp_path / "inst.json", repos)
+    # the round-14 Medium fix (issue #22 AC1): a pilot-B run
+    # requires the instance file's _meta.stratified_repos — add
+    # it (the AC1 evidence is pilot B's definition)
+    doc = json.loads((tmp_path / "inst.json").read_text())
+    doc["_meta"]["stratified_repos"] = [r["repo"] for r in repos]
+    (tmp_path / "inst.json").write_text(json.dumps(doc))
     ids = [e["instance_id"] for e in repos]
     i0, i1, i2 = ids
     wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
@@ -4269,3 +4281,79 @@ def test_wp6b_round13_pilot_b_requires_import(tmp_path, live):
     assert _run(cfg3, _mock_make_session(
         {i0: "no_patch", i1: "no_patch", i2: "no_patch"})) \
         == lp.EXIT_OK
+
+
+def test_wp6b_round14_pilot_b_requires_stratified_meta(tmp_path, live):
+    """The round-14 Medium fix (issue #22 AC1): a --pilot b run
+    over an instances file without _meta.stratified_repos (e.g.
+    --instances pilot_instances.json --import-run pilotA — a valid
+    source with a meta-less instance file) rendered item 15 n/a
+    and could GO with zero AC1 stratification evidence — the same
+    under-evidenced-verdict hole _check_pilot_b_requirements was
+    added to close for item 16 (AC2). Fail-closed: a config
+    error before any session (pilot B is defined as the
+    stratified 12-repo set; a non-stratified instance file is
+    not the documented pilot B — run it as a pilot A)."""
+    repos = _three_repos(tmp_path)
+    # a META-LESS instance file (the bare list form)
+    inst = tmp_path / "bare.json"
+    inst.write_text(json.dumps(
+        [dict(r) for r in repos]))
+    wd = tmp_path / "wd"
+    # the source checkpoint (the AC2 requirement — so the AC1
+    # check is what fires)
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "run-src.jsonl").write_text(
+        json.dumps({"instance_id": repos[0]["instance_id"],
+                    "status": "resolved", "ts": 1.0}) + "\n")
+    cfg = _cfg(tmp_path, str(inst), run_id="pilotB",
+               workdir=str(wd), resume=True, host_check=False,
+               pilot="b", import_run="src",
+               import_workdir=str(src))
+    modes = {r["instance_id"]: "ok" for r in repos}
+    try:
+        _run(cfg, _mock_make_session(modes))
+    except lp.PilotConfigError:
+        pass
+    else:
+        raise AssertionError("a non-stratified pilot-B run was "
+                           "accepted")
+    # and the documented pilot-B file (the _two_pilot_b_repos
+    # helper carries the meta) still passes
+    repos2, inst2 = _two_pilot_b_repos(tmp_path)
+    i0, i1, i2 = [e["instance_id"] for e in repos2]
+    wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
+    modes2 = {i0: "no_patch", i1: "no_patch", i2: "ok"}
+    cfg1 = _cfg(tmp_path, inst2, run_id="src2", workdir=str(wd1),
+               host_check=False)
+    assert _run(cfg1, _mock_make_session(modes2)) == lp.EXIT_OK
+    cfg2 = _cfg(tmp_path, inst2, run_id="pilotB2", workdir=str(wd2),
+               resume=True, host_check=False, pilot="b",
+               import_run="src2", import_workdir=str(wd1))
+    assert _run(cfg2, _mock_make_session(modes2)) == lp.EXIT_OK
+
+
+def test_wp6b_round14_multi_window_obs12_annotation(tmp_path, live):
+    """The round-14 Minor fix (issue #22 AC4): the multi-window
+    item-12 observation omits the imported-lines annotation the
+    single-window branch prints, so the record no longer stated
+    why its session count differs from the WP5 report's (which
+    counts the imported lines). Both branches now carry it."""
+    cfg = lp.PilotConfig(pilot="b", max_wall_s=2700.0,
+                        import_run="src")
+    items = lp.build_checklist(
+        config=cfg, dry_run=False, gate=None, preflight_ok=None,
+        preflight_failures=[], records=[], skipped_on_resume={},
+        interrupted_this_run=None, resume_after_interrupt=False,
+        devin_ok=None, sessions_used=3, wall_budget_s=100.0,
+        wall_used_s=1.0, pilot_b=True,
+        imported={"a__r-1": {"instance_id": "a__r-1"}},
+        import_attempted=True,
+        window_buckets={19000: {"sessions": 2,
+                              "wall_s": 10.0},
+                        19001: {"sessions": 1,
+                               "wall_s": 5.0}})
+    it12 = next(i for i in items if i["item"].startswith("12 "))
+    assert "the WP5 report's sessions-used also counts the 1 " \
+        "imported line(s)" in it12["observed"], it12["observed"]

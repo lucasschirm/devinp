@@ -2639,7 +2639,17 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
             + f"; max per window: "
             f"{max(w['sessions'] for w in window_buckets.values())} "
             f"sessions, "
-            f"{max(w['wall_s'] for w in window_buckets.values()):.1f}s")
+            f"{max(w['wall_s'] for w in window_buckets.values()):.1f}s"
+            + (f" — the WP5 report's sessions-used also counts "
+               f"the {len(imported or {})} imported line(s) (the "
+               f"source run's sessions — the WP5 record-level "
+               f"methodology); this run's per-window budget "
+               f"arithmetic (item 12 / the calibrate basis) "
+               f"excludes them (the round-14 Minor fix: the "
+               f"annotation was missing on the multi-window "
+               f"branch, so the record no longer stated why its "
+               f"session count differs from the WP5 report's)"
+               if imported else ""))
         p12 = not over_s and not over_w
     else:
         # an EMPTY bucket view (a host crash before any line — no
@@ -3301,8 +3311,8 @@ def _usage_total(usage: object) -> "Optional[int]":
     return None
 
 
-def _check_pilot_b_import(config: PilotConfig, state: dict,
-                         imported: "Optional[dict]" = None) -> None:
+def _check_pilot_b_requirements(config: PilotConfig, state: dict,
+                               imported: "Optional[dict]" = None) -> None:
     """The round-13 Medium fix (issue #22 AC2): a pilot-B run
     requires the 2-run overlap evidence (AC2) — the ``--import-run``
     source (this or an earlier window — the state or checkpoint
@@ -3313,7 +3323,17 @@ def _check_pilot_b_import(config: PilotConfig, state: dict,
     source. Fail-closed: a config error before any session (pilot B
     is defined as reusing the Pilot A checkpoint — a no-import
     pilot-B run is not the documented pilot B; run it as a pilot
-    A)."""
+    A). The round-14 Medium fix (issue #22 AC1): a pilot-B run
+    also requires the AC1 stratification evidence — the instance
+    file's ``_meta.stratified_repos``. Without it, item 15 renders
+    n/a (non-gating) and the record could GO with zero AC1
+    stratification evidence — the same under-evidenced-verdict
+    hole left open for item 15 (e.g. ``--instances
+    pilot_instances.json --import-run pilotA`` — a valid source
+    with a meta-less instance file). Fail-closed: a config error
+    before any session (pilot B is defined as the stratified
+    12-repo set — a non-stratified instance file is not the
+    documented pilot B; run it as a pilot A)."""
     if (config.pilot == "b"
             and not config.import_run
             and not imported
@@ -3325,6 +3345,14 @@ def _check_pilot_b_import(config: PilotConfig, state: dict,
             "no-import pilot-B run would GO with item 16 n/a and "
             "zero AC2 evidence) — or a --resume on a workdir whose "
             "state carries the import bookkeeping")
+    if config.pilot == "b" and _stratified_repos(config) is None:
+        raise PilotConfigError(
+            "--pilot b requires the instance file's "
+            "_meta.stratified_repos (AC1 — the 12-repo "
+            "stratification is pilot B's definition; a "
+            "non-stratified instance file would GO with item 15 "
+            "n/a and zero AC1 evidence) — use --pilot a for a "
+            "non-stratified run")
 
 
 def run_pilot(config: PilotConfig,
@@ -3361,8 +3389,10 @@ def run_pilot(config: PilotConfig,
         # import requirement in the dry run too — the dry run
         # renders no verdict (all n/a), but fail-closed
         # consistency: a dry run that passes must be an invocation
-        # that would actually work
-        _check_pilot_b_import(config, _load_state(workdir, run_id))
+        # that would actually work (the round-14 AC1 stratification
+        # requirement too — the same check)
+        _check_pilot_b_requirements(config,
+                                   _load_state(workdir, run_id))
         cal = calibrate([], config)
         items = build_checklist(
             config=config, dry_run=True, gate=None, preflight_ok=None,
@@ -3487,8 +3517,9 @@ def run_pilot(config: PilotConfig,
     # the round-13 Medium fix (issue #22 AC2): the pilot-B import
     # requirement (this or an earlier window — the re-derivation
     # above satisfies it; a no-import pilot-B run is a config
-    # error before any session)
-    _check_pilot_b_import(config, state, imported)
+    # error before any session) + the round-14 Medium fix
+    # (issue #22 AC1): the stratification requirement
+    _check_pilot_b_requirements(config, state, imported)
     # the WP6b import seeding (issue #22 AC2) — BEFORE the resume
     # read: the imported (never-rerun) lines must be in the
     # checkpoint when ``resume_queue`` decides what to skip. The
