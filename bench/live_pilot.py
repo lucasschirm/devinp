@@ -3071,10 +3071,10 @@ def run_pilot(config: PilotConfig,
             imported = {iid: line for iid, line in imported.items()
                        if iid in known}
             if imported:
+                label = state.get("imported_run", "?")
                 print(f"[pilot] import re-derived from the "
                       f"checkpoint's seeded lines ({len(imported)} "
-                      f"line(s) from {state.get('imported_run',
-                                             '?')})")
+                      f"line(s) from {label})")
     # the WP6b import seeding (issue #22 AC2) — BEFORE the resume
     # read: the imported (never-rerun) lines must be in the
     # checkpoint when ``resume_queue`` decides what to skip
@@ -3083,10 +3083,12 @@ def run_pilot(config: PilotConfig,
             jsonl, imported, config.import_run,
             src_workdir=config.import_workdir or workdir)
         if seeded:
-            print(f"[pilot] imported {len(seeded)} instance line(s) "
-                  f"from {config.import_run or state.get(
-                      'imported_run') or 'state/checkpoint'} "
-                  f"(skipped — never re-run, no session spent)")
+            label = (config.import_run
+                    or state.get("imported_run")
+                    or "state/checkpoint")
+            print(f"[pilot] imported {len(seeded)} instance "
+                  f"line(s) from {label} (skipped — never re-run, "
+                  "no session spent)")
     skipped_on_resume: dict = {}
     to_run = [i["instance_id"] for i in insts]
     if os.path.isfile(jsonl):
