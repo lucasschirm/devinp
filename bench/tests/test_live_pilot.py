@@ -3902,3 +3902,136 @@ def test_wp6b_round10_rederivation_non_dict_meta(tmp_path, live):
     # class) — not a generic runner error
     st = json.loads((wd / "pilot-t.state.json").read_text())
     assert st["final_state"] == "report_failed", st
+
+
+def test_wp6b_round11_source_layout_normalization(tmp_path, live):
+    """The round-11 Blocker fix (issue #22 AC2): the pre-commit
+    Pilot-A run (2026-10-28 20:46-20:56 UTC — before commit
+    4259460) wrote meta.artifacts_dir = <iid> while its artifacts
+    lived under runs/<iid>/ — the import resolution (<src>/<iid>/)
+    found nothing, the copy no-opped, and the seeded durable lines
+    referenced paths that could never exist: the completing
+    invocation's rep.generate raised ArtifactCheckError
+    (report_failed, exit 4) and every --resume re-hit the same
+    wedge (the self-heal could never find the sources). The
+    normalization: if the line's references resolve MISSING under
+    its own artifacts_dir but ALL exist under runs/<ad>/ in the
+    source workdir (the current _artifact_dir layout), the
+    imported line's meta is rewritten to the current layout. A
+    normal-layout source is unchanged; a genuinely missing
+    reference is left as-is (the WP5 fail-loud semantics)."""
+    repos, inst = _two_pilot_b_repos(tmp_path)
+    ids = [e["instance_id"] for e in repos]
+    i0, i1, i2 = ids
+    wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
+    # the SOURCE workdir: artifacts under runs/<iid>/ (the current
+    # layout)
+    (wd1 / "runs" / i0).mkdir(parents=True)
+    (wd1 / "runs" / i0 / "patch.diff").write_text("p")
+    (wd1 / "runs" / i0 / "trajectory.jsonl").write_text("t")
+    (wd1 / "runs" / i0 / "eval.log").write_text("e")
+    (wd1 / "runs" / i1).mkdir(parents=True)
+    (wd1 / "runs" / i1 / "patch.diff").write_text("p")
+    (wd1 / "runs" / i1 / "trajectory.jsonl").write_text("t")
+    (wd1 / "runs" / i1 / "eval.log").write_text("e")
+    # the source checkpoint: OLD layout (artifacts_dir = <iid>)
+    src = wd1 / "run-src.jsonl"
+    with open(src, "w") as f:
+        f.write(json.dumps({"instance_id": i0, "status": "no_patch",
+                            "ts": 1.0,
+                            "meta": {"artifacts_dir": i0,
+                                    "patch_diff": "patch.diff",
+                                    "trajectory": "trajectory.jsonl",
+                                    "eval_log": "eval.log"}}) + "\n")
+        f.write(json.dumps({"instance_id": i1, "status": "resolved",
+                            "ts": 2.0,
+                            "meta": {"artifacts_dir": "runs/" + i1,
+                                    "patch_diff": "patch.diff",
+                                    "trajectory": "trajectory.jsonl",
+                                    "eval_log": "eval.log"}}) + "\n")
+    cfg = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               host_check=False, pilot="b",
+               import_run="src", import_workdir=str(wd1))
+    insts = json.loads(Path(inst).read_text())["instances"]
+    imported, _ = lp.load_imported(cfg, str(wd2), insts)
+    # the OLD-layout line is normalized (the AC2 copy can now find
+    # the sources — the cross-check holds)
+    m0 = imported[i0]["meta"]
+    assert m0["artifacts_dir"] == "runs/" + i0, m0
+    # the NORMAL-layout line is unchanged
+    m1 = imported[i1]["meta"]
+    assert m1["artifacts_dir"] == "runs/" + i1, m1
+    # the seeded line carries the normalized meta + the copy lands
+    lp.seed_import_lines(str(wd2 / "run-pilotB.jsonl"), imported,
+                        "src", str(wd1))
+    lines = _read_jsonl(wd2 / "run-pilotB.jsonl")
+    by = {l["instance_id"]: l for l in lines}
+    assert by[i0]["meta"]["artifacts_dir"] == "runs/" + i0
+    # the referenced artifacts were COPIED (the cross-check holds)
+    assert (wd2 / "runs" / i0 / "patch.diff").is_file()
+    assert (wd2 / "runs" / i0 / "trajectory.jsonl").is_file()
+    assert (wd2 / "runs" / i0 / "eval.log").is_file()
+    # a genuinely missing reference is LEFT AS-IS (the WP5
+    # fail-loud semantics — the cross-check flags it)
+    (wd1 / "runs" / i2).mkdir(parents=True)
+    src2 = wd1 / "run-src2.jsonl"
+    with open(src2, "w") as f:
+        f.write(json.dumps({"instance_id": i2, "status": "resolved",
+                            "ts": 3.0,
+                            "meta": {"artifacts_dir": i2,
+                                    "patch_diff": "missing.diff",
+                                    "trajectory": "missing.jsonl",
+                                    "eval_log": "missing.log"}})
+               + "\n")
+    cfg2 = _cfg(tmp_path, inst, run_id="pilotB2",
+                workdir=str(tmp_path / "wd3"), host_check=False,
+                pilot="b", import_run="src2",
+                import_workdir=str(wd1))
+    imported2, _ = lp.load_imported(cfg2, str(tmp_path / "wd3"),
+                                   insts)
+    assert imported2[i2]["meta"]["artifacts_dir"] == i2  # unchanged
+
+
+def test_wp6b_round11_ref_path_schema_validation(tmp_path, live):
+    """The round-11 Medium fix (issue #22 AC2): the fail-closed
+    source-line validation covers the WP5 _ref_path schema — a
+    non-string non-null meta.artifacts_dir / patch_diff /
+    trajectory / eval_log seeds verbatim and crosscheck raises
+    ReportProtocolError → report_failed (the same durable-line
+    wedge class the meta/ts guards were added to close).
+    Fail-closed instead: a config error before any session."""
+    repos, inst = _two_pilot_b_repos(tmp_path)
+    ids = [e["instance_id"] for e in repos]
+    wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
+    wd1.mkdir()
+    src = wd1 / "run-src.jsonl"
+    cfg = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               host_check=False, pilot="b",
+               import_run="src", import_workdir=str(wd1))
+    insts = json.loads(Path(inst).read_text())["instances"]
+    for key, bad in (("artifacts_dir", 123),
+                     ("artifacts_dir", ""),
+                     ("patch_diff", {}),
+                     ("trajectory", ["t"]),
+                     ("eval_log", 5)):
+        with open(src, "w") as f:
+            f.write(json.dumps({"instance_id": ids[0],
+                                "status": "resolved", "ts": 1.0,
+                                "meta": {key: bad}}) + "\n")
+        try:
+            lp.load_imported(cfg, str(wd2), insts)
+        except lp.PilotConfigError:
+            pass
+        else:
+            raise AssertionError(f"{key}={bad!r} was accepted")
+    # a conforming reference (non-empty strings / null) still
+    # passes
+    with open(src, "w") as f:
+        f.write(json.dumps({"instance_id": ids[0],
+                            "status": "resolved", "ts": 1.0,
+                            "meta": {"artifacts_dir": "runs/x",
+                                    "patch_diff": "patch.diff",
+                                    "trajectory": None,
+                                    "eval_log": "eval.log"}}) + "\n")
+    imported, _ = lp.load_imported(cfg, str(wd2), insts)
+    assert ids[0] in imported

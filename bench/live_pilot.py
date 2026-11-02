@@ -569,6 +569,59 @@ def load_imported(config: PilotConfig, workdir: str,
                     "before any session; a seeded non-finite / "
                     "non-positive / bool / null ts would wedge "
                     "every later --resume in report_failed)")
+        # the WP5 ``_ref_path`` schema (the round-11 Medium fix,
+        # issue #22 AC2): a non-string non-null reference (or a
+        # non-string non-null artifacts_dir) seeds verbatim and
+        # crosscheck raises ReportProtocolError → report_failed —
+        # the same durable-line wedge class the meta / ts guards
+        # close. Fail-closed: every reference key must be a
+        # non-empty string or null (the _ref_path contract)
+        for k in ("artifacts_dir", "patch_diff", "trajectory",
+                  "eval_log"):
+            v = meta.get(k)
+            if v is not None and not (isinstance(v, str) and v):
+                raise PilotConfigError(
+                    f"--import-run source line for {iid!r} carries "
+                    f"a {k} the WP5 _ref_path contract rejects "
+                    f"({v!r}) — a corrupt source (fail-closed "
+                    "before any session; a seeded non-string "
+                    "reference would wedge every later --resume "
+                    "in report_failed)")
+        # the SOURCE-ARTIFACT LAYOUT normalization (the round-11
+        # Blocker fix, issue #22 AC2): the pre-commit Pilot-A run
+        # (2026-10-28 20:46–20:56 UTC — before commit 4259460)
+        # wrote ``meta.artifacts_dir = <iid>`` while its artifacts
+        # lived under ``runs/<iid>/`` — the import resolution
+        # (``<src>/<iid>/...``) finds nothing, the copy no-ops,
+        # and the seeded durable lines reference paths that can
+        # NEVER exist: the completing invocation's ``rep.generate``
+        # raises ArtifactCheckError (report_failed, exit 4) and
+        # every --resume re-hits the same wedge (the self-heal
+        # can never find the sources — the AC2 claim "the
+        # referenced artifacts are copied so this run's WP5
+        # cross-check holds" was false on the real pair). The
+        # normalization: if the line's references resolve MISSING
+        # under its own (relative) artifacts_dir but ALL exist
+        # under ``runs/<artifacts_dir>/`` in the source workdir
+        # (the current harness' ``_artifact_dir`` layout), rewrite
+        # the imported line's meta to the current layout. Item 16's
+        # faithfulness is unaffected (it reads status / wall /
+        # tokens / patch_bytes from the meta — all preserved).
+        refs = [meta.get(k) for k in ("patch_diff", "trajectory",
+                                     "eval_log")
+                if isinstance(meta.get(k), str) and meta.get(k)
+                and not os.path.isabs(meta.get(k))]
+        ad = meta.get("artifacts_dir")
+        if (isinstance(ad, str) and ad and not os.path.isabs(ad)
+                and refs):
+            base = os.path.join(os.path.dirname(src) or ".", ad)
+            if any(not os.path.isfile(os.path.join(base, r))
+                   for r in refs):
+                alt_base = os.path.join(
+                    os.path.dirname(src) or ".", "runs", ad)
+                if all(os.path.isfile(os.path.join(alt_base, r))
+                       for r in refs):
+                    meta["artifacts_dir"] = "runs/" + ad
         status = rec.get("status")
         if status in rr.NEVER_RERUN_STATUSES:
             imported[iid] = rec

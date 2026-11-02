@@ -135,10 +135,12 @@ pilot-B run): PASS ⟺ every `eval_error` line carries a class.
 
 The existing `--interrupt-after N` (the WP6a AC3 path) is the
 mechanism; Pilot B exercises it **mid-batch** (`--interrupt-after 8`
-on the 23-to-run queue — 2 imports + 22 new, of which the `requests`
-retry is queued first by the resume order… the interrupt counts
-**completed instances**, not sessions, so N is relative to the
-invocation's completions). The follow-up `--resume` goes through
+on the 23-to-run queue — 2 imports + 22 new; in the pinned file's
+order `psf__requests-1142` (the `requests` retry) is the 21st of the
+23 to-run instances — the resume order follows the instance file, so
+the django seats run first. The interrupt counts **completed
+instances**, not sessions, so N is relative to the invocation's
+completions). The follow-up `--resume` goes through
 `resume_queue`: finished instances (the never-rerun class, imported or
 not) are skipped, the rest run. Checklist item 11 (gating, the
 existing WP6a item) covers the skip / no-duplicates / session
@@ -177,11 +179,14 @@ is bash-blocked from `devin` — the WP6a pattern).
 * `load_instances_meta(path)` (new helper; `load_instances`' signature
   is unchanged — the WP6a tests hold).
 * `run_pilot`: the import load + fail-closed validation + the
-  idempotent checkpoint seeding (the lines are raw-written with the
-  source `ts` before the `JsonlCheckpoint` opens — the write-side
-  repair passes well-formed lines through untouched); the per-window
-  item-12 accounting; the pilot-B record sections; the state file
-  gains `imported_run` / `imported` / `import_retry_class`.
+  idempotent checkpoint seeding (the `JsonlCheckpoint` open — the
+  torn-tail write-side repair — runs **before** the import lines
+  are raw-written with the source `ts`; the post-repair
+  idempotency read then sees the clean file, and a mid-file
+  corruption is a `PilotConfigError` — exit 2, before any
+  session); the per-window item-12 accounting; the pilot-B record
+  sections; the state file gains `imported_run` / `imported` /
+  `import_retry_class`.
 * `PilotSession.run` / `_host_check` / `_eval_container`: the
   `eval_error_root_cause` recording (the table above).
 * `build_checklist`: items **15** (stratification — PASS ⟺ every repo
