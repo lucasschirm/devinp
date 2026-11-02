@@ -289,6 +289,19 @@ class PilotConfig:
                     "--import-run must be a run id of the SWE-bench "
                     "id charset [A-Za-z0-9][A-Za-z0-9._-]* without "
                     f"'..' (got {self.import_run!r})")
+        # the run id (the --run-id flag) is joined into the checkpoint
+        # / state filenames (run-<id>.jsonl / pilot-<id>.state.json)
+        # and reaches ev.evaluate (a non-conforming id would degrade
+        # to a per-instance eval_error instead of a fail-closed
+        # config error) — the same charset as --import-run
+        if self.run_id is not None:
+            if (".." in self.run_id
+                    or _RUN_ID_CHARSET.fullmatch(self.run_id)
+                    is None):
+                raise PilotConfigError(
+                    "--run-id must be a run id of the SWE-bench id "
+                    "charset [A-Za-z0-9][A-Za-z0-9._-]* without "
+                    f"'..' (got {self.run_id!r})")
         # the pairing (fail-closed): --import-workdir is meaningless
         # without --import-run; --import-run is the pilot-B import
         # (checklist items 15–17 verify it — they never render
@@ -3413,12 +3426,29 @@ def run_pilot(config: PilotConfig,
             "final_state": "report_failed",
             "report_error": "the WP5 report pipeline failed",
             "completed_this_invocation": rep_.done_count,
-            "imported_run": config.import_run,
-            "imported": sorted(imported),
-            "import_source": imported,
-            "import_workdir": config.import_workdir,
-            "import_retry_class": {k: v
-                                  for k, v in sorted(import_retry.items())},
+            # the import bookkeeping: the same preserve-on-
+            # continuation fallback as the main write (a report
+            # failure on the documented no-flag continuation window
+            # must not null the import fields — the next resume's
+            # artifact self-heal resolves the source workdir from
+            # them; without the fallback a missing referenced
+            # artifact — a plausible cause of the report failure
+            # itself — could never be self-healed and every
+            # subsequent resume would stay wedged in report_failed)
+            "imported_run": (config.import_run
+                            if config.import_run
+                            else state.get("imported_run")),
+            "imported": sorted(imported) or state.get("imported", []),
+            "import_source": (imported
+                             or state.get("import_source", {})),
+            "import_workdir": (config.import_workdir
+                              if config.import_workdir
+                              else state.get("import_workdir")),
+            "import_retry_class": ({k: v
+                                   for k, v in
+                                   sorted(import_retry.items())}
+                                  or state.get("import_retry_class",
+                                              {})),
             "ts": time.time(),
         })
         _remove_stale_record(workdir)
@@ -3524,12 +3554,18 @@ def _build_parser() -> argparse.ArgumentParser:
                         "instance, 12-repo stratified pilot; the "
                         "default workdir/record naming follows)")
     p.add_argument("--import-run", default=None,
-                   help="the WP6b checkpoint import: the source run's "
-                        "id (issue #22 AC2 — the 3 Pilot A instances "
-                        "are reused inside the 25, never re-run; "
-                        "a pilot-B flag, verified by items 15–17; "
-                        "the run id charset "
-                        "[A-Za-z0-9][A-Za-z0-9._-]*)")
+               help="the WP6b checkpoint import: the source run's "
+                    "id (issue #22 AC2 — the 3 Pilot A instances "
+                    "are reused inside the 25, never re-run; "
+                    "a pilot-B flag, verified by items 15–17; "
+                    "the run id charset "
+                    "[A-Za-z0-9][A-Za-z0-9._-]*). The first "
+                    "import window must also pass --resume: the "
+                    "import seeds this run's checkpoint, and a "
+                    "non-resume invocation with an existing "
+                    "checkpoint is rejected (exit 2) — the "
+                    "imported lines are the expected contents, "
+                    "not a silent re-run")
     p.add_argument("--import-workdir", default=None,
                    help="the source run's workdir (default: this "
                         "run's workdir; requires --import-run)")

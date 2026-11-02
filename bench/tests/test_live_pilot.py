@@ -3179,3 +3179,134 @@ def test_wp6b_round3_calibrate_excludes_imported(tmp_path, live):
     assert cal["median_session_wall_s"] < 1.0  # the mock's wall —
     # NOT the imported 300 s source wall (an inclusion bug would
     # fold it into the median/mean)
+
+
+def test_wp6b_round4_report_failed_state_preserves_import(
+        tmp_path, live, monkeypatch):
+    """The round-4 Major fix (issue #22 AC2): the report_failed
+    state write uses the same preserve-on-continuation fallback as
+    the main write — a WP5 report failure on the documented
+    no-flag continuation window must not null the import
+    bookkeeping (the next resume's artifact self-heal resolves the
+    source workdir from them; without the fallback a missing
+    referenced artifact could never be self-healed and every
+    subsequent resume stayed wedged in report_failed)."""
+    repos, inst = _two_pilot_b_repos(tmp_path)
+    ids = [e["instance_id"] for e in repos]
+    i0, i1, i2 = ids
+    wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
+    modes = {i0: "no_patch", i1: "no_patch", i2: "ok"}
+    cfg1 = _cfg(tmp_path, inst, run_id="src", workdir=str(wd1),
+               host_check=False)
+    assert _run(cfg1, _mock_make_session(modes)) == lp.EXIT_OK
+    # the import window: the artifact copy is LOST (a simulated
+    # crash between the fsync and the copy) — the durable imported
+    # lines reference a trajectory that is missing in wd2, so the
+    # WP5 cross-check fails the report (exit 4, report_failed)
+    toggle = {"skip": True}
+    real_copy = lp._copy_imported_artifacts
+
+    def _copy_gate(rec, s, d):
+        if toggle["skip"]:
+            return
+        real_copy(rec, s, d)
+
+    monkeypatch.setattr(lp, "_copy_imported_artifacts", _copy_gate)
+    cfg2 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               resume=True, host_check=False, pilot="b",
+               import_run="src", import_workdir=str(wd1))
+    assert _run(cfg2, _mock_make_session(modes)) == lp.EXIT_RUN_FAILED
+    # the report_failed state write preserved the import
+    # bookkeeping (the flag's values here — and, on the no-flag
+    # continuation below, the previous invocation's)
+    st = json.loads((wd2 / "pilot-pilotB.state.json").read_text())
+    assert st["final_state"] == "report_failed", st
+    assert st["imported_run"] == "src", st
+    assert st["import_workdir"] == str(wd1), st
+    assert st["import_source"], st
+    # the continuation window (NO --import-run) — the report fails
+    # again (the artifact is still missing), and the state write
+    # must PRESERVE the bookkeeping (the flag values are None here)
+    toggle["skip"] = True
+    cfg3 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               resume=True, host_check=False, pilot="b")
+    assert _run(cfg3, _mock_make_session(
+        {i0: "no_patch", i1: "no_patch", i2: "no_patch"})) \
+        == lp.EXIT_RUN_FAILED
+    st3 = json.loads((wd2 / "pilot-pilotB.state.json").read_text())
+    assert st3["final_state"] == "report_failed", st3
+    assert st3["imported_run"] == "src", st3
+    assert st3["import_workdir"] == str(wd1), st3
+    assert st3["import_source"], st3
+    # the self-heal: the copy is restored — the next resume heals
+    # the missing artifact and the report completes (exit 0)
+    toggle["skip"] = False
+    cfg4 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               resume=True, host_check=False, pilot="b")
+    assert _run(cfg4, _mock_make_session(
+        {i0: "no_patch", i1: "no_patch", i2: "no_patch"})) \
+        == lp.EXIT_OK
+    assert ((wd2 / "runs" / i0 / "trajectory.jsonl").is_file())
+
+
+def test_wp6b_round4_first_import_window_requires_resume(tmp_path,
+                                                       live):
+    """The round-4 Minor fix (the documented contract): a first
+    `--import-run` invocation on a fresh workdir WITHOUT --resume
+    seeds the checkpoint and then is rejected (exit 2) by the
+    'a checkpoint exists — pass --resume' guard — the import
+    creates the very file the guard trips on. The seeded lines
+    survive (the operator's --resume re-invocation is the
+    documented window-1 continuation)."""
+    repos, inst = _two_pilot_b_repos(tmp_path)
+    ids = [e["instance_id"] for e in repos]
+    i0, i1, i2 = ids
+    wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
+    modes = {i0: "no_patch", i1: "no_patch", i2: "ok"}
+    cfg1 = _cfg(tmp_path, inst, run_id="src", workdir=str(wd1),
+               host_check=False)
+    assert _run(cfg1, _mock_make_session(modes)) == lp.EXIT_OK
+    # the first import window WITHOUT --resume: exit 2 (the guard)
+    cfg2 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               host_check=False, pilot="b",
+               import_run="src", import_workdir=str(wd1))
+    assert _run(cfg2, _mock_make_session(modes)) == 2
+    # the seeded lines survive the rejection (the documented
+    # --resume re-invocation picks them up — no re-seed needed)
+    lines = _read_jsonl(wd2 / "run-pilotB.jsonl")
+    seeded = [l for l in lines if l.get("instance_id")]
+    assert {l["instance_id"] for l in seeded} == {i0, i1}
+    assert all(l["meta"].get("imported_from") == "src"
+               for l in seeded)
+    # the --resume re-invocation completes (the window-1 flow)
+    cfg3 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               resume=True, host_check=False, pilot="b",
+               import_run="src", import_workdir=str(wd1))
+    assert _run(cfg3, _mock_make_session(modes)) == lp.EXIT_OK
+    lines3 = _read_jsonl(wd2 / "run-pilotB.jsonl")
+    assert sum(1 for l in lines3 if l["instance_id"] == i0) == 1
+    assert sum(1 for l in lines3 if l["instance_id"] == i1) == 1
+
+
+def test_wp6b_round4_run_id_charset_validation(tmp_path):
+    """The round-4 Minor fix: --run-id has the same charset
+    validation as --import-run (fail-closed config error — the id
+    is joined into the checkpoint / state filenames and reaches
+    ev.evaluate, where a non-conforming id would degrade to a
+    per-instance eval_error instead of a fail-closed config
+    error)."""
+    for bad in ("../evil", "a..b", "-lead", "sp ace",
+               "semi;colon", "slash/ed"):
+        try:
+            lp.PilotConfig(mode="sandbox", run_id=bad,
+                          instances_file="x.json")
+        except lp.PilotConfigError:
+            pass
+        else:
+            raise AssertionError(f"run_id {bad!r} was accepted")
+    for good in ("pilotA", "pilotB", "a.b-c_1", "x"):
+        lp.PilotConfig(mode="sandbox", run_id=good,
+                      instances_file="x.json")
+    # a generated id (run_id=None) is unaffected
+    lp.PilotConfig(mode="sandbox", run_id=None,
+                  instances_file="x.json")

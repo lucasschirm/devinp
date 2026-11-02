@@ -155,10 +155,14 @@ is unchanged).
 The operational plan (the calibrated budget: 10 sessions/day, the WP6a
 conservative number; 23 to-run ⇒ 3 windows): window 1: invocation 1
 `--interrupt-after 8` (the mid-batch interrupt — 8 sessions) +
-invocation 2 `--resume` (2 more, the window-1 cap); window 2:
-invocation 3 `--resume` (10); window 3: invocation 4 `--resume` (3).
-Each invocation is delegated (the operator session is bash-blocked
-from `devin` — the WP6a pattern).
+invocation 2 `--resume` — ONE continuation invocation that spans the
+remaining windows in-process (the WP3 Runner's default sleeper: at
+the per-process daily cap it sleeps to the next UTC-midnight window,
+resets the budget, and continues the queue in the same process — no
+per-window re-invocation; a dead process is the resume class, and a
+host-crash mid-window is re-invoked with `--resume` in the same or
+a later window). Each invocation is delegated (the operator session
+is bash-blocked from `devin` — the WP6a pattern).
 
 ## Harness changes (`bench/live_pilot.py`)
 
