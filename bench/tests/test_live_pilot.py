@@ -39,6 +39,30 @@ Acceptance mapping (issue #21, PLAN-WP6A.md):
   network)
 * the sandbox hygiene (the leak guard + the ephemeral XDG + the env
   hygiene, PLAN §3.2–§3.6) → :func:`test_prepare_sandbox_instance`
+* WP6b (issue #22, PLAN-WP6B.md) — the ``--import-run`` checkpoint
+  import: the never-rerun statuses are imported verbatim (the
+  original timestamp preserved, no session spent), the retry-class
+  status is re-run per pass@1, the idempotent seeding (a repeat
+  ``--resume`` never duplicates an import line), the referenced
+  artifacts are copied so this run's WP5 cross-check holds, the
+  fail-closed source validation (a missing / corrupt source is a
+  config error before the pre-flight) →
+  :func:`test_import_run_reuses_never_rerun_and_reruns_retry`,
+  :func:`test_import_run_source_missing_is_config_error`
+* the checklist items 15 (stratification, AC1), 16 (the 2-run
+  overlap/variance — the import's terminal vs the final — AC2), 17
+  (every ``eval_error`` root-caused to env / parser / patch — AC3),
+  12 (the per-UTC-window budget gate — AC4; a single-window run
+  renders the verbatim WP6a text) →
+  :func:`test_item15_stratification_gates`,
+  :func:`test_item16_overlap_variance_gates`,
+  :func:`test_item17_root_cause_gates`,
+  :func:`test_item12_per_window_budget`
+* the root-cause taxonomy (the host-check failure points →
+  env / parser / patch; the WP4 typed errors; the oversize-patch
+  cap) → :func:`test_host_check_root_cause_classes`,
+  :func:`test_container_eval_error_root_cause`,
+  :func:`test_oversize_patch_root_cause_is_patch`
 """
 
 from __future__ import annotations
@@ -47,6 +71,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -2063,3 +2088,475 @@ def test_host_check_flag_rejected_in_container_mode(tmp_path):
     # the default (None) stays valid in both modes
     assert lp.PilotConfig(mode="container").host_check is False
     assert lp.PilotConfig(mode="sandbox").host_check is True
+
+
+# ---------------------------------------------------------------------------
+# WP6b (issue #22) — the import / reuse, the stratification, the
+# root-caused eval_error, the per-window budget (zero quota, mock-
+# driven + the checklist math direct)
+# ---------------------------------------------------------------------------
+
+def _rec(iid, status, **meta):
+    """A minimal deduped checkpoint record (the checklist input shape)."""
+    m = {"wall": {"session_s": 60.0},
+         "permissions": {"requests": 1, "allowed": 1, "denied": 0},
+         "vendor_notifications": 0, "orphan_check": True,
+         "pruning": {"removed": [], "failed": []},
+         "leak_guard": {"remotes_after": [], "warnings": []},
+         "leak_verify": {"remotes": [], "tags": [], "clean": True}}
+    m.update(meta)
+    return {"instance_id": iid, "status": status, "meta": m}
+
+
+def _cb(**over):
+    """A pilot-B checklist build (the WP6a setup + the pilot-B params)."""
+    base = dict(
+        config=lp.PilotConfig(pilot="b", max_wall_s=2700.0),
+        dry_run=False,
+        gate={"allowed": True, "cost_tier": "Free", "reason": None},
+        preflight_ok=True,
+        preflight_failures=[],
+        records=[
+            {"instance_id": "a", "status": "resolved", "meta": {
+                "wall": {"session_s": 60.0},
+                "usage": {"totalTokens": 100},
+                "permissions": {"requests": 1, "allowed": 1,
+                               "denied": 0},
+                "vendor_notifications": 2, "orphan_check": True,
+                "graded_by": "host_check(pytest -rA)",
+                "patch_diff": "patch.diff",
+                "pruning": {"removed": ["agent checkout"],
+                           "failed": []},
+                "leak_guard": {"remotes_after": [], "warnings": []},
+                "leak_verify": {"remotes": [], "tags": [],
+                               "clean": True}}},
+        ],
+        skipped_on_resume={},
+        interrupted_this_run=None,
+        resume_after_interrupt=False,
+        devin_ok=True,
+        sessions_used=1,
+        wall_budget_s=2700.0 * 10,
+        wall_used_s=60.0,
+        pilot_b=True,
+        stratified_repos=["test/repo0"],
+        imported=None,
+        repo_by_iid={"a": "test/repo0"},
+        arithmetic_total=1,
+    )
+    base.update(over)
+    return lp.build_checklist(**base)
+
+
+def _item(items, num):
+    return [i for i in items if i["item"].split(" ", 1)[0] == num][0]
+
+
+def test_item15_stratification_gates(tmp_path, monkeypatch):
+    """AC1 — every repo in the instance file's ``stratified_repos``
+    meta must have a final line."""
+    monkeypatch.setenv(lp.LIVE_ENV, "1")
+    repos = [f"test/repo{i}" for i in range(3)]
+    recs = [_rec(f"r{i}", "resolved") for i in range(3)]
+    items = _cb(records=recs, stratified_repos=repos,
+               repo_by_iid={f"r{i}": f"test/repo{i}" for i in range(3)},
+               sessions_used=3, wall_used_s=180.0)
+    assert _item(items, "15")["pass"] is True
+    # one repo missing from the finals -> NO-GO (15 gates for a
+    # pilot-B run)
+    items = _cb(records=recs[:2], stratified_repos=repos,
+               repo_by_iid={f"r{i}": f"test/repo{i}" for i in range(3)},
+               sessions_used=2, wall_used_s=120.0)
+    assert _item(items, "15")["pass"] is False
+    verdict, failed = lp._verdict(items,
+                                  gating=lp._pilot_gating(
+                                      lp.PilotConfig(pilot="b")))
+    assert verdict == "NO-GO"
+    assert any(f.split(" ", 1)[0] == "15" for f in failed)
+    # a meta-less file -> n/a (non-gating)
+    items = _cb(stratified_repos=None)
+    assert _item(items, "15")["pass"] is None
+
+
+def test_item16_overlap_variance_gates(tmp_path, monkeypatch):
+    """AC2 — the source line and the final line must agree (status /
+    session wall / tokens / patch bytes); a re-run of an imported
+    instance supersedes the seeded line with a divergent final."""
+    monkeypatch.setenv(lp.LIVE_ENV, "1")
+    src = {"instance_id": "a", "status": "resolved",
+           "meta": {"wall": {"session_s": 60.0},
+                   "usage": {"totalTokens": 100}}}
+    # the GO case needs item 11 to pass too (the resume pair)
+    items = _cb(imported={"a": src},
+               config=lp.PilotConfig(pilot="b", max_wall_s=2700.0,
+                                   resume=True),
+               resume_after_interrupt=True,
+               skipped_on_resume={"a": "no_patch"})
+    assert _item(items, "16")["pass"] is True
+    verdict, failed = lp._verdict(items,
+                                 gating=lp._pilot_gating(
+                                     lp.PilotConfig(pilot="b")))
+    assert verdict == "GO"
+    # a divergent final (a re-run superseded the import — a pass@1
+    # violation) -> item 16 FAIL -> NO-GO
+    items = _cb(imported={"a": src}, records=[
+        _rec("a", "resolved", wall={"session_s": 99.0})])
+    assert _item(items, "16")["pass"] is False
+    verdict, failed = lp._verdict(items,
+                                 gating=lp._pilot_gating(
+                                     lp.PilotConfig(pilot="b")))
+    assert verdict == "NO-GO"
+    assert any(f.split(" ", 1)[0] == "16" for f in failed)
+    # a status divergence (the import's terminal was re-run into a
+    # different terminal) also fails
+    items = _cb(imported={"a": src}, records=[
+        _rec("a", "no_patch")])
+    assert _item(items, "16")["pass"] is False
+    # no import -> n/a (non-gating)
+    items = _cb()
+    assert _item(items, "16")["pass"] is None
+
+
+def test_item17_root_cause_gates(tmp_path, monkeypatch):
+    """AC3 — every eval_error line must carry a root cause (env /
+    parser / patch); an unclassed line fails; zero lines pass
+    vacuously."""
+    monkeypatch.setenv(lp.LIVE_ENV, "1")
+    items = _cb(records=[
+        _rec("a", "eval_error",
+             eval_error_root_cause="env"),
+        _rec("b", "eval_error",
+             eval_error_root_cause="parser")])
+    assert _item(items, "17")["pass"] is True
+    # one unclassed -> FAIL -> NO-GO
+    items = _cb(records=[
+        _rec("a", "eval_error"),  # no root cause
+        _rec("b", "resolved")])
+    assert _item(items, "17")["pass"] is False
+    verdict, failed = lp._verdict(items,
+                                 gating=lp._pilot_gating(
+                                     lp.PilotConfig(pilot="b")))
+    assert verdict == "NO-GO"
+    assert any(f.split(" ", 1)[0] == "17" for f in failed)
+    # a class outside the taxonomy is not a class
+    items = _cb(records=[
+        _rec("a", "eval_error", eval_error_root_cause="mystery")])
+    assert _item(items, "17")["pass"] is False
+
+
+def test_item12_per_window_budget(tmp_path, monkeypatch):
+    """AC4 — a multi-window run is gated PER WINDOW (the WP3 runner
+    sleeps to the next UTC-midnight window at the local daily cap);
+    a single-window run renders the verbatim WP6a text."""
+    monkeypatch.setenv(lp.LIVE_ENV, "1")
+    day1 = int(time.time() // 86400)
+    d1, d2 = day1, day1 + 1
+    # both windows within the cap -> PASS
+    items = _cb(window_buckets={
+        d1: {"sessions": 10, "wall_s": 100.0},
+        d2: {"sessions": 5, "wall_s": 50.0}})
+    assert _item(items, "12")["pass"] is True
+    # one window over the session cap -> FAIL
+    items = _cb(window_buckets={
+        d1: {"sessions": 10, "wall_s": 100.0},
+        d2: {"sessions": 11, "wall_s": 50.0}})
+    assert _item(items, "12")["pass"] is False
+    verdict, failed = lp._verdict(items,
+                                 gating=lp._pilot_gating(
+                                     lp.PilotConfig(pilot="b")))
+    assert verdict == "NO-GO"
+    assert any(f.split(" ", 1)[0] == "12" for f in failed)
+    # the per-window text is present
+    assert "windows:" in _item(items, "12")["observed"]
+    # a single-window run renders the WP6a text (the contract holds)
+    items = _cb(window_buckets={d1: {"sessions": 4,
+                                    "wall_s": 40.0}})
+    assert "sessions (attempts, incl. reruns): 4" in \
+        _item(items, "12")["observed"]
+
+
+def test_dry_run_pilot_b_writes_17_skeleton(tmp_path, live):
+    repos = _three_repos(tmp_path)
+    inst = _instances_file(tmp_path / "inst.json", repos)
+    wd = tmp_path / "wd"
+    rc = lp.main(["--dry-run", "--pilot", "b", "--devin-bin",
+                  MOCK_PATH, "--instances", inst,
+                  "--workdir", str(wd), "--run-id", "dryb"])
+    assert rc == lp.EXIT_OK
+    md = (wd / "wp6b-pilot-b.md").read_text()
+    for i in range(1, 18):
+        assert f"| {i} |" in md, md
+    # the WP6a record name is not written (the pilot kind selects the
+    # name) — and the stale-record invariant removes both
+    assert not (wd / "wp6a-go-no-go.md").exists()
+    assert "dry-run" in md
+
+
+def test_config_rejects_bad_pilot(tmp_path):
+    with pytest.raises(lp.PilotConfigError):
+        lp.PilotConfig(pilot="c")
+
+
+def test_import_run_source_missing_is_config_error(tmp_path, live):
+    """The import is fail-closed: a missing / corrupt source is a
+    config error (exit 2) BEFORE the pre-flight — no session is ever
+    spent against an import that did not validate."""
+    repos = _three_repos(tmp_path)
+    inst = _instances_file(tmp_path / "inst.json", repos)
+    wd = tmp_path / "wd"
+    # missing source (a path that does not exist)
+    cfg = _cfg(tmp_path, str(inst), run_id="imp", workdir=str(wd),
+              import_run="nope", import_workdir=str(tmp_path / "absent"))
+    with pytest.raises(lp.PilotConfigError):
+        _run(cfg, _mock_make_session("ok"))
+    # a corrupt source (a non-JSON line in the MIDDLE of the file —
+    # the fsync'd corruption; a bad line at EOF is the torn-write
+    # class and is dropped, not fatal)
+    bad = tmp_path / "srcwd"
+    bad.mkdir()
+    (bad / "run-nope.jsonl").write_text(
+        json.dumps({"instance_id": "x", "status": "resolved",
+                   "meta": {}, "ts": 1.0}) + "\n"
+        + "not a checkpoint line\n"
+        + json.dumps({"instance_id": "y", "status": "resolved",
+                     "meta": {}, "ts": 2.0}) + "\n")
+    cfg = _cfg(tmp_path, str(inst), run_id="imp", workdir=str(wd),
+              import_run="nope", import_workdir=str(bad))
+    with pytest.raises(lp.PilotConfigError):
+        _run(cfg, _mock_make_session("ok"))
+
+
+def _two_pilot_b_repos(tmp_path) -> "tuple[list, str]":
+    """3 fixture repos with a distinct ``repo`` per instance + a
+    ``stratified_repos`` meta (the 12-repo shape, scaled to 3 for
+    the fixture)."""
+    repos = []
+    for i in range(3):
+        r = tmp_path / f"srcrepo{i}"
+        commit = _make_repo(r)
+        e = _entry(i, str(r), commit)
+        e["repo"] = f"test/repo{i}"
+        repos.append(e)
+    f = tmp_path / "inst.json"
+    f.write_text(json.dumps({
+        "_meta": {"source": "test fixture",
+                  "stratified_repos":
+                  [f"test/repo{i}" for i in range(3)]},
+        "instances": repos}))
+    return repos, str(f)
+
+
+def test_import_run_reuses_never_rerun_and_reruns_retry(
+        tmp_path, live):
+    """AC2 — the import: the never-rerun statuses are imported (the
+    line copied with its original ts + imported_from, the instance
+    skipped — never re-run, no session spent); the retry-class
+    status is NOT imported — the instance runs (the pass@1 retry
+    class). The source file is untouched; the repeat --resume is
+    idempotent (no duplicate import lines)."""
+    repos, inst = _two_pilot_b_repos(tmp_path)
+    ids = [e["instance_id"] for e in repos]
+    i0, i1, i2 = ids
+    wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
+    # run 1 (the source): i0 no_patch (never-rerun), i1 no_patch
+    # (never-rerun), i2 ok -> eval_error (retry class, the documented
+    # no-container skip with the host check off)
+    modes1 = {i0: "no_patch", i1: "no_patch", i2: "ok"}
+    cfg1 = _cfg(tmp_path, inst, run_id="src", workdir=str(wd1),
+               host_check=False)
+    assert _run(cfg1, _mock_make_session(modes1)) == lp.EXIT_OK
+    lines1 = _read_jsonl(wd1 / "run-src.jsonl")
+    assert len(lines1) == 3
+    src_ts = {l["instance_id"]: l["ts"] for l in lines1}
+    src_bytes = (wd1 / "run-src.jsonl").read_bytes()
+    # run 2 (the pilot-B import): i0/i1 imported + skipped; i2
+    # re-runs (the retry class)
+    modes2 = {i0: "no_patch", i1: "no_patch", i2: "ok"}
+    cfg2 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               resume=True, host_check=False, pilot="b",
+               import_run="src", import_workdir=str(wd1))
+    assert _run(cfg2, _mock_make_session(modes2)) == lp.EXIT_OK
+    lines2 = _read_jsonl(wd2 / "run-pilotB.jsonl")
+    # 3 lines: i0 + i1 (imported — the original ts, imported_from) +
+    # i2 (the fresh re-run line)
+    assert len(lines2) == 3, lines2
+    by_iid = {}
+    for l in lines2:
+        by_iid.setdefault(l["instance_id"], []).append(l)
+    for iid in (i0, i1):
+        assert len(by_iid[iid]) == 1  # imported, never re-run
+        l = by_iid[iid][0]
+        assert l["status"] == "no_patch"
+        assert l["meta"].get("imported_from") == "src"
+        assert l["ts"] == src_ts[iid]  # the original ts is preserved
+    assert len(by_iid[i2]) == 1
+    # i2 was RE-RUN (a fresh line — not the source line: no
+    # imported_from, a fresh ts)
+    assert by_iid[i2][0]["meta"].get("imported_from") is None
+    assert by_iid[i2][0]["ts"] != src_ts[i2]
+    # the source file is untouched (the import reads, never writes)
+    assert (wd1 / "run-src.jsonl").read_bytes() == src_bytes
+    # the state file records the import
+    state = json.loads((wd2 / "pilot-pilotB.state.json").read_text())
+    assert state["imported"] == sorted([i0, i1])
+    assert state["import_retry_class"] == {i2: "eval_error"}
+    # the WP6b record: items 15/16/17 + the sections; item 16 PASS
+    # (the faithful, non-re-run overlap)
+    gng = (wd2 / "wp6b-pilot-b.md").read_text()
+    for i in (15, 16, 17):
+        row = [l for l in gng.splitlines()
+              if l.startswith(f"| {i} |")][0]
+        assert "PASS" in row, (i, row)
+    assert "## 2-run overlap/variance (issue #22 AC2)" in gng
+    assert "## Stratification (issue #22 AC1)" in gng
+    assert "## Failure taxonomy (issue #22 AC3)" in gng
+    assert "## Budget windows (issue #22 AC4)" in gng
+    # the repeat --resume: i0/i1 are still skipped (no duplicate
+    # import lines); i2's eval_error is the RETRY class — it re-runs
+    # (a fresh, superseding line: the pass@1 retry semantics)
+    modes3 = {i0: "no_patch", i1: "no_patch", i2: "no_patch"}
+    cfg3 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               resume=True, host_check=False, pilot="b",
+               import_run="src", import_workdir=str(wd1))
+    assert _run(cfg3, _mock_make_session(modes3)) == lp.EXIT_OK
+    lines3 = _read_jsonl(wd2 / "run-pilotB.jsonl")
+    assert len(lines3) == 4, lines3  # the i2 retry adds one line
+    assert sum(1 for l in lines3
+               if l["instance_id"] == i0) == 1
+    assert sum(1 for l in lines3
+               if l["instance_id"] == i1) == 1
+    i2_lines = [l for l in lines3 if l["instance_id"] == i2]
+    assert len(i2_lines) == 2
+    assert i2_lines[1]["status"] == "no_patch"
+    assert i2_lines[1]["meta"].get("imported_from") is None
+
+
+def test_pilot_b_full_mock_run_verdict(tmp_path, live):
+    """The pilot-B full mock run: 3-repo fixture + a source run + the
+    import. The verdict is NO-GO with item 11 the only gating failure
+    (the pair was not the intentional interrupt — the live run's
+    ``--interrupt-after`` is the AC4 leg; the mock pair asserts the
+    items 15/16/17 + the arithmetic + the state)."""
+    repos, inst = _two_pilot_b_repos(tmp_path)
+    i0, i1, i2 = [e["instance_id"] for e in repos]
+    wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
+    modes = {i0: "no_patch", i1: "no_patch", i2: "ok"}
+    cfg1 = _cfg(tmp_path, inst, run_id="src", workdir=str(wd1),
+               host_check=False)
+    assert _run(cfg1, _mock_make_session(modes)) == lp.EXIT_OK
+    cfg2 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               resume=True, host_check=False, pilot="b",
+               import_run="src", import_workdir=str(wd1))
+    assert _run(cfg2, _mock_make_session(modes)) == lp.EXIT_OK
+    gng = (wd2 / "wp6b-pilot-b.md").read_text()
+    assert "**Verdict: NO-GO**" in gng  # item 11 (not the interrupt)
+    failed = gng.split("**Verdict: NO-GO** — failed items:")[1] \
+        .split("\n")[0]
+    assert "11" in failed
+    # 15/16/17 PASS (stratification, the overlap/variance, the
+    # root-caused eval_error — i2's no-container skip is env)
+    for i in (15, 16, 17):
+        row = [l for l in gng.splitlines()
+              if l.startswith(f"| {i} |")][0]
+        assert "PASS" in row, (i, row)
+    # i2's eval_error is root-caused (the documented no-container
+    # skip is env)
+    lines = _read_jsonl(wd2 / "run-pilotB.jsonl")
+    l2 = [l for l in lines if l["instance_id"] == i2][0]
+    assert l2["status"] == "eval_error"
+    assert l2["meta"]["eval_error_root_cause"] == "env"
+
+
+def test_host_check_root_cause_classes(tmp_path, monkeypatch):
+    """AC3 — the host-check failure points map to the root-cause
+    classes (the PLAN-WP6B.md table): the install leg -> env, the
+    model-patch apply -> patch, the test-patch apply -> env, the
+    unparseable pytest -> parser, a spawned-tool failure -> env."""
+    # pip install failure -> env
+    status, s = _host_check_case(
+        tmp_path, monkeypatch, ["tests/test_a.py::test_a"],
+        ["tests/test_b.py::test_b"], b"", pip_rc=1)
+    assert status == "eval_error"
+    assert s.meta["eval_error_root_cause"] == "env"
+    assert s.meta["eval_error_root_cause_detail"]
+
+    # the model-patch apply fails -> patch
+    status, s = _host_check_case(
+        tmp_path, monkeypatch, ["tests/test_a.py::test_a"],
+        ["tests/test_b.py::test_b"], b"", apply_rc=1)
+    assert status == "eval_error"
+    assert s.meta["eval_error_root_cause"] == "patch"
+    assert "model_patch" in s.meta["eval_error_root_cause_detail"]
+
+    # an unparseable pytest (the tests ran, no -rA results) -> parser
+    status, s = _host_check_case(
+        tmp_path, monkeypatch, ["tests/test_a.py::test_a"],
+        ["tests/test_b.py::test_b"], b"garbage, no summary")
+    assert status == "eval_error"
+    assert s.meta["eval_error_root_cause"] == "parser"
+
+    # a spawned-tool failure (a hung pip -> TimeoutExpired) -> env
+    def fake_run(cmd, **kw):
+        a = [str(x) for x in cmd]
+        if a[0].endswith("pip") and "pytest" not in a[1:]:
+            raise subprocess.TimeoutExpired(cmd, 1)
+        return _fake_completed(0)
+    monkeypatch.setattr(lp.subprocess, "run", fake_run)
+    inst = {
+        "instance_id": "test__host-1", "repo": "test/host",
+        "base_commit": "abc123", "problem_statement": "x",
+        "FAIL_TO_PASS": ["tests/test_a.py::test_a"],
+        "PASS_TO_PASS": [], "test_patch": "",
+        "repo_url": "file:///nonexistent"}
+    spec = lp.SessionSpec(
+        instance=inst, mode="sandbox", devin_bin="x", model="m",
+        cwd=str(tmp_path), env={}, wall_s=30.0, host_check=True,
+        workdir=str(tmp_path))
+    s = lp.PilotSession(spec)
+    assert s._host_check("patch body") == "eval_error"
+    assert s.meta["eval_error_root_cause"] == "env"
+
+
+def test_oversize_patch_root_cause_is_patch(tmp_path, live,
+                                            monkeypatch):
+    # the PLAN §4 oversize-patch cap is the ``patch`` class (the
+    # agent's output, not the env / not the parser)
+    monkeypatch.setattr(lp, "PATCH_SIZE_CAP_BYTES", 1)
+    repos = _three_repos(tmp_path)
+    inst = _instances_file(tmp_path / "inst.json", repos)
+    wd = tmp_path / "wd"
+    cfg = _cfg(tmp_path, str(inst), run_id="big", workdir=str(wd),
+              interrupt_after=1)
+    rc = lp.run_pilot(cfg, make_session=_mock_make_session("ok"))
+    assert rc == lp.EXIT_INTERRUPT
+    lines = _read_jsonl(wd / "run-big.jsonl")
+    assert lines[0]["status"] == "eval_error"
+    assert lines[0]["meta"]["eval_error_root_cause"] == "patch"
+
+
+def test_container_eval_error_root_cause(tmp_path, monkeypatch):
+    # container mode: the WP4 typed errors classify — the patch
+    # corruption (the harness's git-apply chain) is ``patch``; every
+    # other harness failure is ``env``
+    inst = {
+        "instance_id": "test__c-1", "repo": "test/c",
+        "base_commit": "abc", "problem_statement": "x",
+        "FAIL_TO_PASS": [], "PASS_TO_PASS": [], "test_patch": ""}
+    spec = lp.SessionSpec(
+        instance=inst, mode="container", devin_bin="x", model="m",
+        cwd="/testbed", env={}, wall_s=30.0, host_check=False,
+        workdir=str(tmp_path), container="c1")
+    s = lp.PilotSession(spec)
+    monkeypatch.setattr(
+        lp.ev, "evaluate",
+        lambda *a, **k: (_ for _ in ()).throw(
+            lp.ev.PatchCorruptionError("the harness wrote "
+                                      "APPLY_PATCH_FAIL")))
+    assert s._eval_container("patch body") == "eval_error"
+    assert s.meta["eval_error_root_cause"] == "patch"
+    monkeypatch.setattr(
+        lp.ev, "evaluate",
+        lambda *a, **k: (_ for _ in ()).throw(
+            lp.ev.HarnessFailedError("the harness process failed")))
+    assert s._eval_container("patch body") == "eval_error"
+    assert s.meta["eval_error_root_cause"] == "env"

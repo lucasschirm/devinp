@@ -35,13 +35,45 @@ budget math, checklist skeleton, no devin spawn.
   over the pinned ``FAIL_TO_PASS`` / ``PASS_TO_PASS`` ids; the
   repo-specific ``log_parser``s are image-leg-only).
 
-**Intentional interrupt (issue #21 AC3).** ``--interrupt-after N``: after
-the N-th instance's checkpoint line is flushed, the session factory for
-the next instance raises :class:`IntentionalInterrupt` (a host-crash-class
-abort — the remaining instances have **no** checkpoint line; the WP3b
-resume class). The follow-up ``--resume`` invocation goes through
+**Intentional interrupt (issue #21 AC3 / issue #22 AC4).**
+``--interrupt-after N``: after the N-th instance's checkpoint line is
+flushed, the session factory for the next instance raises
+:class:`IntentionalInterrupt` (a host-crash-class abort — the
+remaining instances have **no** checkpoint line; the WP3b resume
+class). The follow-up ``--resume`` invocation goes through
 ``resume_queue``: finished instances are **skipped** (never re-run, no
-session spent on them), the rest run. Exit code 42 marks the interrupt.
+session spent on them), the rest run. Exit code 42 marks the
+interrupt.
+
+**Pilot B (issue #22).** ``--pilot b`` selects the pilot-B record
+(naming, the 17-item checklist, the record sections) over a 25-
+instance, 12-repo stratified file (``pilot_b_instances.json``). The
+3 Pilot A instances are **reused inside** the 25 through the
+checkpoint **import**: ``--import-run <run-id>`` [+ ``--import-
+workdir <path>``] reads the source run's ``run-<id>.jsonl`` and, per
+shared instance, the **never-rerun** statuses (``resolved`` /
+``failed_test`` / ``timeout`` / ``no_patch`` / ``agent_error``) are
+imported — the line is copied into this run's checkpoint **with its
+original ``ts``** (the source window — it never counts toward this
+run's daily budget) + ``meta.imported_from``, and the instance is
+skipped (never re-run, no session spent); the **retry-class**
+statuses (``quota_limited`` / ``eval_error`` / ``preflight_failed``)
+are **not** imported — the instance runs (the only pass@1 retry
+class, PLAN §2.5). The import is fail-closed (a missing / corrupt
+source is a config error before the pre-flight) and idempotent (a
+repeat ``--resume`` never re-seeds). Checklist item 16 (gating) is
+the 2-run overlap/variance check: for each imported instance the
+source line and this run's final line must agree on status / session
+wall / total tokens / patch bytes (the import is faithful **and**
+the reused instance was not re-run) + the session arithmetic
+(imported + new == unique). Item 15 (gating) is the stratification
+(every repo in the instance file's ``stratified_repos`` meta has a
+final line); item 17 (gating) is the root-caused ``eval_error``
+(every ``eval_error`` line carries ``meta.eval_error_root_cause`` ∈
+{``env``, ``parser``, ``patch``} — the mapping is in
+PLAN-WP6B.md). Item 12 gates **per window** (the checkpoint lines
+bucketed by their ``ts``'s UTC day — a multi-window run never fails
+by construction; a single-window run renders the verbatim WP6a text).
 
 **Exit codes:** 0 = complete (incl. a finished resume) · 2 = config
 error · 3 = ``BENCH_LIVE`` refused · 4 = pre-flight / runner / other
@@ -88,7 +120,12 @@ DEFAULT_LARGEST_CHECKOUT_BYTES = 1 * 10**9
 #: PLAN §4 patch guard: the size cap.
 PATCH_SIZE_CAP_BYTES = 1024 * 1024
 DEFAULT_INSTANCES_FILE = str(_BENCH_DIR / "pilot_instances.json")
+DEFAULT_B_INSTANCES_FILE = str(_BENCH_DIR / "pilot_b_instances.json")
 BUDGET_FILE = str(_BENCH_DIR / "live_pilot_budget.json")
+#: The go/no-go record names per pilot kind (the early-exit invariant
+#: removes BOTH — a stale verdict from a previous kind in the same
+#: workdir is never kept).
+RECORD_NAMES = {"a": "wp6a-go-no-go.md", "b": "wp6b-pilot-b.md"}
 
 EXIT_OK = 0
 EXIT_CONFIG = 2
@@ -185,7 +222,15 @@ class IntentionalInterrupt(PilotError):
 
 
 class _HostCheckInfra(Exception):
-    """A host-check infrastructure failure (the ``eval_error`` class)."""
+    """A host-check infrastructure failure (the ``eval_error``
+    class). Carries the AC3 root-cause class (issue #22):
+    ``env`` (the default — the host / venv / install leg), ``patch``
+    (the model patch does not apply), or ``parser`` (the test run
+    happened but no parseable results came back)."""
+
+    def __init__(self, msg: str, root_cause: str = "env") -> None:
+        super().__init__(msg)
+        self.root_cause = root_cause
 
 
 # ---------------------------------------------------------------------------
@@ -208,11 +253,27 @@ class PilotConfig:
     resume: bool = False
     dry_run: bool = False
     host_check: Optional[bool] = None  # None -> the mode default (sandbox: on)
+    pilot: str = "a"  # "a" (the WP6a 3-instance gate) | "b" (issue #22)
+    import_run: Optional[str] = None  # the source run id (issue #22 AC2)
+    import_workdir: Optional[str] = None  # its workdir (default: this run's)
 
     def __post_init__(self) -> None:
         if self.mode not in ("container", "sandbox"):
             raise PilotConfigError(
                 f"mode must be 'container' or 'sandbox' (got {self.mode!r})")
+        if self.pilot not in ("a", "b"):
+            raise PilotConfigError(
+                f"pilot must be 'a' or 'b' (got {self.pilot!r})")
+        if self.import_run is not None and not isinstance(
+                self.import_run, str):
+            raise PilotConfigError(
+                f"import_run must be a string (got "
+                f"{type(self.import_run).__name__})")
+        if self.import_workdir is not None and not isinstance(
+                self.import_workdir, str):
+            raise PilotConfigError(
+                f"import_workdir must be a string (got "
+                f"{type(self.import_workdir).__name__})")
         # ``--host-check`` is a sandbox-mode flag (the documented no-
         # container fallback) — in container mode the eval leg is the
         # official WP4 harness, and the flag would be accepted but
@@ -344,6 +405,155 @@ def load_instances(path: str) -> list:
 
 def prompt_for(inst: dict) -> str:
     return PROMPT_TEMPLATE.format(problem_statement=inst["problem_statement"])
+
+
+def load_instances_meta(path: str) -> dict:
+    """The instance file's ``_meta`` (the WP6b ``stratified_repos``
+    provenance; ``{}`` for a bare list / a meta-less file)."""
+    data = _load_json_file(path)
+    if isinstance(data, dict):
+        meta = data.get("_meta")
+        return meta if isinstance(meta, dict) else {}
+    return {}
+
+
+def load_imported(config: PilotConfig, workdir: str,
+                  insts: list) -> "tuple[dict, dict]":
+    """The WP6b checkpoint import (issue #22 AC2 — the 2-run overlap
+    reuse). Reads the source run's checkpoint, dedupes (last line per
+    instance, the WP3 contract), and classifies each shared instance:
+
+    * a **never-rerun** status → ``imported[iid]`` = the source line
+      (it is seeded into this run's checkpoint with its original
+      ``ts`` + ``meta.imported_from`` and skipped by ``resume_queue``
+      — never re-run, no session spent);
+    * a **retry-class** status → ``retry_class[iid]`` = the status
+      (NOT imported — the instance runs in this run, the only
+      pass@1 retry class, PLAN §2.5);
+    * a source line whose ``instance_id`` is not in the current
+      file → ignored (stale).
+
+    Fail-closed: a missing source file, or a corrupt one, is a
+    ``PilotConfigError`` (exit 2) — the validation happens before the
+    pre-flight, so no session is ever spent against an import that
+    did not validate.
+    """
+    src = os.path.join(config.import_workdir or workdir,
+                      f"run-{config.import_run}.jsonl")
+    if not os.path.isfile(src):
+        raise PilotConfigError(
+            f"--import-run source not found: {src!r} (the import is "
+            "fail-closed — a missing / corrupt source is a config "
+            "error before the pre-flight)")
+    try:
+        src_records, _ = rr.load_checkpoint(src)
+    except rr.RunnerProtocolError as exc:
+        raise PilotConfigError(
+            f"--import-run source {src!r} is corrupt: {exc}") from exc
+    finals, _ = rep.dedupe([r for r in src_records
+                          if isinstance(r, dict)])
+    known = {i["instance_id"] for i in insts}
+    imported: dict = {}
+    retry_class: dict = {}
+    for iid, rec in finals.items():
+        if iid not in known:
+            continue  # stale — not in this run's instance file
+        status = rec.get("status")
+        if status in rr.NEVER_RERUN_STATUSES:
+            imported[iid] = rec
+        elif status in rr.RETRY_STATUSES:
+            retry_class[iid] = status
+        else:
+            # a non-terminal status on a source line (impossible after
+            # the load_checkpoint validation, but fail loud anyway)
+            raise PilotConfigError(
+                f"--import-run source line for {iid!r} carries "
+                f"unknown status {status!r}")
+    return imported, retry_class
+
+
+def _copy_imported_artifacts(rec: dict, src_workdir: str,
+                             dst_workdir: str) -> None:
+    """The imported line's referenced artifacts (the WP5 reference
+    contract: ``patch_diff`` / ``trajectory`` / ``eval_log`` resolve
+    against ``artifacts_dir`` → the run JSONL's directory) are copied
+    from the source run's workdir into this run's — the imported
+    line is part of THIS run's record, and the WP5 cross-check
+    (``report.crosscheck``) resolves every reference against the JSONL's
+    own directory: a ``resolved`` / ``failed_test`` final must
+    reference an existing ``patch.diff`` *here* (the leaderboard
+    artifact's ``all_preds.jsonl`` patch content is cross-checked
+    against this run's copy). A source file that is missing is left
+    as-is (the cross-check flags it — fail loud, the WP5
+    semantics)."""
+    meta = rec.get("meta") or {}
+    ad = meta.get("artifacts_dir")
+    if isinstance(ad, str) and ad:
+        src_base = (ad if os.path.isabs(ad)
+                    else os.path.join(src_workdir, ad))
+        dst_base = (ad if os.path.isabs(ad)
+                    else os.path.join(dst_workdir, ad))
+    else:
+        src_base = dst_base = None
+    for key in ("patch_diff", "trajectory", "eval_log"):
+        val = meta.get(key)
+        if not isinstance(val, str) or not val:
+            continue
+        if os.path.isabs(val):
+            continue  # an absolute reference is not a workdir-relative
+            # artifact — not an import-time concern
+        src = os.path.join(src_base, val) if src_base else val
+        dst = os.path.join(dst_base, val) if dst_base else val
+        if os.path.isfile(src):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copyfile(src, dst)
+
+
+def seed_import_lines(jsonl_path: str, imported: dict,
+                      import_run: str,
+                      src_workdir: "Optional[str]" = None) -> list:
+    """Idempotently seeds the imported lines into this run's
+    checkpoint (issue #22 AC2). The lines are raw-written (the source
+    ``ts`` is **preserved** — the imported session counts toward the
+    source run's window, never this run's daily budget) and are
+    skipped when the file already carries a line for the instance (a
+    repeat ``--resume`` never re-seeds — no duplicate import lines).
+    Well-formed lines pass the ``JsonlCheckpoint`` open repair through
+    untouched. The referenced artifacts are copied from
+    ``src_workdir`` (the WP5 cross-check — see
+    :func:`_copy_imported_artifacts`). Returns the instance ids
+    actually seeded."""
+    if not imported:
+        return []
+    existing = set()
+    if os.path.isfile(jsonl_path):
+        try:
+            recs, _ = rr.load_checkpoint(jsonl_path)
+            existing = {r.get("instance_id") for r in recs
+                       if isinstance(r, dict) and r.get("instance_id")}
+        except rr.RunnerProtocolError:
+            # a torn tail in the CURRENT file is the normal crash-
+            # resume state — the checkpoint open repairs it; only the
+            # set of existing ids matters here
+            pass
+    seeded = []
+    dst_workdir = os.path.dirname(jsonl_path) or "."
+    for iid in sorted(imported):
+        if iid in existing:
+            continue
+        rec = imported[iid]
+        m = dict(rec.get("meta") or {})
+        m["imported_from"] = import_run
+        line = {"instance_id": iid, "status": rec.get("status"),
+                "meta": m, "ts": rec.get("ts", time.time())}
+        with open(jsonl_path, "a", encoding="utf-8", newline="") as f:
+            f.write(json.dumps(line) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        if src_workdir:
+            _copy_imported_artifacts(rec, src_workdir, dst_workdir)
+        seeded.append(iid)
+    return seeded
 
 
 def prompt_template_hash() -> str:
@@ -784,6 +994,11 @@ class PilotSession(rr.AgentSession):
             ext = extract_patch(self._extract_repo_dir())
         except PilotPatchTooLarge as exc:
             self.meta["eval_skip_reason"] = str(exc)[:200]
+            # the AC3 root cause (issue #22): an oversize patch is
+            # unusable by definition — the ``patch`` class (the
+            # agent's output, not the env / not the parser)
+            self.meta["eval_error_root_cause"] = "patch"
+            self.meta["eval_error_root_cause_detail"] = str(exc)[:200]
             self._write_eval_log(f"eval skipped: {exc}")
             self._write_trajectory()
             return "eval_error"
@@ -812,6 +1027,11 @@ class PilotSession(rr.AgentSession):
         # environment — the documented skip (the retry class; the gate
         # does not depend on the eval verdict)
         self.meta["eval_skip_reason"] = "no_container_runtime"
+        # the AC3 root cause (issue #22): the documented skip is the
+        # ``env`` class (no eval leg available in this environment)
+        self.meta["eval_error_root_cause"] = "env"
+        self.meta["eval_error_root_cause_detail"] = (
+            "no container runtime (sandbox mode, host check off)")
         self._write_eval_log(
             "eval skipped: no container runtime "
             "(sandbox mode, host check off)")
@@ -977,6 +1197,18 @@ class PilotSession(rr.AgentSession):
         except ev.EvaluationError as exc:
             self.meta["wall"]["eval_s"] = round(
                 time.monotonic() - t0, 3)
+            # the AC3 root cause (issue #22): the WP4 typed errors
+            # classify cleanly — the harness's own git-apply chain
+            # wrote its APPLY_PATCH_FAIL marker (the patch is
+            # corrupt/truncated) is the ``patch`` class; every other
+            # harness failure (spawn / watchdog / non-zero exit /
+            # input validation / a timeout) is ``env`` (the harness
+            # container / the harness itself)
+            self.meta["eval_error_root_cause"] = (
+                "patch" if isinstance(exc, ev.PatchCorruptionError)
+                else "env")
+            self.meta["eval_error_root_cause_detail"] = (
+                f"{type(exc).__name__}: {exc}"[:200])
             self._write_eval_log(
                 f"eval_error: {type(exc).__name__}: {exc}")
             return "eval_error"
@@ -1056,9 +1288,17 @@ class PilotSession(rr.AgentSession):
                     ["git", "-C", clone, "apply", pf],
                     capture_output=True, timeout=300, check=False)
                 if p.returncode != 0:
+                    # the AC3 root cause (issue #22): the MODEL patch
+                    # not applying to the fresh checkout is the
+                    # ``patch`` class; the TEST patch not applying is
+                    # the ``env`` class (the harness test fixture /
+                    # the pinned base — not the agent's patch)
                     raise _HostCheckInfra(
                         f"git apply {name}: "
-                        + p.stderr.decode("utf-8", "replace").strip()[:500])
+                        + p.stderr.decode("utf-8", "replace").strip()[:500],
+                        root_cause=("patch"
+                                   if name == "model_patch"
+                                   else "env"))
             # 3. a venv with a minimal install (never the host python)
             venv = os.path.join(base, "venv")
             py = _find_python()
@@ -1104,9 +1344,12 @@ class PilotSession(rr.AgentSession):
             log_lines.append(out[-4000:])
             results = _parse_pytest_ra(out, ids)
             if results is None:
+                # the AC3 root cause (issue #22): the tests ran but
+                # the log-parser leg produced no parseable results —
+                # the ``parser`` class
                 raise _HostCheckInfra(
                     f"pytest exited {p.returncode} with no parseable "
-                    "-rA results")
+                    "-rA results", root_cause="parser")
             f2p = set(inst["FAIL_TO_PASS"])
             p2p = set(inst["PASS_TO_PASS"])
             failed_f2p = sorted(t for t in f2p
@@ -1139,6 +1382,11 @@ class PilotSession(rr.AgentSession):
             log_lines.append(f"  infra failure: {exc}")
             self._write_eval_log("\n".join(log_lines))
             self.meta["eval_skip_reason"] = str(exc)[:200]
+            # the AC3 root cause (issue #22) — the class the failed
+            # phase maps to (the PLAN-WP6B.md table)
+            self.meta["eval_error_root_cause"] = getattr(
+                exc, "root_cause", "env")
+            self.meta["eval_error_root_cause_detail"] = str(exc)[:200]
             return "eval_error"
         except (OSError, subprocess.SubprocessError) as exc:
             # a spawned-tool failure that is not a returncode — a
@@ -1146,13 +1394,17 @@ class PilotSession(rr.AgentSession):
             # ``subprocess.TimeoutExpired`` (a hung pip/pytest) — is
             # likewise the ``eval_error`` infra class, not a
             # run-killing fatal (it would otherwise escape the
-            # documented ``eval_error`` handling)
+            # documented ``eval_error`` handling); the root cause is
+            # ``env`` (the host infra — a missing tool / a hang)
             self.meta["wall"]["eval_s"] = round(
                 time.monotonic() - t0, 3)
             log_lines.append(
                 f"  infra failure: {type(exc).__name__}: {exc}")
             self._write_eval_log("\n".join(log_lines))
             self.meta["eval_skip_reason"] = (
+                f"{type(exc).__name__}: {exc}"[:200])
+            self.meta["eval_error_root_cause"] = "env"
+            self.meta["eval_error_root_cause_detail"] = (
                 f"{type(exc).__name__}: {exc}"[:200])
             return "eval_error"
         finally:
@@ -1809,10 +2061,27 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
                    devin_ok: "Optional[bool]",
                    sessions_used: int,
                    wall_budget_s: float,
-                   wall_used_s: float) -> list:
-    """The 14-item go/no-go checklist (PLAN-WP6A.md). ``pass`` is None
-    in a dry run (the skeleton). Item 13 (the eval leg) is
-    deviation-tolerant, **non-gating**."""
+                   wall_used_s: float,
+                   pilot_b: bool = False,
+                   stratified_repos: "Optional[list]" = None,
+                   imported: "Optional[dict]" = None,
+                   repo_by_iid: "Optional[dict]" = None,
+                   arithmetic_total: int = 3,
+                   window_buckets: "Optional[dict]" = None) -> list:
+    """The go/no-go checklist (PLAN-WP6A.md — 14 items; PLAN-WP6B.md
+    — 17 for a ``--pilot b`` run: 15 stratification (AC1), 16 the
+    2-run overlap/variance (AC2), 17 the root-caused ``eval_error``
+    (AC3)). ``pass`` is None in a dry run (the skeleton). Item 13
+    (the eval leg) is deviation-tolerant, **non-gating**.
+
+    Items 15/16 render ``n/a`` (non-gating) when their data is
+    absent (a pilot-B run over a non-stratified file / without an
+    import); item 17 is always evaluable (zero ``eval_error`` lines
+    pass vacuously). Item 12 gates **per window** when
+    ``window_buckets`` is given (the WP3 runner sleeps to the next
+    UTC-midnight window at the local daily cap — a multi-window run
+    must never fail the per-day cap by construction); a run that
+    spans one window renders the verbatim WP6a text."""
     items: list = []
 
     def add(item: str, expected: str, observed: str,
@@ -1821,7 +2090,7 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
                      "observed": observed, "pass": passed})
 
     if dry_run:
-        for i in range(1, 15):
+        for i in range(1, 15 + (3 if pilot_b else 0)):
             add(f"{i} (dry run)", "see PLAN-WP6A.md", "n/a (dry run)",
                 None)
         return items
@@ -2028,15 +2297,50 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
     add("11 resume after the intentional interrupt (WP3b)",
         "the finished instance is skipped (never re-run); no "
         "duplicate checkpoint lines; the session arithmetic holds "
-        "(3 total across the run pair)",
+        f"({arithmetic_total} total across the run pair)",
         obs, p)
+    # the AC4 per-window budget gate (issue #22): a multi-window run
+    # (the WP3 runner sleeps to the next UTC-midnight window at the
+    # local daily cap) is gated PER WINDOW — the total would exceed
+    # the per-day cap by construction; a single-window run renders
+    # the verbatim WP6a text (the WP6a contract holds)
+    if window_buckets is not None and len(window_buckets) > 1:
+        over_s = [d for d, w in window_buckets.items()
+                 if w["sessions"] > config.max_sessions_per_day]
+        over_w = [d for d, w in window_buckets.items()
+                 if w["wall_s"] > wall_budget_s]
+        obs12 = (f"windows: " + "; ".join(
+            f"{_window_day_str(d)}: {w['sessions']} sessions / "
+            f"{w['wall_s']:.1f}s" for d, w in
+            sorted(window_buckets.items()))
+            + f"; max per window: "
+            f"{max(w['sessions'] for w in window_buckets.values())} "
+            f"sessions, "
+            f"{max(w['wall_s'] for w in window_buckets.values()):.1f}s")
+        p12 = not over_s and not over_w
+    else:
+        # an EMPTY bucket view (a host crash before any line — no
+        # ``ts`` to bucket) falls back to the legacy totals (0 / 0)
+        if window_buckets:
+            only = next(iter(window_buckets.values()))
+            n12 = only["sessions"]
+            w12 = only["wall_s"]
+        else:
+            n12 = sessions_used
+            w12 = wall_used_s
+        obs12 = (f"sessions (attempts, incl. reruns): {n12}; "
+                f"wall used: {w12:.1f}s")
+        p12 = (n12 <= config.max_sessions_per_day
+              and w12 <= wall_budget_s)
     add("12 within the calibrated budget",
-        f"sessions ≤ {config.max_sessions_per_day}; wall ≤ "
-        f"{wall_budget_s:.0f}s",
-        f"sessions (attempts, incl. reruns): {sessions_used}; "
-        f"wall used: {wall_used_s:.1f}s",
-        sessions_used <= config.max_sessions_per_day
-        and wall_used_s <= wall_budget_s)
+        (f"every window: sessions ≤ {config.max_sessions_per_day}; "
+         f"wall ≤ {wall_budget_s:.0f}s")
+        if (window_buckets is not None
+            and len(window_buckets) > 1)
+        else (f"sessions ≤ {config.max_sessions_per_day}; wall ≤ "
+              f"{wall_budget_s:.0f}s"),
+        obs12,
+        p12)
     add("13 eval leg verdict (deviation-tolerant, NON-gating)",
         "container: the official harness; sandbox: the host check or "
         "the documented no-runtime skip",
@@ -2047,25 +2351,119 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
         "post-session)",
         "; ".join(leak_obs) or "no instances",
         (leak_ok and bool(records)) if records else devin_ok)
+
+    # the WP6b items (issue #22 — appended for a ``--pilot b`` run
+    # only; the WP6a 14-item contract + the
+    # test_checklist_verdict_gating invariants hold). Each is ``n/a``
+    # (non-gating — ``pass=None``) when its data is absent.
+    if pilot_b:
+        # 15 — the stratification (AC1)
+        if stratified_repos:
+            repo_by_iid = repo_by_iid or {}
+            covered = {repo_by_iid.get(r.get("instance_id"))
+                      for r in records}
+            covered.discard(None)
+            n_cov = sum(1 for repo in stratified_repos
+                       if repo in covered)
+            add("15 stratification (WP6b AC1)",
+                f"all {len(stratified_repos)} Verified repos covered "
+                "by a final line (the instance file's meta)",
+                f"{n_cov}/{len(stratified_repos)} repos covered",
+                n_cov == len(stratified_repos))
+        else:
+            add("15 stratification (WP6b AC1)",
+                "the instance file's ``stratified_repos`` meta",
+                "n/a (no stratification meta — non-gating)",
+                None)
+        # 16 — the 2-run overlap/variance (AC2)
+        if imported:
+            ok16 = True
+            frag = []
+            for iid in sorted(imported):
+                src = imported[iid]
+                fin = next((r for r in records
+                           if r.get("instance_id") == iid), None)
+                sm = src.get("meta") or {}
+                fm = (fin.get("meta") or {}) if fin else {}
+                s_wall = (sm.get("wall") or {}).get("session_s")
+                f_wall = (fm.get("wall") or {}).get("session_s")
+                s_tok = _usage_total(sm.get("usage"))
+                f_tok = _usage_total(fm.get("usage"))
+                s_pb = sm.get("patch_bytes")
+                f_pb = fm.get("patch_bytes")
+                m = (fin is not None
+                    and src.get("status") == fin.get("status")
+                    and s_wall == f_wall and s_tok == f_tok
+                    and s_pb == f_pb)
+                ok16 = ok16 and m
+                frag.append(f"{iid}: "
+                          + ("match" if m else "MISMATCH")
+                          + f" ({src.get('status')}/"
+                             f"{fin.get('status') if fin else '-'}, "
+                             f"wall {s_wall}/{f_wall}, tokens "
+                             f"{s_tok}/{f_tok}, patch {s_pb}/{f_pb})")
+            add("16 2-run overlap/variance (WP6b AC2)",
+                "each imported (reused) instance: the source line == "
+                "this run's final line (status / session wall / "
+                "tokens / patch bytes) — never re-run, no extra "
+                "session spent; the session arithmetic holds "
+                "(imported + new == unique)",
+                "; ".join(frag) or "no imported instances",
+                ok16)
+        else:
+            add("16 2-run overlap/variance (WP6b AC2)",
+                "an ``--import-run`` source (the 3 Pilot A "
+                "instances)",
+                "n/a (no import — non-gating)",
+                None)
+        # 17 — the root-caused eval_error (AC3)
+        ee = [r for r in records if r.get("status") == "eval_error"]
+        unclassed = [r.get("instance_id") for r in ee
+                    if (r.get("meta") or {}).get(
+                        "eval_error_root_cause")
+                    not in ("env", "parser", "patch")]
+        obs17 = (f"{len(ee)} eval_error line(s), "
+                f"{len(ee) - len(unclassed)} classified"
+                + (f" — UNCLASSIFIED: {', '.join(sorted(
+                    str(u) for u in unclassed))}"
+                   if unclassed else ""))
+        if ee:
+            by_class: dict = {}
+            for r in ee:
+                c = (r.get("meta") or {}).get(
+                    "eval_error_root_cause")
+                if c in ("env", "parser", "patch"):
+                    by_class[c] = by_class.get(c, 0) + 1
+            obs17 += " (" + ", ".join(f"{c}={n}"
+                                     for c, n in sorted(by_class.items())) + ")"
+        add("17 eval_error root-caused (WP6b AC3)",
+            "every eval_error line carries a root cause (env / "
+            "parser / patch — the PLAN-WP6B.md mapping)",
+            obs17,
+            not unclassed)
     return items
 
 
-def _verdict(items: list, interrupted: bool = False) -> "tuple[str, list]":
-    """GO ⟺ items 1–12 + 14 all pass (item 13 is deviation-tolerant,
-    non-gating — PLAN-WP6A.md). A rendering with no decided items at
-    all (the dry-run skeleton — every item ``pass=None``) is ``n/a``,
-    not NO-GO (a dry run decides nothing). An **interrupted** run
-    decides nothing either: it is a PARTIAL record (e.g. 1/3
-    instances) — no gating item requires all pinned instances to have
-    a completed line, so without this guard the partial record would
-    render a GO the resume invocation would silently supersede. The
-    pair's verdict is the resume invocation's."""
+def _verdict(items: list, interrupted: bool = False,
+             gating: "Optional[frozenset]" = None) -> "tuple[str, list]":
+    """GO ⟺ all gating items pass (the WP6a 14-item set by default —
+    1–12 + 14, item 13 non-gating; the ``gating`` parameter extends
+    it for a pilot-B run: + 15/16/17, 13 still non-gating). A
+    rendering with no decided items at all (the dry-run skeleton —
+    every item ``pass=None``) is ``n/a``, not NO-GO (a dry run
+    decides nothing). An **interrupted** run decides nothing either:
+    it is a PARTIAL record (e.g. 1/3 instances) — no gating item
+    requires all pinned instances to have a completed line, so
+    without this guard the partial record would render a GO the
+    resume invocation would silently supersede. The pair's verdict
+    is the resume invocation's."""
     if interrupted:
         return ("n/a (interrupted — resume to complete)", [])
-    gating_numbers = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "10",
-                     "11", "12", "14"}  # 13 excluded (non-gating)
+    if gating is None:
+        gating = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "10",
+                 "11", "12", "14"}  # 13 excluded (non-gating)
     decided = [i for i in items
-              if i["item"].split(" ", 1)[0] in gating_numbers
+              if i["item"].split(" ", 1)[0] in gating
               and i["pass"] is not None]
     if not decided:
         return ("n/a", [])
@@ -2073,12 +2471,90 @@ def _verdict(items: list, interrupted: bool = False) -> "tuple[str, list]":
     return ("NO-GO" if failed else "GO", failed)
 
 
+def _render_pilot_b_sections(wp6b: dict) -> list:
+    """The pilot-B record sections (issue #22) — the per-repo
+    stratification table, the 2-run overlap/variance table, the
+    failure taxonomy + root-cause table, the per-window budget
+    table."""
+    lines: list = []
+    pr = wp6b.get("per_repo") or {}
+    expected = wp6b.get("expected_repos") or sorted(pr)
+    if pr:
+        lines += ["## Stratification (issue #22 AC1)", "",
+                  "| repo | observed | status |",
+                  "|---|---|---|"]
+        for repo in expected:
+            d = pr.get(repo, {"count": 0, "statuses": {}})
+            st = ", ".join(f"{k} {v}" for k, v in
+                          sorted(d["statuses"].items())) or "-"
+            lines.append(f"| {repo} | {d['count']} | {st} |")
+        lines += [f"\n**{sum(1 for r in pr.values() if r['count'] >= 1)}/"
+                  f"{len(expected)} repos covered.**", ""]
+    imp = wp6b.get("import") or {}
+    rows = imp.get("rows")
+    if rows is not None:
+        lines += ["## 2-run overlap/variance (issue #22 AC2)", "",
+                  "| instance | source | final | session wall (s) "
+                  "| tokens | patch bytes | match |",
+                  "|---|---|---|---|---|---|---|"]
+        for r in rows:
+            lines.append(
+                f"| {r['instance_id']} | {r['src_status']} | "
+                f"{r['final_status']} | {r['src_wall']} → "
+                f"{r['final_wall']} | {r['src_tokens']} → "
+                f"{r['final_tokens']} | {r['src_patch']} → "
+                f"{r['final_patch']} | "
+                f"{'PASS' if r['match'] else 'FAIL'} |")
+        lines += ["",
+                  f"Session arithmetic: {imp.get('imported')} imported "
+                  f"+ {imp.get('new_sessions')} new = "
+                  f"{imp.get('unique')} unique — "
+                  f"{'holds' if imp.get('arithmetic_holds') else 'BROKEN'}. "
+                  f"Overlap match: "
+                  f"{'PASS' if imp.get('all_match') else 'FAIL'}.", ""]
+    tax = wp6b.get("taxonomy") or {}
+    rc = wp6b.get("root_causes") or []
+    if tax or rc:
+        lines += ["## Failure taxonomy (issue #22 AC3)", "",
+                  "| status | count | instances |",
+                  "|---|---|---|"]
+        for s in sorted(tax):
+            t = tax[s]
+            lines.append(f"| {s} | {t['count']} | "
+                        f"{', '.join(t['instances']) or '-'} |")
+        if rc:
+            lines += ["",
+                     "**eval_error root causes (env / parser / patch):**",
+                     "",
+                     "| instance | class | detail |",
+                     "|---|---|---|"]
+            for r in rc:
+                lines.append(f"| {r['instance_id']} | "
+                            f"{r['root_cause'] or 'UNCLASSIFIED'} | "
+                            f"{r['detail'] or '-'} |")
+        lines.append("")
+    win = wp6b.get("windows") or []
+    if win:
+        lines += ["## Budget windows (issue #22 AC4)", "",
+                  "| window (UTC day) | sessions | wall (s) |",
+                  "|---|---|---|"]
+        for w in win:
+            lines.append(f"| {w['day']} | {w['sessions']} | "
+                        f"{w['wall_s']} |")
+        lines.append("")
+    return lines
+
+
 def render_checklist_md(items: list, config: PilotConfig,
                        calibration: "Optional[dict]",
                        meta: dict,
-                       interrupted: bool = False) -> str:
-    verdict, failed = _verdict(items, interrupted=interrupted)
-    lines = ["# WP6a Pilot A — go/no-go record (auto-generated)", "",
+                       interrupted: bool = False,
+                       title: str = "WP6a Pilot A — go/no-go record "
+                                   "(auto-generated)",
+                       gating: "Optional[frozenset]" = None) -> str:
+    verdict, failed = _verdict(items, interrupted=interrupted,
+                              gating=gating)
+    lines = [f"# {title}", "",
              f"**Verdict: {verdict}**"
              + (f" — failed items: {', '.join(failed)}" if failed else ""),
              "",
@@ -2088,9 +2564,10 @@ def render_checklist_md(items: list, config: PilotConfig,
              f"- budget: max_sessions_per_day="
              f"{config.max_sessions_per_day} · max_wall_per_session="
              f"{config.max_wall_s:.0f}s", ""]
+    ac_label = "issue #22" if config.pilot == "b" else "issue #21"
     if calibration:
         lines += [
-            "## Calibration (issue #21 AC2)", "",
+            f"## Calibration ({ac_label} AC2)", "",
             f"- per-session wall (s): {calibration['per_session_wall_s']}",
             f"- median: {calibration['median_session_wall_s']} · mean: "
             f"{calibration['mean_session_wall_s']}",
@@ -2102,7 +2579,7 @@ def render_checklist_md(items: list, config: PilotConfig,
             f"chosen `max_sessions_per_day`: "
             f"{calibration['chosen_max_sessions_per_day']}",
             f"- basis: {calibration['basis']}", ""]
-    lines += ["## Checklist (issue #21 AC4)", "",
+    lines += [f"## Checklist ({ac_label} AC4)", "",
               "| # | item | expected | observed | pass |",
               "|---|---|---|---|---|"]
     for i in items:
@@ -2113,6 +2590,8 @@ def render_checklist_md(items: list, config: PilotConfig,
         observed = str(i["observed"]).replace("|", "\\|")[:200]
         lines.append(f"| {num} | {item} | {expected} | {observed} | {p} |")
     lines.append("")
+    if meta.get("wp6b"):
+        lines += _render_pilot_b_sections(meta["wp6b"])
     return "\n".join(lines)
 
 
@@ -2175,12 +2654,200 @@ def _remove_stale_record(workdir: str) -> None:
     """The record file is the last *completed* run's verdict — an early
     exit (dry-run skeleton, pre-flight / model-gate refusal, an abort)
     removes it so a stale verdict from a previous invocation is never
-    mistaken for this run's (consistent record handling across exits)."""
-    p = os.path.join(workdir, "wp6a-go-no-go.md")
+    mistaken for this run's (consistent record handling across exits).
+    Both pilot kinds' names are removed (a stale verdict from the
+    other kind in the same workdir is equally stale)."""
+    for name in RECORD_NAMES.values():
+        try:
+            os.remove(os.path.join(workdir, name))
+        except OSError:
+            pass
+
+
+def _pilot_title(config: PilotConfig) -> str:
+    return ("WP6b Pilot B (issue #22)" if config.pilot == "b"
+            else "WP6a Pilot A (issue #21)")
+
+
+def _stratified_repos(config: PilotConfig) -> "Optional[list]":
+    """The AC1 expected repo set: the instance file's
+    ``_meta.stratified_repos`` (None for a meta-less / bare-list file
+    — the item renders ``n/a`` and is non-gating)."""
     try:
-        os.remove(p)
-    except OSError:
-        pass
+        meta = load_instances_meta(config.instances_file)
+    except PilotConfigError:
+        return None
+    repos = meta.get("stratified_repos")
+    if isinstance(repos, list) and repos and all(
+            isinstance(r, str) for r in repos):
+        return list(repos)
+    return None
+
+
+def _repo_by_iid(insts: list) -> dict:
+    return {i["instance_id"]: i.get("repo", "?") for i in insts}
+
+
+def _window_buckets(records: list) -> dict:
+    """The AC4 per-window budget view (issue #22): the checkpoint
+    lines (instance id, non-``preflight_failed`` — the WP3 contract:
+    it consumed no session) bucketed by their ``ts``'s **UTC day**
+    (the WP3 quota window boundary, ``next_quota_window``). Imported
+    lines keep the source run's ``ts`` — they land in the source
+    window, never this run's daily budget. A run that spans one
+    window renders the verbatim WP6a item-12 text."""
+    out: dict = {}
+    for r in records:
+        if not r.get("instance_id"):
+            continue
+        if r.get("status") == "preflight_failed":
+            continue
+        ts = r.get("ts") or 0.0
+        day = int(ts // 86400)
+        w = out.setdefault(day, {"sessions": 0, "wall_s": 0.0})
+        w["sessions"] += 1
+        wall = (r.get("meta") or {}).get("wall_s", 0.0)
+        if isinstance(wall, (int, float)) and not isinstance(wall, bool):
+            w["wall_s"] += float(wall)
+    return out
+
+
+def _window_day_str(day: int) -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime(day * 86400))
+
+
+def _pilot_gating(config: PilotConfig) -> frozenset:
+    """The gating item set (the WP6a 14-item set; pilot B adds the
+    AC1–AC3 items 15/16/17 — item 13 stays non-gating in both)."""
+    base = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "10",
+            "11", "12", "14"}
+    if config.pilot == "b":
+        base |= {"15", "16", "17"}
+    return frozenset(base)
+
+
+def _pilot_b_sections(config: PilotConfig, insts: list, records: list,
+                     inst_records: list, imported: dict,
+                     buckets: dict) -> dict:
+    """The pilot-B record-section data (issue #22) — the
+    ``meta['wp6b']`` the renderer turns into markdown tables.
+
+    * ``per_repo`` — the AC1 stratification table (the instance
+      file's ``stratified_repos`` meta vs the finals' repo counts);
+    * ``import`` — the AC2 2-run overlap/variance table (per shared
+      instance: the source line vs this run's final line) + the
+      session arithmetic;
+    * ``taxonomy`` — the AC3 full failure taxonomy (every terminal
+      status: count + instance ids) + the root-cause table (every
+      ``eval_error`` line: class + detail);
+    * ``windows`` — the per-window budget table (the item-12 view).
+    """
+    repo_by_iid = _repo_by_iid(insts)
+    final_by_iid = {r.get("instance_id"): r for r in inst_records}
+    strat = _stratified_repos(config) or sorted(
+        {i.get("repo", "?") for i in insts})
+    per_repo: dict = {}
+    for repo in strat:
+        ids = [iid for iid, r in final_by_iid.items()
+              if repo_by_iid.get(iid) == repo]
+        statuses: dict = {}
+        for iid in ids:
+            s = final_by_iid[iid].get("status")
+            statuses[s] = statuses.get(s, 0) + 1
+        per_repo[repo] = {"count": len(ids), "statuses": statuses,
+                         "instances": sorted(ids)}
+    # the AC2 overlap/variance: per imported instance, the source line
+    # vs the final line (status / session wall / total tokens / patch
+    # bytes). A re-run of an imported instance supersedes the seeded
+    # line with a divergent final → a mismatch → the item fails
+    import_rows: list = []
+    for iid in sorted(imported):
+        src = imported[iid]
+        fin = final_by_iid.get(iid)
+        sm = src.get("meta") or {}
+        fm = (fin.get("meta") or {}) if fin else {}
+        wall_s = (lambda m: (m.get("wall") or {}).get("session_s"))
+        toks = (lambda m: _usage_total(m.get("usage")))
+        s_wall, f_wall = wall_s(sm), wall_s(fm)
+        s_tok, f_tok = toks(sm), toks(fm)
+        s_pb, f_pb = sm.get("patch_bytes"), fm.get("patch_bytes")
+        match = (fin is not None
+                and src.get("status") == fin.get("status")
+                and s_wall == f_wall and s_tok == f_tok
+                and s_pb == f_pb)
+        import_rows.append({
+            "instance_id": iid, "repo": repo_by_iid.get(iid),
+            "src_status": src.get("status"), "src_wall": s_wall,
+            "src_tokens": s_tok, "src_patch": s_pb,
+            "final_status": fin.get("status") if fin else None,
+            "final_wall": f_wall, "final_tokens": f_tok,
+            "final_patch": f_pb, "match": match})
+    new_lines = [r for r in records if r.get("instance_id")
+                and not (r.get("meta") or {}).get("imported_from")
+                and r.get("status") != "preflight_failed"]
+    unique = len({r.get("instance_id") for r in records
+                 if r.get("instance_id")})
+    import_section = {
+        "rows": import_rows,
+        "imported": len(imported),
+        "new_sessions": len(new_lines),
+        "unique": unique,
+        "arithmetic_holds": (len(imported) + len(new_lines)
+                            == unique),
+        "all_match": all(r["match"] for r in import_rows)
+        if import_rows else False,
+    }
+    # the AC3 taxonomy + the root-cause table (over the DEDUPED view
+    # — a superseded attempt's eval_error is not the instance's
+    # verdict; the attempts basis lives in the calibration + item 12)
+    taxonomy: dict = {}
+    for r in inst_records:
+        s = r.get("status")
+        t = taxonomy.setdefault(s, {"count": 0, "instances": []})
+        t["count"] += 1
+        t["instances"].append(r.get("instance_id"))
+    for t in taxonomy.values():
+        t["instances"].sort()
+    root_rows: list = []
+    for r in inst_records:
+        if r.get("status") != "eval_error":
+            continue
+        m = r.get("meta") or {}
+        rc = m.get("eval_error_root_cause")
+        root_rows.append({
+            "instance_id": r.get("instance_id"),
+            "root_cause": rc if rc in ("env", "parser", "patch")
+            else None,
+            "detail": (m.get("eval_error_root_cause_detail")
+                      or m.get("eval_skip_reason") or "")[:200]})
+    return {
+        "per_repo": per_repo,
+        "expected_repos": strat,
+        "all_repos_covered": all(per_repo[r]["count"] >= 1
+                                for r in strat),
+        "import": import_section,
+        "taxonomy": taxonomy,
+        "root_causes": root_rows,
+        "all_root_caused": all(r["root_cause"] is not None
+                              for r in root_rows),
+        "windows": [{"day": _window_day_str(d), "sessions": w["sessions"],
+                    "wall_s": round(w["wall_s"], 1)}
+                   for d, w in sorted(buckets.items())],
+    }
+
+
+def _usage_total(usage: object) -> "Optional[int]":
+    """The verbatim visible-usage total (the WP0 §1
+    ``usage.totalTokens``; the ``total_tokens`` alias) — None when
+    the leg did not expose it (the comparison is still well-defined:
+    the import and the final line must agree, including on absence)."""
+    if not isinstance(usage, dict):
+        return None
+    for k in ("totalTokens", "total_tokens"):
+        v = usage.get(k)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return int(v)
+    return None
 
 
 def run_pilot(config: PilotConfig,
@@ -2192,10 +2859,24 @@ def run_pilot(config: PilotConfig,
     insts = load_instances(config.instances_file)
     run_id = config.run_id or time.strftime("pilot-%Y%m%d-%H%M%S")
     config.run_id = run_id
-    workdir = config.workdir or os.path.join(os.getcwd(), "pilot-a")
+    workdir = config.workdir or os.path.join(
+        os.getcwd(), "pilot-b" if config.pilot == "b" else "pilot-a")
     config.workdir = workdir
     os.makedirs(workdir, exist_ok=True)
     jsonl = os.path.join(workdir, f"run-{run_id}.jsonl")
+    record_name = RECORD_NAMES[config.pilot]
+
+    # the WP6b import (issue #22 AC2) — fail-closed validation for
+    # BOTH the dry run and the live run: a missing / corrupt source
+    # is a config error before anything else (no session, no report)
+    imported: dict = {}
+    import_retry: dict = {}
+    if config.import_run:
+        imported, import_retry = load_imported(config, workdir, insts)
+        print(f"[pilot] import from {config.import_run}: reused "
+              f"{len(imported)} (never-rerun — skipped, no session "
+              "spent); retry-class (the pass@1 re-run): "
+              f"{sorted(import_retry)}")
 
     # -- dry run: the zero-quota validation ------------------------------
     if config.dry_run:
@@ -2206,13 +2887,17 @@ def run_pilot(config: PilotConfig,
             interrupted_this_run=None, resume_after_interrupt=False,
             devin_ok=None, sessions_used=0,
             wall_budget_s=config.max_wall_s
-            * config.max_sessions_per_day, wall_used_s=0.0)
+            * config.max_sessions_per_day, wall_used_s=0.0,
+            pilot_b=config.pilot == "b",
+            stratified_repos=_stratified_repos(config),
+            imported=imported, repo_by_iid=_repo_by_iid(insts))
         _remove_stale_record(workdir)  # the skeleton replaces the last
         # completed run's verdict — a stale file is never kept
-        with open(os.path.join(workdir, "wp6a-go-no-go.md"), "w",
+        with open(os.path.join(workdir, record_name), "w",
                   encoding="utf-8", newline="") as f:
             f.write(render_checklist_md(items, config, cal, {
-                "run_id": run_id, "devin_cli_version": "dry-run"}))
+                "run_id": run_id, "devin_cli_version": "dry-run"},
+                title=_pilot_title(config)))
         print(f"[dry-run] config ok · mode={config.mode} · "
               f"model={config.model} · {len(insts)} instances: "
               + ", ".join(i["instance_id"] for i in insts))
@@ -2238,6 +2923,16 @@ def run_pilot(config: PilotConfig,
     interrupted_before = bool(state.get("interrupted"))
     aborted_before = bool(state.get("aborted"))
     resume_exercised_before = bool(state.get("resume_exercised"))
+    # the WP6b import seeding (issue #22 AC2) — BEFORE the resume
+    # read: the imported (never-rerun) lines must be in the
+    # checkpoint when ``resume_queue`` decides what to skip
+    if imported:
+        seeded = seed_import_lines(
+            jsonl, imported, config.import_run,
+            src_workdir=config.import_workdir or workdir)
+        print(f"[pilot] imported {len(seeded)} instance line(s) from "
+              f"{config.import_run} (skipped — never re-run, no "
+              "session spent)")
     skipped_on_resume: dict = {}
     to_run = [i["instance_id"] for i in insts]
     if os.path.isfile(jsonl):
@@ -2417,6 +3112,9 @@ def run_pilot(config: PilotConfig,
                            else ("run_failed" if run_failed
                                 else "done"))),
         "completed_this_invocation": rep_.done_count,
+        "imported_run": config.import_run,
+        "imported": sorted(imported),
+        "import_retry_class": {k: v for k, v in sorted(import_retry.items())},
         "ts": time.time(),
     })
     ckpt.close()
@@ -2481,6 +3179,10 @@ def run_pilot(config: PilotConfig,
             "final_state": "report_failed",
             "report_error": "the WP5 report pipeline failed",
             "completed_this_invocation": rep_.done_count,
+            "imported_run": config.import_run,
+            "imported": sorted(imported),
+            "import_retry_class": {k: v
+                                  for k, v in sorted(import_retry.items())},
             "ts": time.time(),
         })
         _remove_stale_record(workdir)
@@ -2488,6 +3190,13 @@ def run_pilot(config: PilotConfig,
               "WP5 report pipeline failed — no verdict rendered; "
               "the run is the resume class")
         return EXIT_RUN_FAILED
+    # the AC4 per-window budget view (issue #22) — the item-12 gate
+    # buckets the checkpoint lines by their ts's UTC day; a
+    # multi-window run never fails the per-day cap by construction,
+    # and a single-window run renders the verbatim WP6a text
+    buckets = _window_buckets(records)
+    sessions_used = sum(w["sessions"] for w in buckets.values())
+    wall_used_s = sum(w["wall_s"] for w in buckets.values())
     items = build_checklist(
         config=config, dry_run=False, gate=gate,
         preflight_ok=preflight_ok, preflight_failures=preflight_failures,
@@ -2503,23 +3212,33 @@ def run_pilot(config: PilotConfig,
         # preflight_failed line burned a session / wall that the
         # deduped view would silently drop), consistent with the
         # wall sum and with WP5's session arithmetic
-        sessions_used=sum(
-            1 for r in records
-            if r.get("instance_id")
-            and r.get("status") != "preflight_failed"),
+        sessions_used=sessions_used,
         wall_budget_s=config.max_wall_s * config.max_sessions_per_day,
-        wall_used_s=sum(
-            (r.get("meta") or {}).get("wall_s", 0.0)
-            for r in records if r.get("instance_id")))
-    with open(os.path.join(workdir, "wp6a-go-no-go.md"), "w",
+        wall_used_s=wall_used_s,
+        pilot_b=config.pilot == "b",
+        stratified_repos=_stratified_repos(config),
+        imported=imported, repo_by_iid=_repo_by_iid(insts),
+        arithmetic_total=len(insts),
+        window_buckets=buckets)
+    # the pilot-B record sections (issue #22) — the per-repo
+    # stratification table, the 2-run overlap/variance table, the
+    # failure taxonomy + root-cause table, the per-window budget
+    # table
+    if config.pilot == "b":
+        meta["wp6b"] = _pilot_b_sections(
+            config, insts, records, inst_records, imported, buckets)
+    with open(os.path.join(workdir, record_name), "w",
               encoding="utf-8", newline="") as f:
         f.write(render_checklist_md(items, config, cal, meta,
-                                   interrupted=interrupted))
-    verdict, failed = _verdict(items, interrupted=interrupted)
+                                   interrupted=interrupted,
+                                   title=_pilot_title(config),
+                                   gating=_pilot_gating(config)))
+    verdict, failed = _verdict(items, interrupted=interrupted,
+                              gating=_pilot_gating(config))
     print(f"[pilot] go/no-go: {verdict}"
           + (f" (failed: {', '.join(failed)})" if failed else ""))
     rep_dir = os.path.join(workdir, "report")
-    gng = os.path.join(workdir, "wp6a-go-no-go.md")
+    gng = os.path.join(workdir, record_name)
     print(f"[pilot] artifacts: {jsonl} · {rep_dir} · {gng}")
 
     if interrupted:
@@ -2558,6 +3277,17 @@ def _build_parser() -> argparse.ArgumentParser:
                    action="store_false")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--largest-bytes", type=float, default=None)
+    p.add_argument("--pilot", choices=("a", "b"), default="a",
+                   help="the pilot kind (issue #22: 'b' = the 25-"
+                        "instance, 12-repo stratified pilot; the "
+                        "default workdir/record naming follows)")
+    p.add_argument("--import-run", default=None,
+                   help="the WP6b checkpoint import: the source run's "
+                        "id (issue #22 AC2 — the 3 Pilot A instances "
+                        "are reused inside the 25, never re-run)")
+    p.add_argument("--import-workdir", default=None,
+                   help="the source run's workdir (default: this "
+                        "run's workdir)")
     return p
 
 
@@ -2569,7 +3299,9 @@ def main(argv: "Optional[list]" = None) -> int:
         # workdir is resolved exactly as run_pilot does, and the
         # previous run's verdict is removed before the first thing
         # that can fail (a stale verdict is never kept)
-        wd = args.workdir or os.path.join(os.getcwd(), "pilot-a")
+        wd = args.workdir or os.path.join(
+            os.getcwd(),
+            "pilot-b" if args.pilot == "b" else "pilot-a")
         os.makedirs(wd, exist_ok=True)
         _remove_stale_record(wd)
         budget = load_budget_file()
@@ -2600,7 +3332,9 @@ def main(argv: "Optional[list]" = None) -> int:
             or (DEFAULT_LARGEST_IMAGE_BYTES if args.mode == "container"
                 else DEFAULT_LARGEST_CHECKOUT_BYTES),
             interrupt_after=args.interrupt_after, resume=args.resume,
-            dry_run=args.dry_run, host_check=args.host_check)
+            dry_run=args.dry_run, host_check=args.host_check,
+            pilot=args.pilot, import_run=args.import_run,
+            import_workdir=args.import_workdir)
         return run_pilot(config)
     except LiveRefused as exc:
         print(f"[pilot] REFUSED: {exc}")

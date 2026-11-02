@@ -50,6 +50,18 @@ container runtime exists) + zero-quota CI tests in
 semantics; the fail-closed model gate; the patch guards; the
 calibration math). The live run + measured go/no-go record:
 `notes/wp6a-go-no-go.md`.
+**WP6b (issue #22) — Pilot B (the 25-instance stratified pilot)** — the
+same harness extended: `--pilot b` (a 25-instance file across all 12
+Verified repos, pinned + deterministic: `pilot_b_instances.json`,
+`scripts/pin_pilot_b_instances.py`), `--import-run/--import-workdir`
+(import the Pilot-A checkpoint lines — the never-rerun statuses reused
+verbatim with their original timestamp, the retry-class status re-run
+per pass@1), the per-UTC-window budget gate (item 12), and checklist
+items 15–17 (stratification, the 2-run overlap/variance, the
+root-caused `eval_error`s — the PLAN §2.5/§2.6 variance report + the
+AC1–AC4 map) + zero-quota CI tests. `PLAN-WP6B.md` (the plan of
+record; the import is the WP6a→WP6b reuse mechanism). The live run +
+measured record: `notes/wp6b-pilot-b.md`.
 
 ## Layout
 
@@ -60,8 +72,10 @@ calibration math). The live run + measured go/no-go record:
 | `PLAN-WP4.md` | WP4 implementation plan (AC map, harness-fact record, contingencies) |
 | `PLAN-WP5.md` | WP5 implementation plan (AC map, WP3-schema fact record, design decisions pinned by the tests, contingencies) |
 | `PLAN-WP6A.md` | WP6a implementation plan (AC map, the two run modes, the gate ordering, the checklist, the deviation record) |
-| `live_pilot.py` | **WP6a** — the `BENCH_LIVE=1` Pilot-A smoke harness: the pinned 3-instance sequential run through WP1–WP5 (pre-flight → fail-closed model gate → sessions → patch extraction → checkpoint → pruning → report), the intentional interrupt (`--interrupt-after`, exit 42, host-crash class) + `--resume` via `resume_queue`, the `max_sessions_per_day` calibration, the 14-item go/no-go checklist (exit codes 0/2/3/4/42) |
+| `PLAN-WP6B.md` | WP6b implementation plan (the AC1–AC4 map, the `--import-run` checkpoint import + the never-rerun/retry-class reuse rule, the per-window budget, the checklist items 15–17) |
+| `live_pilot.py` | **WP6a+WP6b** — the `BENCH_LIVE=1` live-pilot harness: the pinned sequential run through WP1–WP5 (pre-flight → fail-closed model gate → sessions → patch extraction → checkpoint → pruning → report), the intentional interrupt (`--interrupt-after`, exit 42, host-crash class) + `--resume` via `resume_queue`, the `max_sessions_per_day` calibration, the go/no-go checklist (WP6a: items 1–14; WP6b: items 15–17 + the per-UTC-window item 12, exit codes 0/2/3/4/42), the WP6b `--import-run/--import-workdir` checkpoint import (the never-rerun statuses reused verbatim, the retry-class re-run, the referenced artifacts copied so the WP5 cross-check holds) |
 | `pilot_instances.json` | The three pinned Pilot-A instances (one from each of the smallest Verified repos: pallets/flask, mwaskom/seaborn, psf/requests — verbatim SWE-bench Verified fields incl. `test_patch` for the host check) |
+| `pilot_b_instances.json` | The 25 pinned Pilot-B instances — stratified across all 12 Verified repos (2 each; the 3 largest capped at 3 for the calibrated budget) — verbatim Verified fields incl. `test_patch` + a `repo` key per instance + the `stratified_repos` meta (checklist item 15); produced by `scripts/pin_pilot_b_instances.py` (deterministic: the Verified file sha256 + the selection rule in its header) |
 | `notes/acp-surface.md` | **WP0 notes** — the recon record answering every "?" |
 | `notes/models-list.json` | Raw `devin models list --format json` (2026-10-26) |
 | `notes/auth-status.txt` | `devin auth status` output (quota evidence) |
@@ -72,7 +86,7 @@ calibration math). The live run + measured go/no-go record:
 | `runner.py` | **WP3a + WP3b** — sequential queue (concurrency 1 by default), quota-budget state machine (`running → budget_exhausted → sleeping → resume`), overlap guard + concurrency flag contract, abort on 2 consecutive `agent_error`; checkpoint/resume with pass@1-correct retry semantics (`JsonlCheckpoint`, `resume_queue`), the dynamic cost-tier model gate (fail-closed, `gate_cost_tier`/`parse_models_list`/`fetch_models_list`), the zero-quota pre-flight (`Preflight`, before every batch + every instance) (pure stdlib) |
 | `evaluate.py` | **WP4** — the SWE-bench evaluation leg: a thin delegate to `python -m swebench.harness.run_evaluation` (standard predictions file, fresh harness-created container, `{resolved, logs}` return contract, typed error hierarchy `InvalidInputError`/`PatchCorruptionError`/`EvaluationTimeoutError`/`HarnessFailedError`; never imports `swebench` — the subprocess is the only harness interaction; pure stdlib + subprocess) |
 | `report.py` | **WP5** — the report leg: pass@1 overall + per-repo table (WP3b resume-dedup; the retry class excluded from the denominator — the pass@1-correct semantics), the failure taxonomy, the methodology block, the leaderboard artifacts (`all_preds.jsonl` + `trajs/`), the artifact cross-check (typed errors `InvalidInputError`/`ReportProtocolError`/`ArtifactCheckError`; reads the run JSONL by import from `runner.load_checkpoint` — one source of truth for the WP3 schema; pure stdlib + `runner`) |
-| `tests/` | **WP1** — unit tests + in-process mock `devin` server; **WP2** — `mock_devin` integration tests (driven through the real WP1 client); **WP3a** — `runner` unit tests (instrumented fake sessions); **WP3b** — resume fixtures (incl. EOF corruption + retry-class rules), cost-tier gate fixtures (paid model, shape change, paid override), pre-flight stub-failure tests; **WP4** — `evaluate` unit tests (injected harness runner + fabricated harness trees, zero quota) + CI integration tests (positive control on the public flask image, corruption guard, isolation; skip without a Docker daemon); **WP5** — `report` unit tests (fixture JSONL → exact expected numbers: resume-dedup, terminal-status exclusion, artifact cross-checks, trajs byte-for-byte, methodology, determinism, CLI exit codes; zero quota); **WP6a** — `test_live_pilot.py` (the full pilot pipeline through `mock_devin`, zero quota; the failure-mode mapping; interrupt + resume pass@1 semantics; the pre-flight batch marker; the paid-model gate refusal; the patch guards incl. pre-staged junk + collapsed-dir expansion; the host-check verdicts; the calibration/checklist math; one `BENCH_LIVE`-gated real-binary handshake smoke); **CI (issue #20)** — the `BENCH_LIVE` gate (real-Devin tests excluded by default; `BENCH_LIVE=1` opts in; the static guard fails the suite on an unmarked real-Devin test; zero quota) |
+| `tests/` | **WP1** — unit tests + in-process mock `devin` server; **WP2** — `mock_devin` integration tests (driven through the real WP1 client); **WP3a** — `runner` unit tests (instrumented fake sessions); **WP3b** — resume fixtures (incl. EOF corruption + retry-class rules), cost-tier gate fixtures (paid model, shape change, paid override), pre-flight stub-failure tests; **WP4** — `evaluate` unit tests (injected harness runner + fabricated harness trees, zero quota) + CI integration tests (positive control on the public flask image, corruption guard, isolation; skip without a Docker daemon); **WP5** — `report` unit tests (fixture JSONL → exact expected numbers: resume-dedup, terminal-status exclusion, artifact cross-checks, trajs byte-for-byte, methodology, determinism, CLI exit codes; zero quota); **WP6a** — `test_live_pilot.py` (the full pilot pipeline through `mock_devin`, zero quota; the failure-mode mapping; interrupt + resume pass@1 semantics; the pre-flight batch marker; the paid-model gate refusal; the patch guards incl. pre-staged junk + collapsed-dir expansion; the host-check verdicts; the calibration/checklist math; one `BENCH_LIVE`-gated real-binary handshake smoke; **WP6b** — the `--import-run` import (the never-rerun reuse: the original timestamp preserved, no session spent; the retry-class re-run; the idempotent seeding; the referenced-artifact copy; the fail-closed source validation), the checklist items 15 (stratification), 16 (the 2-run overlap/variance), 17 (the root-caused `eval_error`), the per-UTC-window item 12 + the root-cause taxonomy (env/parser/patch)); **CI (issue #20)** — the `BENCH_LIVE` gate (real-Devin tests excluded by default; `BENCH_LIVE=1` opts in; the static guard fails the suite on an unmarked real-Devin test; zero quota) |
 | `conftest.py` | pytest path shim for the flat layout + the `BENCH_LIVE` gate (`@pytest.mark.bench_live` — real-Devin tests are excluded by default; CI never consumes quota, PLAN §6) |
 | `pyproject.toml` / `requirements.lock` | Python ≥3.11; `swebench==5.0.2` pinned; `pytest-timeout` (the integration tests' watchdog) |
 
@@ -577,6 +591,68 @@ BENCH_LIVE=1 python live_pilot.py --mode sandbox --run-id pilotA \
   patch guards, the host-check verdicts, the checklist math) — one
   real-binary handshake smoke is `@pytest.mark.bench_live`-gated
   (skipped by default; CI never consumes quota, PLAN §6).
+
+## Pilot B (WP6b, issue #22 — the 25-instance stratified pilot)
+
+The WP6a harness, extended (`PLAN-WP6B.md`): the 25 pinned instances
+across **all 12** Verified repos (`pilot_b_instances.json` — the
+`stratified_repos` meta drives checklist item 15) run sequentially in
+sandbox mode through the same WP1–WP5 pipeline, **importing the
+Pilot-A checkpoint** so the three Pilot-A instances are reused, never
+re-run:
+
+```bash
+cd bench
+# the WP3 runner window model: at the local daily cap the run exits
+# 43 and the operator re-invokes with --resume (next UTC-midnight
+# window); item 12 gates the budget per window
+BENCH_LIVE=1 python live_pilot.py --pilot b --mode sandbox \
+  --run-id pilotB --workdir ./pilot-b --resume \
+  --import-run pilotA \
+  --import-workdir <wp6a-workspace>/pilot-a \
+  --interrupt-after 8
+# next UTC-midnight window — same workdir, no --import-* (the lines
+# are already in the checkpoint; seeding is idempotent):
+BENCH_LIVE=1 python live_pilot.py --pilot b --mode sandbox \
+  --run-id pilotB --workdir ./pilot-b --resume
+```
+
+- **The import (issue #22 AC2 — reuse, never re-run):**
+  `--import-run RUN --import-workdir DIR` reads `DIR/run-RUN.jsonl`
+  (fail-closed before the pre-flight: a missing / corrupt source is a
+  config error, exit 2, no session spent). The terminal, non-retry
+  statuses (the runner's `NEVER_RERUN_STATUSES` — `resolved` /
+  `failed_test` / `timeout` / `no_patch` / `agent_error` — the
+  session was burned, the outcome is final) are copied verbatim into
+  this run's checkpoint with their **original timestamp** (they count
+  toward the source run's window, never this run's daily budget) +
+  the `meta.imported_from` marker, and the referenced artifacts are
+  copied so this run's WP5 cross-check holds. The retry-class
+  statuses (the runner's `RETRY_STATUSES` — `quota_limited` /
+  `eval_error` / `preflight_failed`; the only pass@1 retry class,
+  PLAN §2.5 — e.g. the Pilot-A `psf__requests-1142` no-container
+  skip) are **not** imported: the instance runs in this run. A repeat
+  `--resume` never re-seeds (no duplicate import lines).
+- **The measurement (issue #22 AC1/AC3/AC4):** the same per-instance
+  measurement as Pilot A, plus — (AC1) the per-repo stratification
+  (item 15: every repo in `stratified_repos` has a final line;
+  per-repo wall/token variance in the report); (AC3) every
+  `eval_error` line is root-caused to `env` / `parser` / `patch`
+  (item 17 gates on it; the harness classifies the failure points —
+  the host-check install/apply/pytest legs, the WP4 typed errors, the
+  oversize-patch cap — and the operator may override via the state
+  file); (AC4) the per-UTC-window budget gate (item 12 buckets the
+  checkpoint by day; a single-window run renders the verbatim WP6a
+  text) + the 2-run overlap/variance report (item 16: the imported
+  Pilot-A lines vs the Pilot-B finals — status / session wall /
+  tokens / patch bytes; the `--interrupt-after` interrupt + the
+  `--resume` continuation exercise the AC4 resume path on the
+  real-quota run).
+- **The verdict:** `GO ⟺` items 1–12 + 14–17 pass (item 13 remains
+  deviation-tolerant, non-gating — `graded_by` is recorded). The
+  verdict + the measured numbers (the per-repo variance, the overlap
+  table, the failure taxonomy, the window budget arithmetic) are
+  recorded in `notes/wp6b-pilot-b.md`.
 
 ## SWE-bench pin (WP0 result)
 
