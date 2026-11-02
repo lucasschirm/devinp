@@ -34,11 +34,21 @@ invalid JSON (… 0 bytes)"*. It now works harder to get the whole document:
 - Prices are captured through a temp file in `os.tmpdir()` — a pipe stream from
   `devin` can be truncated mid-write, so `devinp` points `devin`'s stdout at a
   real file first. The temp file is always removed after the run.
-- **Retries, each one louder about not being interactive.** If an attempt
-  yields no usable JSON, `devinp` runs `devin` again with the "not interactive"
-  conventions set (`PAGER=cat`, `GIT_PAGER=cat`, `TERM=dumb`, `NO_COLOR=1`,
-  `CI=1`) and, on the last try, captures over a pipe instead of a file. The
-  first successful attempt wins, so the healthy path costs one `devin` call.
+- **Retries that take the terminal away from `devin`.** If an attempt yields no
+  usable JSON, `devinp` runs `devin` again, each time stripping more of the
+  interactive terminal off it:
+
+  | # | stdout goes to | environment | controlling terminal |
+  | - | ------------ | -------------------------------------------------------- | --------------------- |
+  | 1 | temp file | yours, untouched | yes — the healthy path, one `devin` call |
+  | 2 | temp file | `PAGER=cat`, `GIT_PAGER=cat`, `TERM=dumb`, `NO_COLOR=1`, `CI=1` | **none** |
+  | 3 | pipe | same | **none** |
+
+  Spawned in its own session, `devin` cannot open `/dev/tty`: a pager or a TUI
+  that paints a "click to show more" view onto the terminal has nowhere to
+  draw, so the document has to come out of stdout. Nothing lands on the screen
+  you are typing in, and Ctrl-C there no longer kills the lookup. The first
+  attempt that parses wins, so the healthy path is unchanged.
 - Noise around the document is tolerated: ANSI colours, an update banner in
   front, or the `pass a slug to --model` hint behind are stripped before the
   JSON is parsed.
@@ -46,9 +56,11 @@ invalid JSON (… 0 bytes)"*. It now works harder to get the whole document:
   prints a warning, and renders the partial table.
 - A real CLI failure (not signed in, network down) is reported as-is instead of
   being retried.
-- If nothing worked, the error lists every attempt — bytes, exit code, stderr,
-  timeout — and how to feed the data in yourself. That always works, because a
-  redirect or a pipe makes `devin` write the whole document in one go:
+- If nothing worked, the error lists all three attempts — bytes, exit code,
+  stderr, timeout — and how to feed the data in yourself. That always works,
+  because a redirect or a pipe makes `devin` write the whole document in one go:
+  (and if it does not, `command -v devin` tells you whether devinp is even
+  talking to the CLI and not to a shell function or agent wrapper around it).
 
   ```sh
   devin models list --format json > models.json && devinp --source models.json

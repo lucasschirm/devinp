@@ -65,28 +65,39 @@ describe('runDevinJson', () => {
     assert.ok(attempts.every((a) => a.timedOut), 'every attempt should be flagged as timed out')
   })
 
-  it('retries until an attempt yields JSON, forcing a non-interactive environment', async () => {
+  it('escalates: retries with paging disabled and no controlling terminal', async () => {
     const fake = await makeFakeDevin('devin-flaky.sh', {
       stdout: OK_DOC,
       before: [
         'n=$(cat "$0.count" 2>/dev/null || echo 0)',
         'n=$((n+1)); echo "$n" > "$0.count"',
-        `echo "run $n TERM=$TERM PAGER=$PAGER NO_COLOR=$NO_COLOR CI=$CI" >> "$0.log"`,
+        `echo "run $n pid=$$ pgid=$(ps -o pgid= -p $$ | tr -d ' ') TERM=$TERM PAGER=$PAGER NO_COLOR=$NO_COLOR CI=$CI" >> "$0.log"`,
         '[ "$n" -lt 3 ] && exit 0',
       ],
     })
     const {parsed, attempts} = await runDevinJson({command: fake})
     assert.deepEqual(parsed, JSON.parse(OK_DOC))
     assert.equal(attempts.length, 3)
-    // First attempt keeps the caller's environment; the retries say
-    // "not interactive" so pagers and TUIs stay out of the stream.
-    assert.match(attempts[1].label, /non-interactive/)
-    const lines = (await readFile(`${fake}.log`, 'utf8')).trim().split('\n')
-    assert.equal(lines.length, 3)
-    assert.match(lines[1], /TERM=dumb PAGER=cat NO_COLOR=1 CI=1/)
-    assert.match(lines[2], /TERM=dumb PAGER=cat NO_COLOR=1 CI=1/)
+    assert.match(attempts[0].label, /^temp file$/)
+    assert.match(attempts[1].label, /paging disabled/)
     // The third attempt captures over a pipe instead of a temp file.
     assert.match(attempts[2].label, /^pipe/)
+
+    const lines = (await readFile(`${fake}.log`, 'utf8')).trim().split('\n')
+    assert.equal(lines.length, 3)
+    // Attempt 1 keeps the caller's environment; the retries say "not
+    // interactive" so pagers, colours and prompts stay out of the stream.
+    assert.doesNotMatch(lines[0], /TERM=dumb/)
+    assert.match(lines[1], /TERM=dumb PAGER=cat NO_COLOR=1 CI=1/)
+    assert.match(lines[2], /TERM=dumb PAGER=cat NO_COLOR=1 CI=1/)
+    // A detached spawn leads its own session, so it has no controlling
+    // terminal to paint a paged view on (pgid === pid).
+    for (const [i, line] of lines.entries()) {
+      const pid = Number(/pid=(\d+)/.exec(line)[1])
+      const pgid = Number(/pgid=(\d+)/.exec(line)[1])
+      if (i === 0) assert.notEqual(pgid, pid, 'attempt 1 stays in devinp\'s process group')
+      else assert.equal(pgid, pid, `attempt ${i + 1} must lead its own session`)
+    }
   })
 
   it('salvages JSON that arrives coloured or wrapped in chatter', async () => {
@@ -119,6 +130,20 @@ describe('loadModelData (live path)', () => {
     assert.equal(truncated, undefined)
     assert.equal(retries, 0)
     assert.equal(data.families.length, 1)
+  })
+
+  it('beats a devin that keeps its paged view as long as it has a terminal', async () => {
+    // The reported failure: the CLI draws its interactive "click to show
+    // more" list and writes 0 bytes. Such a CLI is simulated here by a
+    // fake that only answers once it has no controlling terminal — which
+    // is exactly what the detached retries give it.
+    const fake = await makeFakeDevin('devin-pager.sh', {
+      stdout: JSON.stringify({families: [{slug: 'a', variants: []}]}),
+      before: [`[ "$(ps -o pgid= -p $$ | tr -d ' ')" != "$$" ] && exit 0`],
+    })
+    const {data, retries} = await loadModelData({command: fake})
+    assert.equal(data.families.length, 1)
+    assert.equal(retries, 1)
   })
 
   it('reports how many extra attempts the machine needed', async () => {
