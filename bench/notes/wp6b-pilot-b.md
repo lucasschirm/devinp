@@ -70,9 +70,32 @@ BENCH_LIVE=1 /tmp/benchvenv/bin/python live_pilot.py --pilot b \
 
 ## Measured numbers per instance (from `run-pilotB.jsonl`)
 
-_recorded per window as the run completes; the final table is the
-per-repo stratification (AC1) — wall / tokens / patch bytes per repo,
-2 instances each (3 for the capped repos)._
+_window 1, measured so far (3 of the 8 interrupt-after sessions — the
+run is in flight; the remaining windows complete in-process and are
+appended here as they finish; the final table is the per-repo
+stratification (AC1) — wall / tokens / patch bytes per repo):_
+
+| instance | status | session wall | tokens | notes |
+|---|---|---|---|---|
+| `mwaskom__seaborn-3069` | `resolved` (imported, Pilot A) | 411.5 s | 68,578 | never-rerun reuse — the original Pilot-A `ts`, no session spent (item 16) |
+| `pallets__flask-5014` | `failed_test` (imported, Pilot A) | 251.1 s | 31,015 | never-rerun reuse — the original Pilot-A `ts`, no session spent (item 16) |
+| `django__django-10097` | `eval_error` (root cause `patch`) | 277.0 s | 38,987 | host-check model-patch apply leg: `git apply model_patch: error: can't open patch './pilot-b/host-check/django__dja…'` |
+| `django__django-10554` | `eval_error` (root cause `patch`) | 201.7 s | 77,905 | the same `patch` class (the host-check apply leg) |
+| `django__django-10880` | `quota_limited` | 282.1 s | 44,753 | the mid-window 429 refusal (the retry class — re-run on the next invocation) |
+
+_window 1 checkpoint: 2 imported (never-rerun) + 3 fresh attempts (of
+the 8 interrupt-after sessions); the run then continues in-process to
+the window cap / the interrupt (exit 42), and the delegated
+continuation spans windows 2–3._
+
+## 2-run overlap/variance (issue #22 AC2 — Pilot A vs Pilot B)
+
+The imported Pilot-A lines (`flask`, `seaborn` — never-rerun; their
+Pilot-A finals are the import itself) vs the Pilot-B finals:
+status / session wall / tokens / patch bytes. `psf__requests-1142`
+was `eval_error` in Pilot A (the no-container skip, root cause `env`)
+and is re-run in Pilot B per pass@1 — its Pilot-B final is the
+fresh, superseding line (the retry class, not a re-run).
 
 ## 2-run overlap/variance (issue #22 AC2 — Pilot A vs Pilot B)
 

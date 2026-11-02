@@ -289,6 +289,11 @@ class PilotConfig:
                     "--import-run must be a run id of the SWE-bench "
                     "id charset [A-Za-z0-9][A-Za-z0-9._-]* without "
                     f"'..' (got {self.import_run!r})")
+        if self.run_id is not None and not isinstance(
+                self.run_id, str):
+            raise PilotConfigError(
+                f"run_id must be a string (got "
+                f"{type(self.run_id).__name__})")
         # the run id (the --run-id flag) is joined into the checkpoint
         # / state filenames (run-<id>.jsonl / pilot-<id>.state.json)
         # and reaches ev.evaluate (a non-conforming id would degrade
@@ -481,6 +486,23 @@ def load_imported(config: PilotConfig, workdir: str,
     """
     src = os.path.join(config.import_workdir or workdir,
                       f"run-{config.import_run}.jsonl")
+    # fail-closed: a SELF-IMPORT is rejected — with the default
+    # import-workdir (this run's workdir) and --import-run equal to
+    # this run's id, the source IS this run's own checkpoint: a
+    # later-window --resume would re-derive ``imported`` from the
+    # run's own seeded lines, overwrite ``state.import_source`` /
+    # ``imported_run``, and item 16 would pass on a self-comparison
+    # (the real 2-run overlap evidence clobbered)
+    if (config.import_run == config.run_id
+            and (config.import_workdir is None
+                 or os.path.abspath(config.import_workdir)
+                 == os.path.abspath(workdir))):
+        raise PilotConfigError(
+            f"--import-run {config.import_run!r} is this run's own "
+            "run id with this run's workdir — a self-import is "
+            "rejected (it would re-derive the import from the run's "
+            "own seeded lines; item 16 would pass on a "
+            "self-comparison)")
     if not os.path.isfile(src):
         raise PilotConfigError(
             f"--import-run source not found: {src!r} (the import is "
@@ -542,7 +564,13 @@ def _copy_imported_artifacts(rec: dict, src_workdir: str,
         dst_base = (ad if os.path.isabs(ad)
                     else os.path.join(dst_workdir, ad))
     else:
-        src_base = dst_base = None
+        # the WP5 ``_ref_path`` contract: a reference without an
+        # ``artifacts_dir`` resolves against the run JSONL's
+        # directory (the workdir) — the copy must land there too
+        # (a None base would make the same-path guard a trivial
+        # no-op and the artifact would never be copied — the
+        # cross-check then reports it missing at report time)
+        src_base, dst_base = src_workdir, dst_workdir
     for key in ("patch_diff", "trajectory", "eval_log"):
         val = meta.get(key)
         if not isinstance(val, str) or not val:

@@ -3310,3 +3310,102 @@ def test_wp6b_round4_run_id_charset_validation(tmp_path):
     # a generated id (run_id=None) is unaffected
     lp.PilotConfig(mode="sandbox", run_id=None,
                   instances_file="x.json")
+
+
+def test_wp6b_round5_self_import_rejected(tmp_path, live):
+    """The round-5 Medium fix (issue #22 AC2): a SELF-IMPORT is
+    rejected — --import-run equal to --run-id with the default
+    import-workdir (this run's workdir) makes the source this run's
+    own checkpoint; a later-window --resume would re-derive
+    ``imported`` from the run's own seeded lines, overwrite
+    ``state.import_source`` / ``imported_run``, and item 16 would
+    pass on a self-comparison (the real 2-run overlap evidence
+    clobbered). Fail-closed: a config error before the pre-flight."""
+    repos, inst = _two_pilot_b_repos(tmp_path)
+    wd = tmp_path / "wd"
+    # the self-import: import_run == run_id, the default workdir
+    cfg = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
+               host_check=False, pilot="b",
+               import_run="pilotB")
+    try:
+        lp.load_imported(cfg, str(wd), [])
+    except lp.PilotConfigError:
+        pass
+    else:
+        raise AssertionError("the self-import was accepted")
+    # an explicit same-workdir self-import is rejected too
+    cfg2 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
+                host_check=False, pilot="b",
+                import_run="pilotB", import_workdir=str(wd))
+    try:
+        lp.load_imported(cfg2, str(wd), [])
+    except lp.PilotConfigError:
+        pass
+    else:
+        raise AssertionError("the explicit self-import was accepted")
+    # the same run id in a DIFFERENT workdir is a legitimate import
+    # (the source file is a different file) — not rejected
+    other = tmp_path / "other"
+    other.mkdir()
+    with open(other / "run-pilotB.jsonl", "w") as f:
+        f.write(json.dumps({"instance_id": "x", "status": "resolved",
+                            "ts": 1.0, "meta": {}}) + "\n")
+    cfg3 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
+                host_check=False, pilot="b",
+                import_run="pilotB", import_workdir=str(other))
+    # no config error at the self-import check (the source exists)
+    try:
+        lp.load_imported(cfg3, str(wd), [])
+    except lp.PilotConfigError as exc:
+        # a different-workdir source must not trip the self-import
+        # rejection (it may fail for other reasons, never the
+        # self-import one)
+        assert "self-import" not in str(exc), exc
+
+
+def test_wp6b_round5_artifacts_dir_absent_copies_to_workdir_root(
+        tmp_path):
+    """The round-5 Minor fix (issue #22 AC2 / the WP5 cross-check):
+    a referenced artifact on a line whose ``meta.artifacts_dir`` is
+    absent resolves against the run JSONL's directory (the workdir
+    — the WP5 ``_ref_path`` contract) — the import copy must land
+    there too (a None base made the same-path guard a trivial no-op
+    and the artifact was never copied — the cross-check then
+    reports it missing at report time)."""
+    srcwd, dstwd = tmp_path / "src", tmp_path / "dst"
+    srcwd.mkdir()
+    dstwd.mkdir()
+    (srcwd / "trajectory.jsonl").write_text("t\n")
+    rec = {"instance_id": "x", "status": "resolved", "ts": 1.0,
+           "meta": {"trajectory": "trajectory.jsonl"}}  # no
+    # artifacts_dir
+    lp._copy_imported_artifacts(rec, str(srcwd), str(dstwd))
+    assert (dstwd / "trajectory.jsonl").is_file()
+    # the idempotent fast path (an existing destination) + the
+    # missing-source case (left as-is — the cross-check flags it,
+    # the WP5 semantics)
+    (dstwd / "eval.log").unlink(missing_ok=True)
+    rec2 = {"instance_id": "x", "status": "resolved", "ts": 1.0,
+           "meta": {"eval_log": "eval.log"}}
+    lp._copy_imported_artifacts(rec2, str(srcwd), str(dstwd))
+    assert not (dstwd / "eval.log").is_file()  # missing source
+
+
+def test_wp6b_round5_run_id_type_guard(tmp_path):
+    """The round-5 Minor fix: a non-string run_id is a fail-closed
+    PilotConfigError (exit 2) — the isinstance guard import_run has
+    — instead of a bare TypeError at the ``'..' in self.run_id``
+    check (a generic exit 4)."""
+    try:
+        lp.PilotConfig(mode="sandbox", run_id=123,
+                      instances_file="x.json")
+    except lp.PilotConfigError:
+        pass
+    else:
+        raise AssertionError("a non-string run_id was accepted")
+    try:
+        lp.PilotConfig(mode="sandbox", run_id=None,
+                      instances_file="x.json")
+    except lp.PilotConfigError:
+        raise AssertionError("run_id None (the generated id) was "
+                             "rejected")
