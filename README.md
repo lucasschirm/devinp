@@ -24,18 +24,36 @@ The package ships as a self-contained bundle — no dependencies are installed.
   not authenticated, `devinp` exits with an error (use `--source` for a saved
   snapshot).
 
-### When `devin` fails or truncates
+### When `devin` fails, pages, or truncates
 
-- Prices are captured through a temp file in `os.tmpdir()` — `devin`'s
-  interactive CLI can truncate a pipe stream mid-write, so `devinp` points
-  `devin`'s stdout at a real file instead. The temp file is always removed
-  after the run.
+`devin` is an interactive CLI, and on some machines it stays interactive even
+when a script calls it: the model list comes back paged ("click to show more")
+and the JSON never reaches stdout, so `devinp` used to die with *"returned
+invalid JSON (… 0 bytes)"*. It now works harder to get the whole document:
+
+- Prices are captured through a temp file in `os.tmpdir()` — a pipe stream from
+  `devin` can be truncated mid-write, so `devinp` points `devin`'s stdout at a
+  real file first. The temp file is always removed after the run.
+- **Retries, each one louder about not being interactive.** If an attempt
+  yields no usable JSON, `devinp` runs `devin` again with the "not interactive"
+  conventions set (`PAGER=cat`, `GIT_PAGER=cat`, `TERM=dumb`, `NO_COLOR=1`,
+  `CI=1`) and, on the last try, captures over a pipe instead of a file. The
+  first successful attempt wins, so the healthy path costs one `devin` call.
+- Noise around the document is tolerated: ANSI colours, an update banner in
+  front, or the `pass a slug to --model` hint behind are stripped before the
+  JSON is parsed.
 - If `devin`'s output is cut off mid-stream, `devinp` repairs the document,
   prints a warning, and renders the partial table.
-- If the output cannot be recovered, `devinp` reports a diagnostic with the
-  size and tail of what `devin` wrote, and suggests re-running or saving the
-  output manually: `devin models list --format json > models.json`, then
-  `devinp --source models.json`.
+- A real CLI failure (not signed in, network down) is reported as-is instead of
+  being retried.
+- If nothing worked, the error lists every attempt — bytes, exit code, stderr,
+  timeout — and how to feed the data in yourself. That always works, because a
+  redirect or a pipe makes `devin` write the whole document in one go:
+
+  ```sh
+  devin models list --format json > models.json && devinp --source models.json
+  devin models list --format json | devinp --source=-
+  ```
 
 ## Usage
 
@@ -55,6 +73,7 @@ devinp --web                 # serve an interactive page on http://127.0.0.1:432
 devinp --web --port 8080     # pick a port
 
 devinp --source models.json  # read a saved `devin models list --format json`
+devin models list --format json | devinp --source=-   # feed it straight from stdin
 devinp --json                # emit normalized rows as JSON
 ```
 
