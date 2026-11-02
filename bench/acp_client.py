@@ -660,6 +660,7 @@ class AcpSession:
         devin_bin: str = "devin",
         model: str = "swe-2-high",
         cwd: Optional[str] = None,
+        session_cwd: Optional[str] = None,
         extra_args: Optional[list] = None,
         env: Optional[dict] = None,
         policy: Optional[PermissionPolicy] = None,
@@ -672,6 +673,11 @@ class AcpSession:
         self._devin_bin = devin_bin
         self._model = model
         self._cwd = cwd
+        # the SESSION cwd (what ``session/new`` sends the agent) —
+        # distinct from the host-side spawn ``cwd`` (container mode:
+        # the devin process is a host process, the agent works in the
+        # container's ``/testbed``)
+        self._session_cwd = session_cwd
         self._extra_args = list(extra_args or [])
         self._env = dict(env or {})
         self._policy = policy or SwebenchPolicy()
@@ -702,6 +708,11 @@ class AcpSession:
         self.transcript: list[SessionEvent] = []
         #: every ignored vendor notification (logged, never an error)
         self.vendor_notifications: list[dict] = []
+        #: permission responses the client could NOT send (the process
+        #: was already dying — a request the server never heard; the
+        #: transcript entry is appended before the send attempt, so a
+        #: non-zero count is the "not all answered" signal)
+        self.permission_send_failures: int = 0
 
     # -- context manager -------------------------------------------------
 
@@ -730,10 +741,21 @@ class AcpSession:
                 raise AcpProtocolError(
                     "--refusal-fallback is forbidden (PLAN §3.4)"
                 )
-        # Env hygiene (PLAN §3.4): refusal-fallback is NEVER in the child
-        # env, even if the caller supplied it.
-        env = dict(os.environ)
-        env.update(self._env)
+        # Env hygiene (PLAN §3.4): the session env is AUTHORITATIVE
+        # when the caller supplied one — the pilot passes a filtered
+        # env (host credentials stripped), and overlaying on
+        # ``os.environ`` here would re-inherit exactly what the
+        # caller removed (including its ``DEVIN_MODEL`` / refusal
+        # pops). The host env is the default only for a bare
+        # session (``env`` absent / empty — container mode, where
+        # the shim forwards the agent's env into the container via
+        # ``docker exec -e`` flags, so the shim process's own host
+        # env never reaches the agent). Refusal fallback stays out
+        # in every case.
+        if self._env:
+            env = dict(self._env)
+        else:
+            env = dict(os.environ)
         env.pop("DEVIN_REFUSAL_FALLBACK", None)
         cmd = [self._devin_bin, "acp"]
         if self._model:
@@ -785,12 +807,14 @@ class AcpSession:
 
     def create_session(self, cwd: Optional[str] = None,
                       mcp_servers: Optional[list] = None) -> str:
-        """``session/new`` (benchmark default: ``cwd="/testbed"``)."""
+        """``session/new`` (benchmark default: ``cwd="/testbed"``) —
+        the session cwd wins over the spawn cwd (container mode:
+        spawn in a host dir, session in the container's ``/testbed``)."""
         self._require_state("initialized")
         deadline = time.monotonic() + self._session_timeout
         rid = self._tx.send_request(
             WIRE["SESSION_NEW"],
-            {"cwd": cwd or self._cwd or "/testbed",
+            {"cwd": cwd or self._session_cwd or self._cwd or "/testbed",
              "mcpServers": mcp_servers if mcp_servers is not None else []},
             deadline=deadline,
         )
@@ -1081,7 +1105,12 @@ class AcpSession:
                 deadline=time.monotonic() + 2.0,
             )
         except (OSError, ValueError, AcpError):
-            pass  # process dying — kill path covers it
+            # process dying — the kill path covers the session; but the
+            # unanswered REQUEST is recorded (the pilot's checklist item
+            # 6 must be able to observe a request the server never
+            # heard — the transcript entry alone is vacuous by
+            # construction)
+            self.permission_send_failures += 1
 
     def _kill_group(self) -> None:
         if self._killed or self._proc is None:
@@ -1127,10 +1156,20 @@ class AcpSession:
                         and len(self._stderr_chunks) > 1:
                     total -= len(self._stderr_chunks.pop(0))
 
-    def _capture_stderr(self) -> None:
+    def stderr_tail_now(self) -> str:
+        """The current stderr tail — readable **during** the session
+        (the drain thread accumulates the chunks continuously; a caller
+        that never joins the thread still sees what has drained so
+        far). ``close()`` updates :attr:`stderr_tail` with the final
+        drain after the thread is joined — but the mid-session
+        quota / rate-limit signal (PLAN §2.3) reads **this**, not
+        :attr:`stderr_tail` (which is empty until close)."""
         with self._stderr_lock:
             data = b"".join(self._stderr_chunks)
-        self.stderr_tail = data[-4000:].decode("utf-8", "replace")
+        return data[-4000:].decode("utf-8", "replace")
+
+    def _capture_stderr(self) -> None:
+        self.stderr_tail = self.stderr_tail_now()
 
     def _close_stdin(self) -> None:
         self._close_pipe(self._proc.stdin if self._proc is not None else None)
