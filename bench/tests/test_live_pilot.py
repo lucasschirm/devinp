@@ -3860,3 +3860,45 @@ def test_wp6b_round9_mid_file_corruption_is_config_error(tmp_path):
     else:
         raise AssertionError("a mid-file corruption was not a "
                              "config error")
+
+
+def test_wp6b_round10_rederivation_non_dict_meta(tmp_path, live):
+    """The round-10 Minor fix (issue #22 AC2): a truthy non-dict
+    meta on a checkpoint line (the same corrupt-line class
+    load_imported validates on the source side) no longer crashes
+    the checkpoint re-derivation with an uncaught AttributeError
+    (exit 4) — the _meta_of guard normalizes it to {} (the line
+    simply lacks a meta for the accounting / re-derivation), and
+    the run proceeds (exit 0)."""
+    repos = _three_repos(tmp_path)
+    inst = _instances_file(tmp_path / "inst.json", repos)
+    ids = [e["instance_id"] for e in repos]
+    i0, i1, i2 = ids
+    wd = tmp_path / "wd"
+    wd.mkdir()
+    cp = wd / "run-t.jsonl"
+    good0 = json.dumps({"instance_id": i0, "status": "no_patch",
+                        "ts": 1.0, "meta": {}})
+    corrupt = json.dumps({"instance_id": i1, "status": "no_patch",
+                          "ts": 2.0,
+                          "meta": "a-corrupt-string-meta"})
+    cp.write_text(good0 + "\n" + corrupt + "\n")
+    cfg = _cfg(tmp_path, inst, run_id="t", workdir=str(wd),
+               resume=True, host_check=False)
+    # the run PROCEEDS through the re-derivation (i2 runs — the
+    # fresh session line exists) and then fails at the WP5 report
+    # (its fail-loud meta validation — the documented report
+    # class, the resume class — NOT the old uncaught
+    # AttributeError at the re-derivation, which crashed BEFORE i2
+    # ran)
+    assert _run(cfg, _mock_make_session(
+        {i0: "no_patch", i1: "no_patch", i2: "no_patch"})) \
+        == lp.EXIT_RUN_FAILED
+    lines = _read_jsonl(cp)
+    # i2 was RUN (the re-derivation did not crash before the
+    # sessions)
+    assert sum(1 for l in lines if l["instance_id"] == i2) == 1
+    # the failure is the WP5 report class (the documented resume
+    # class) — not a generic runner error
+    st = json.loads((wd / "pilot-t.state.json").read_text())
+    assert st["final_state"] == "report_failed", st

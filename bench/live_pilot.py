@@ -2205,7 +2205,7 @@ def calibrate(records: list, config: PilotConfig) -> dict:
     tokens = 0
     usage_seen = False
     for rec in records:
-        meta = rec.get("meta") or {}
+        meta = _meta_of(rec)
         w = (meta.get("wall") or {}).get("session_s")
         if isinstance(w, (int, float)) and not isinstance(w, bool):
             walls.append(float(w))
@@ -2321,7 +2321,7 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
     attempt_tokens = 0
     attempt_usage_seen = False
     for r in att:
-        m = r.get("meta") or {}
+        m = _meta_of(r)
         w = (m.get("wall") or {}).get("session_s")
         if isinstance(w, (int, float)) and not isinstance(w, bool):
             attempt_wall.append((r.get("status"), w))
@@ -2334,7 +2334,7 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
                     attempt_tokens += int(v)
                     break
     for rec in records:
-        m = rec.get("meta") or {}
+        m = _meta_of(rec)
         p = m.get("permissions") or {}
         perms_req += int(p.get("requests", 0))
         if int(p.get("requests", 0)) != int(p.get("allowed", 0)) + int(
@@ -2600,8 +2600,8 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
                 src = imported[iid]
                 fin = next((r for r in records
                            if r.get("instance_id") == iid), None)
-                sm = src.get("meta") or {}
-                fm = (fin.get("meta") or {}) if fin else {}
+                sm = _meta_of(src)
+                fm = _meta_of(fin) if fin else {}
                 s_wall = (sm.get("wall") or {}).get("session_s")
                 f_wall = (fm.get("wall") or {}).get("session_s")
                 s_tok = _usage_total(sm.get("usage"))
@@ -2625,7 +2625,7 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
             # is the item-12 budget basis, not an arithmetic break
             new_iids = {r.get("instance_id") for r in records
                        if r.get("instance_id")
-                       and not (r.get("meta") or {}).get(
+                       and not _meta_of(r).get(
                            "imported_from")
                        and r.get("status") != "preflight_failed"}
             unique = len({r.get("instance_id") for r in records
@@ -2652,7 +2652,7 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
         # 17 — the root-caused eval_error (AC3)
         ee = [r for r in records if r.get("status") == "eval_error"]
         unclassed = [r.get("instance_id") for r in ee
-                    if (r.get("meta") or {}).get(
+                    if _meta_of(r).get(
                         "eval_error_root_cause")
                     not in ("env", "parser", "patch")]
         unclassified_obs = (
@@ -2665,7 +2665,7 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
         if ee:
             by_class: dict = {}
             for r in ee:
-                c = (r.get("meta") or {}).get(
+                c = _meta_of(r).get(
                     "eval_error_root_cause")
                 if c in ("env", "parser", "patch"):
                     by_class[c] = by_class.get(c, 0) + 1
@@ -2878,6 +2878,20 @@ def _state_path(workdir: str, run_id: str) -> str:
     return os.path.join(workdir, f"pilot-{run_id}.state.json")
 
 
+def _meta_of(rec: dict) -> dict:
+    """The record's meta as a dict (the round-10 fix, issue #22): a
+    corrupt (non-dict) meta is normalized to ``{}`` — a truthy
+    non-dict meta (the same corrupt-line class :func:`load_imported`
+    validates on the source side) must not crash the read-side
+    accounting (the checkpoint re-derivation, the window buckets,
+    the calibrate exclusion, the checklist math) with an uncaught
+    ``AttributeError`` (exit 4) — the dict guard keeps the read
+    side robust (the line simply lacks a meta for the accounting).
+    """
+    m = rec.get("meta")
+    return m if isinstance(m, dict) else {}
+
+
 def _load_state(workdir: str, run_id: str) -> dict:
     p = _state_path(workdir, run_id)
     if not os.path.isfile(p):
@@ -2986,7 +3000,7 @@ def _window_buckets(records: list) -> dict:
     for r in records:
         if not r.get("instance_id"):
             continue
-        if (r.get("meta") or {}).get("imported_from"):
+        if _meta_of(r).get("imported_from"):
             continue  # the import — the source run's accounting
         ts = r.get("ts") or 0.0
         day = int(ts // 86400)
@@ -3000,7 +3014,7 @@ def _window_buckets(records: list) -> dict:
         # fix)
         if r.get("status") != "preflight_failed":
             w["sessions"] += 1
-        wall = (r.get("meta") or {}).get("wall_s", 0.0)
+        wall = _meta_of(r).get("wall_s", 0.0)
         if isinstance(wall, (int, float)) and not isinstance(wall, bool):
             w["wall_s"] += float(wall)
     return out
@@ -3058,8 +3072,8 @@ def _pilot_b_sections(config: PilotConfig, insts: list, records: list,
     for iid in sorted(imported):
         src = imported[iid]
         fin = final_by_iid.get(iid)
-        sm = src.get("meta") or {}
-        fm = (fin.get("meta") or {}) if fin else {}
+        sm = _meta_of(src)
+        fm = _meta_of(fin) if fin else {}
         wall_s = (lambda m: (m.get("wall") or {}).get("session_s"))
         toks = (lambda m: _usage_total(m.get("usage")))
         s_wall, f_wall = wall_s(sm), wall_s(fm)
@@ -3077,7 +3091,7 @@ def _pilot_b_sections(config: PilotConfig, insts: list, records: list,
             "final_wall": f_wall, "final_tokens": f_tok,
             "final_patch": f_pb, "match": match})
     new_lines = [r for r in records if r.get("instance_id")
-                and not (r.get("meta") or {}).get("imported_from")
+                and not _meta_of(r).get("imported_from")
                 and r.get("status") != "preflight_failed"]
     # the session arithmetic counts UNIQUE new instances (a legal
     # pass@1 retry of one instance is several attempt lines — the
@@ -3115,7 +3129,7 @@ def _pilot_b_sections(config: PilotConfig, insts: list, records: list,
     for r in inst_records:
         if r.get("status") != "eval_error":
             continue
-        m = r.get("meta") or {}
+        m = _meta_of(r)
         rc = m.get("eval_error_root_cause")
         root_rows.append({
             "instance_id": r.get("instance_id"),
@@ -3290,12 +3304,13 @@ def run_pilot(config: PilotConfig,
                 pre_recs = []  # a torn tail (the host-crash class)
                 # makes the read fail — the state source is the only
                 # re-derivation available on that path
-            imported = {r.get("instance_id"): dict(r)
-                       for r in pre_recs
-                       if (r.get("meta") or {}).get(
-                           "imported_from")}
-            for r in imported.values():
-                (r.get("meta") or {}).pop("imported_from", None)
+            for r in pre_recs:
+                m = _meta_of(r)
+                if m.get("imported_from"):
+                    line = dict(r)
+                    line["meta"] = m
+                    m.pop("imported_from", None)
+                    imported[r.get("instance_id")] = line
             imported = {iid: line for iid, line in imported.items()
                        if iid in known}
             if imported:
@@ -3561,7 +3576,7 @@ def run_pilot(config: PilotConfig,
     # source-run wall/usage into this run's per-session stats would
     # misstate the run the calibration measures
     attempts = [r for r in records if r.get("instance_id")
-               and not (r.get("meta") or {}).get("imported_from")]
+               and not _meta_of(r).get("imported_from")]
     cal = calibrate(attempts, config)
     meta = {
         "run_id": run_id,
