@@ -259,7 +259,10 @@ interrupt after 8 completions (mid-batch); the windowed resumes.
    stops the batch, checkpoints, the 429 backstop parks it; the
    follow-up `--resume` continues in the next window (the retry
    class — the run's budget-window accounting item 12 holds because
-   the `quota_limited` line is excluded from the session count).
+   the `quota_limited` line IS counted in the window's session
+   count: it is a started-then-refused attempt that did burn wall.
+   Only the `preflight_failed` line is excluded — the pre-flight
+   consumed no session).
 2. **An `eval_error` whose host-check phase is ambiguous** → the
    class is whatever phase failed (the table is exhaustive over the
    host-check's failure points); the `detail` carries the raw

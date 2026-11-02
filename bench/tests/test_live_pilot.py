@@ -2787,3 +2787,107 @@ def test_item16_gates_on_arithmetic(tmp_path, monkeypatch):
                                      lp.PilotConfig(pilot="b")))
     assert verdict == "NO-GO"
     assert any(f.split(" ", 1)[0] == "16" for f in failed)
+
+
+def test_wp6b_round2_import_rederives_from_checkpoint_after_graceful_exit(
+        tmp_path, live):
+    """The round-2 Major fix (issue #22 AC2): a graceful early exit
+    (the pre-flight failure — exit 4, before the state write) leaves
+    ``import_source`` unpersisted; the follow-up ``--resume`` (the
+    documented multi-window flow, no --import-run) re-derives the
+    source lines from the checkpoint's own seeded lines (they carry
+    ``meta.imported_from`` + the original ``ts``) — item 16 still
+    gates on the completing record."""
+    repos, inst = _two_pilot_b_repos(tmp_path)
+    ids = [e["instance_id"] for e in repos]
+    i0, i1, i2 = ids
+    wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
+    # run 1 (the source): i0/i1 never-rerun, i2 eval_error (retry
+    # class) — the WP6b import-test pattern
+    modes1 = {i0: "no_patch", i1: "no_patch", i2: "ok"}
+    cfg1 = _cfg(tmp_path, inst, run_id="src", workdir=str(wd1),
+               host_check=False)
+    assert _run(cfg1, _mock_make_session(modes1)) == lp.EXIT_OK
+    # invocation 1 of the pilot-B pair: --import-run + --resume, but
+    # the pre-flight FAILS (the missing devin binary) — the seeding
+    # has already happened, then exit 4 BEFORE the state write
+    cfg2 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               resume=True, host_check=False, pilot="b",
+               import_run="src", import_workdir=str(wd1),
+               devin_bin=str(tmp_path / "missing-devin"))
+    assert _run(cfg2, _mock_make_session(modes1)) == lp.EXIT_RUN_FAILED
+    assert not (wd2 / "pilot-pilotB.state.json").exists()
+    # the seeded lines ARE in the checkpoint (the fallback source —
+    # plus the batch-level preflight_failed marker, no instance id)
+    lines = _read_jsonl(wd2 / "run-pilotB.jsonl")
+    inst_lines = [l for l in lines if l.get("instance_id")]
+    assert {l["instance_id"] for l in inst_lines} == {i0, i1}
+    assert all(l["meta"].get("imported_from") == "src"
+               for l in inst_lines)
+
+    # invocation 2: --resume, NO --import-run — the fallback
+    # re-derives from the checkpoint's seeded lines; item 16 gates
+    # on the completing record. i0/i1 are skipped (imported); i2
+    # re-runs (the retry class) and is no_patch this time.
+    modes2 = {i0: "no_patch", i1: "no_patch", i2: "no_patch"}
+    cfg3 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               resume=True, host_check=False, pilot="b")
+    assert _run(cfg3, _mock_make_session(modes2)) == lp.EXIT_OK
+    lines3 = _read_jsonl(wd2 / "run-pilotB.jsonl")
+    # no duplicate import lines (the post-repair read — the same
+    # idempotency as the flag path)
+    assert sum(1 for l in lines3 if l["instance_id"] == i0) == 1
+    assert sum(1 for l in lines3 if l["instance_id"] == i1) == 1
+    # item 16 gates on the completing record (2 imported + 1 new =
+    # 3 unique — not n/a)
+    gng = (wd2 / "wp6b-pilot-b.md").read_text()
+    i16 = [l for l in gng.splitlines()
+          if l.startswith("| 16 |")][0]
+    assert "n/a" not in i16, i16
+    assert "FAIL" not in i16, i16
+    assert "2 + 1 = 3" in i16, i16
+    # the overlap section rendered the per-instance row (i0's line
+    # matches the source's — the faithful, non-re-run overlap)
+    assert "## 2-run overlap/variance (issue #22 AC2)" in gng
+    assert "Overlap match: FAIL" not in gng
+
+
+def test_wp6b_round2_no_import_record_consistent(tmp_path, live):
+    """The round-2 Minor fix (issue #22 AC2): a pilot-B run with NO
+    import renders ``Overlap match: n/a (no import)`` in the section
+    — not ``FAIL`` (zero rows is not a mismatch) — consistent with
+    item 16's n/a (the record does not contradict itself)."""
+    repos, inst = _two_pilot_b_repos(tmp_path)
+    ids = [e["instance_id"] for e in repos]
+    i0, i1, i2 = ids
+    wd = tmp_path / "wd"
+    modes = {i0: "no_patch", i1: "no_patch", i2: "ok"}
+    cfg = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
+               host_check=False, pilot="b")
+    assert _run(cfg, _mock_make_session(modes)) == lp.EXIT_OK
+    gng = (wd / "wp6b-pilot-b.md").read_text()
+    assert "Overlap match: n/a (no import)" in gng
+    assert "Overlap match: FAIL" not in gng
+    i16 = [l for l in gng.splitlines()
+          if l.startswith("| 16 |")][0]
+    assert "n/a" in i16, i16
+
+
+def test_wp6b_round2_session_spec_carrys_the_run_id(tmp_path, live):
+    """The round-2 body flag (issue #22): ``_eval_container`` must
+    label its WP4 artifacts with the RUN's run id (a pilot-B run's
+    artifacts are ``pilotB-<iid>-...``, not ``pilotA-...``) — the
+    spec carries the id (the default keeps the WP6a form
+    byte-identical)."""
+    spec = lp.SessionSpec(
+        instance={"instance_id": "repo__a-1", "base_commit": "c1"},
+        mode="sandbox", devin_bin=MOCK_PATH, model="m",
+        cwd="/t", env={}, wall_s=1800.0, host_check=False,
+        workdir="wd")
+    assert spec.run_id == "pilotA"  # the WP6a default
+    spec_b = lp.SessionSpec(
+        instance={"instance_id": "repo__a-1", "base_commit": "c1"},
+        mode="sandbox", devin_bin=MOCK_PATH, model="m",
+        cwd="/t", env={}, wall_s=1800.0, host_check=False,
+        workdir="wd", run_id="pilotB")
+    assert spec_b.run_id == "pilotB"

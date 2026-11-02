@@ -948,6 +948,11 @@ class SessionSpec:
     host_check: bool
     workdir: str
     container: "Optional[str]" = None
+    # the run's label for the eval-leg artifact names (issue #22 —
+    # the WP4 artifacts are per-run; a pilot-B run must not label its
+    # artifacts ``pilotA-...``). The default keeps the WP6a form
+    # byte-identical
+    run_id: str = "pilotA"
 
 
 class PilotSession(rr.AgentSession):
@@ -1250,7 +1255,7 @@ class PilotSession(rr.AgentSession):
                 iid, patch,
                 model_name_or_path="devin-acp-benchmark",
                 workdir=workdir,
-                run_id="pilotA",
+                run_id=self._spec.run_id,
             )
         except ev.EvaluationError as exc:
             self.meta["wall"]["eval_s"] = round(
@@ -2583,6 +2588,9 @@ def _render_pilot_b_sections(wp6b: dict) -> list:
                 f"{r['final_tokens']} | {r['src_patch']} → "
                 f"{r['final_patch']} | "
                 f"{'PASS' if r['match'] else 'FAIL'} |")
+        match_label = ("PASS" if imp.get("all_match")
+                      else ("FAIL" if imp.get("rows")
+                           else "n/a (no import)"))
         lines += ["",
                   f"Session arithmetic: {imp.get('imported')} imported "
                   f"+ {imp.get('new_instances')} new = "
@@ -2590,7 +2598,7 @@ def _render_pilot_b_sections(wp6b: dict) -> list:
                   f"{'holds' if imp.get('arithmetic_holds') else 'BROKEN'} "
                   f"({imp.get('new_sessions')} attempt lines — the "
                   f"budget basis, item 12). Overlap match: "
-                  f"{'PASS' if imp.get('all_match') else 'FAIL'}.", ""]
+                  f"{match_label}.", ""]
     tax = wp6b.get("taxonomy") or {}
     rc = wp6b.get("root_causes") or []
     if tax or rc:
@@ -2772,13 +2780,14 @@ def _window_buckets(records: list) -> dict:
     lines (instance id, non-``preflight_failed`` — the WP3 contract:
     it consumed no session) bucketed by their ``ts``'s **UTC day**
     (the quota window boundary, ``next_quota_window`` — the next UTC
-    midnight; the WP3 ``Runner`` sleeps there to the next window in
-    the 500-run model, the pilot harness instead records
-    ``quota_limited`` — the retry class — and exits 0, the operator
-    resuming in the next window). Imported lines keep the source
-    run's ``ts`` — they land in the source window, never this run's
-    daily budget. A run that spans one window renders the verbatim
-    WP6a item-12 text."""
+    midnight; the WP3 ``Runner`` — the pilot harness' queue engine,
+    default sleeper — sleeps there at the per-process daily cap,
+    resets the budget counters (a new window is a fresh budget), and
+    continues the remaining queue in the same process, the 500-run
+    model: one process spans days across windows). Imported lines
+    keep the source run's ``ts`` — they land in the source window,
+    never this run's daily budget. A run that spans one window
+    renders the verbatim WP6a item-12 text."""
     out: dict = {}
     for r in records:
         if not r.get("instance_id"):
@@ -2882,8 +2891,12 @@ def _pilot_b_sections(config: PilotConfig, insts: list, records: list,
         "new_sessions": len(new_lines),
         "unique": unique,
         "arithmetic_holds": (len(imported) + len(new_iids) == unique),
+        # the overlap match is only defined for a run that has an
+        # import (zero rows is not a FAIL — item 16 renders n/a on
+        # a non-import run, and the record must not contradict
+        # itself)
         "all_match": all(r["match"] for r in import_rows)
-        if import_rows else False,
+        if import_rows else None,
     }
     # the AC3 taxonomy + the root-cause table (over the DEDUPED view
     # — a superseded attempt's eval_error is not the instance's
@@ -3018,17 +3031,50 @@ def run_pilot(config: PilotConfig,
     # in the state file by the importing invocation and re-derived
     # here (filtered to the current instance file — a stale id is
     # ignored, the load_imported semantics)
-    if (not imported and config.resume
-            and state.get("imported")
-            and isinstance(state.get("import_source"), dict)):
+    # the WP6b import re-derivation (issue #22 AC2): the documented
+    # multi-window flow drops --import-run on the continuation
+    # windows — but item 16 must still gate on the completing
+    # (verdict-producing) record. Two sources: the state file's
+    # ``import_source`` (persisted at the end of a finished
+    # invocation), or — when a graceful early exit (the pre-flight
+    # failure, the model-gate refusal, a load_checkpoint protocol
+    # error) leaves it unpersisted — the checkpoint's own seeded
+    # lines (they carry ``meta.imported_from`` + the original ``ts``;
+    # the source line is the line minus the marker). Both filtered
+    # to the current instance file (a stale id is ignored — the
+    # load_imported semantics)
+    if (not imported and config.resume):
         known = {i["instance_id"] for i in insts}
-        imported = {iid: line for iid, line in
-                    state["import_source"].items()
-                    if iid in known}
-        if imported:
-            print(f"[pilot] import re-derived from the state file "
-                  f"({len(imported)} line(s) from "
-                  f"{state.get('imported_run', '?')})")
+        if (state.get("imported")
+                and isinstance(state.get("import_source"), dict)
+                and state["import_source"]):
+            imported = {iid: line for iid, line in
+                        state["import_source"].items()
+                        if iid in known}
+            if imported:
+                print(f"[pilot] import re-derived from the state "
+                      f"file ({len(imported)} line(s) from "
+                      f"{state.get('imported_run', '?')})")
+        elif os.path.isfile(jsonl):
+            try:
+                pre_recs, _ = rr.load_checkpoint(jsonl)
+            except rr.RunnerProtocolError:
+                pre_recs = []  # a torn tail (the host-crash class)
+                # makes the read fail — the state source is the only
+                # re-derivation available on that path
+            imported = {r.get("instance_id"): dict(r)
+                       for r in pre_recs
+                       if (r.get("meta") or {}).get(
+                           "imported_from")}
+            for r in imported.values():
+                (r.get("meta") or {}).pop("imported_from", None)
+            imported = {iid: line for iid, line in imported.items()
+                       if iid in known}
+            if imported:
+                print(f"[pilot] import re-derived from the "
+                      f"checkpoint's seeded lines ({len(imported)} "
+                      f"line(s) from {state.get('imported_run',
+                                             '?')})")
     # the WP6b import seeding (issue #22 AC2) — BEFORE the resume
     # read: the imported (never-rerun) lines must be in the
     # checkpoint when ``resume_queue`` decides what to skip
@@ -3036,9 +3082,11 @@ def run_pilot(config: PilotConfig,
         seeded = seed_import_lines(
             jsonl, imported, config.import_run,
             src_workdir=config.import_workdir or workdir)
-        print(f"[pilot] imported {len(seeded)} instance line(s) from "
-              f"{config.import_run} (skipped — never re-run, no "
-              "session spent)")
+        if seeded:
+            print(f"[pilot] imported {len(seeded)} instance line(s) "
+                  f"from {config.import_run or state.get(
+                      'imported_run') or 'state/checkpoint'} "
+                  f"(skipped — never re-run, no session spent)")
     skipped_on_resume: dict = {}
     to_run = [i["instance_id"] for i in insts]
     if os.path.isfile(jsonl):
@@ -3140,7 +3188,8 @@ def run_pilot(config: PilotConfig,
                 devin_bin=config.devin_bin, model=config.model,
                 cwd=prep["cwd"], env=prep["env"],
                 wall_s=config.max_wall_s,
-                host_check=bool(config.host_check), workdir=workdir)
+                host_check=bool(config.host_check), workdir=workdir,
+                run_id=config.run_id)
         else:
             # a crashed attempt's agent container may still be up on a
             # crash-resume — ``docker run --name`` would fail with
@@ -3156,7 +3205,8 @@ def run_pilot(config: PilotConfig,
                 cwd="/testbed", env=cprep["env"],
                 wall_s=config.max_wall_s,
                 host_check=bool(config.host_check), workdir=workdir,
-                container=cprep["container"])
+                container=cprep["container"],
+                run_id=config.run_id)
         s = PilotSession(spec, make_session=make_session)
         # the pre-session guard record (the checklist item 14 evidence —
         # kept in the session meta so the line merger persists it)

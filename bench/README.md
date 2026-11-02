@@ -603,20 +603,25 @@ re-run:
 
 ```bash
 cd bench
-# the per-window model: the harness never sleeps — at the local daily
-# cap the window's remaining sessions are recorded quota_limited
-# (the retry class — nothing was burned) and the run finishes
-# (exit 0); the operator re-invokes with --resume in the next
-# UTC-midnight window. Item 12 gates the budget per window.
-# (--pilot b selects pilot_b_instances.json by default.)
+# the window model (the WP3 Runner — the harness' queue engine,
+# default sleeper): at the per-process daily cap (10 sessions in the
+# current UTC window) the run sleeps to the next UTC-midnight
+# window, resets the budget (a new window is a fresh budget), and
+# continues the remaining queue in the same process (the WP3 500-run
+# model — one process spans days across windows). Item 12 gates the
+# budget per window. (--pilot b selects pilot_b_instances.json by
+# default.)
 BENCH_LIVE=1 python live_pilot.py --pilot b --mode sandbox \
   --run-id pilotB --workdir ./pilot-b --resume \
   --import-run pilotA \
   --import-workdir <wp6a-workspace>/pilot-a \
   --interrupt-after 8
-# next UTC-midnight window — same workdir, no --import-* (the lines
-# are already in the checkpoint; seeding is idempotent, and the
-# import re-derives from the state file so item 16 still gates):
+# continuation — same workdir, no --import-* (the lines are already
+# in the checkpoint; seeding is idempotent, and the import
+# re-derives from the state file so item 16 still gates). This ONE
+# invocation spans the remaining windows (the cap sleep is
+# in-process — no per-window re-invocation; if the process dies,
+# re-invoke with --resume — the resume class):
 BENCH_LIVE=1 python live_pilot.py --pilot b --mode sandbox \
   --run-id pilotB --workdir ./pilot-b --resume
 ```
@@ -649,10 +654,12 @@ BENCH_LIVE=1 python live_pilot.py --pilot b --mode sandbox \
   (item 15: every repo in `stratified_repos` has a final line;
   per-repo wall/token variance in the report); (AC3) every
   `eval_error` line is root-caused to `env` / `parser` / `patch`
-  (item 17 gates on it; the harness classifies the failure points —
-  the host-check install/apply/pytest legs, the WP4 typed errors, the
-  oversize-patch cap — and the operator may override via the state
-  file); (AC4) the per-UTC-window budget gate (item 12 buckets the
+  (item 17 gates on it; the harness auto-classifies every failure
+  point — the host-check install/apply/pytest legs, the WP4 typed
+  errors, the oversize-patch cap — and records
+  `meta.eval_error_root_cause` + `meta.eval_error_root_cause.detail`
+  on the checkpoint line itself, which is the record's source of
+  truth); (AC4) the per-UTC-window budget gate (item 12 buckets the
   checkpoint by day; a single-window run renders the verbatim WP6a
   text) + the 2-run overlap/variance report (item 16: the imported
   Pilot-A lines vs the Pilot-B finals — status / session wall /
