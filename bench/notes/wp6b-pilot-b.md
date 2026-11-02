@@ -88,14 +88,14 @@ the 8 interrupt-after sessions); the run then continues in-process to
 the window cap / the interrupt (exit 42), and the delegated
 continuation spans windows 2–3._
 
-## 2-run overlap/variance (issue #22 AC2 — Pilot A vs Pilot B)
-
-The imported Pilot-A lines (`flask`, `seaborn` — never-rerun; their
-Pilot-A finals are the import itself) vs the Pilot-B finals:
-status / session wall / tokens / patch bytes. `psf__requests-1142`
-was `eval_error` in Pilot A (the no-container skip, root cause `env`)
-and is re-run in Pilot B per pass@1 — its Pilot-B final is the
-fresh, superseding line (the retry class, not a re-run).
+_note on the two `patch`-classified lines above: they were recorded
+under the pre-round-6 host-check, whose `git apply` leg passed a
+workdir-relative patch path to `git -C <clone> apply` (git resolved
+it against the clone — "can't open patch") — a HARNESS path failure
+the old code misclassified `patch`. The corrected class is `env`
+(the model patch content never got a chance); both instances are
+retry-class and re-run under the fixed harness (absolute patch path;
+"can't open"-class failures now classify `env`)._
 
 ## 2-run overlap/variance (issue #22 AC2 — Pilot A vs Pilot B)
 

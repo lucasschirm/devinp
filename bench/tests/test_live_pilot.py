@@ -3409,3 +3409,71 @@ def test_wp6b_round5_run_id_type_guard(tmp_path):
     except lp.PilotConfigError:
         raise AssertionError("run_id None (the generated id) was "
                              "rejected")
+
+
+def test_wp6b_round6_host_check_path_failure_classifies_env(
+        tmp_path, monkeypatch):
+    """The round-6 Blocker fix (issue #22 AC3): the host-check's
+    ``git apply`` leg — a "can't open patch"-class failure is a
+    HARNESS path failure (the file is missing — e.g. the
+    workdir-relative path resolved against the clone by ``git -C``),
+    not the model's patch content: it classifies ``env`` (the model
+    patch content never got a chance; classifying it ``patch``
+    would misgate the AC3 taxonomy). A genuine apply conflict
+    (the content does not apply) stays ``patch`` for the model
+    patch and ``env`` for the test patch (the harness fixture /
+    the pinned base)."""
+    inst = {"instance_id": "a__b-1", "repo": "a/b",
+            "base_commit": "0" * 40,
+            "model_patch": "diff --git a/x b/x\n",
+            "test_patch": "diff --git a/y b/y\n"}
+    spec = lp.SessionSpec(instance=inst, mode="sandbox",
+                         devin_bin="devin", model="swe-2-high",
+                         cwd=str(tmp_path), env={}, wall_s=1.0,
+                         host_check=False, workdir=str(tmp_path),
+                         run_id="t")
+    # the shared bare cache pre-created (the bare clone is skipped)
+    (tmp_path / "clone-cache" / "a__b.git").mkdir(parents=True)
+    calls = {"apply_err": "error: can't open "
+             "'./pilot-b/host-check/a__b-1/model_patch.diff': "
+             "No such file or directory"}
+
+    class _P:
+        returncode = 0
+        stdout = b""
+        stderr = b""
+
+    def fake_run(args, **kw):
+        p = _P()
+        if args[0] == "git" and "apply" in args:
+            p.returncode = 128
+            p.stderr = calls["apply_err"].encode()
+        return p
+    monkeypatch.setattr(lp.subprocess, "run", fake_run)
+    session = lp.PilotSession.__new__(lp.PilotSession)
+    session._spec = spec
+    session.meta = {"wall": {}}
+    session._artifact_dir = lambda: str(tmp_path / "art")
+    # 1. the "can't open patch" class — the model patch leg: the
+    # HARNESS failure classifies env (not patch)
+    assert session._host_check(
+        "diff --git a/x b/x\n") == "eval_error"
+    assert session.meta["eval_error_root_cause"] == "env", \
+        session.meta["eval_error_root_cause"]
+    # 2. a genuine apply conflict — the model patch leg stays
+    # patch (the model's content does not apply to the checkout)
+    calls["apply_err"] = "error: patch failed: a/x:1\n" \
+        "error: a/x: patch does not apply"
+    assert session._host_check(
+        "diff --git a/x b/x\n") == "eval_error"
+    assert session.meta["eval_error_root_cause"] == "patch", \
+        session.meta["eval_error_root_cause"]
+    # 3. the TEST patch leg is env either way (the harness fixture /
+    # the pinned base — not the agent's patch)
+    calls["apply_err"] = "error: patch failed: a/y:1"
+    assert session._host_check("") == "eval_error"  # an empty model
+    # patch skips the model leg; the test patch leg fails
+    assert session.meta["eval_error_root_cause"] == "env", \
+        session.meta["eval_error_root_cause"]
+
+

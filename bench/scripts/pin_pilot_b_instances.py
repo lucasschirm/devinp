@@ -65,15 +65,32 @@ def _get(url: str) -> dict:
 def fetch_all_rows() -> list:
     rows = []
     offset = 0
+    last_first = None
     while True:
         data = _get(API.format(offset=offset))
         page = data["rows"]
         rows.extend(page)
+        if not page:
+            break
+        # a persistently partial=True response (a misbehaving API)
+        # would make the offset loop unbounded — the no-progress
+        # guard (a page repeating the previous first row = no
+        # forward movement)
+        if page and page[0].get("row_idx") == last_first:
+            break
+        last_first = page[0].get("row_idx")
         if not data.get("partial", False) and len(page) < 100:
             break
         offset += 100
     rows.sort(key=lambda r: r["row_idx"])
-    return rows
+    seen = set()
+    out = []
+    for r in rows:  # a partial page can overlap the next — de-dupe
+        if r["row_idx"] in seen:
+            continue
+        seen.add(r["row_idx"])
+        out.append(r)
+    return out
 
 
 def stratify(rows: list) -> "tuple[list, dict]":

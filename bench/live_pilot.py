@@ -1352,7 +1352,8 @@ class PilotSession(rr.AgentSession):
         inst = self._spec.instance
         iid = inst["instance_id"]
         t0 = time.monotonic()
-        base = os.path.join(self._spec.workdir, "host-check", iid)
+        base = os.path.abspath(os.path.join(self._spec.workdir,
+                                           "host-check", iid))
         os.makedirs(base, exist_ok=True)
         repo_url = inst.get("repo_url",
                            "https://github.com/" + inst["repo"] + ".git")
@@ -1413,13 +1414,23 @@ class PilotSession(rr.AgentSession):
                     # not applying to the fresh checkout is the
                     # ``patch`` class; the TEST patch not applying is
                     # the ``env`` class (the harness test fixture /
-                    # the pinned base — not the agent's patch)
+                    # the pinned base — not the agent's patch). A
+                    # "can't open patch"-class failure is a HARNESS
+                    # path failure (the file is missing — e.g. the
+                    # workdir-relative path resolved against the
+                    # clone by ``git -C``): the ``env`` class — the
+                    # model patch content never got a chance, and
+                    # classifying it ``patch`` would misgate the AC3
+                    # taxonomy
+                    err = p.stderr.decode("utf-8", "replace").strip()
+                    if "can't open" in err.lower():
+                        cause = "env"
+                    else:
+                        cause = ("patch" if name == "model_patch"
+                                else "env")
                     raise _HostCheckInfra(
-                        f"git apply {name}: "
-                        + p.stderr.decode("utf-8", "replace").strip()[:500],
-                        root_cause=("patch"
-                                   if name == "model_patch"
-                                   else "env"))
+                        f"git apply {name}: {err}",
+                        root_cause=cause)
             # 3. a venv with a minimal install (never the host python)
             venv = os.path.join(base, "venv")
             py = _find_python()
