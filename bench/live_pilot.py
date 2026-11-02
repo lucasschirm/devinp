@@ -2423,6 +2423,14 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
     leak_ok = True
     leak_obs: list = []
     eval_legs: list = []
+    # the round-17 Minor fix (issue #22 AC2): the item-4 / item-7
+    # observations count THIS RUN'S sessions only — imported
+    # (never-rerun) lines were never initialized / closed by this
+    # run (the source run's sessions), so the gating record must
+    # not claim "ok on 25 instance(s)" for 2 it never exercised
+    n_own = sum(1 for r in records
+                if not _meta_of(r).get("imported_from"))
+    n_imp = len(records) - n_own
     # the session-level stats (item 8's token totals, item 9's wall,
     # the calibration) count **ATTEMPTS** — every line with an
     # instance id: a superseded ``eval_error``→rerun attempt's wall
@@ -2542,8 +2550,10 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
     add("4 NDJSON framing + vendor notifications (WP0 §1)",
         "the initialize result is received; vendor notifications are "
         "logged, never errors",
-        f"initialize ok on {len(records)} instance(s); vendor "
-        f"notifications observed: {vendor_seen}",
+        f"initialize ok on {n_own} instance(s)"
+        + (f" (+ {n_imp} imported — not initialized this run)"
+           if n_imp else "")
+        + f"; vendor notifications observed: {vendor_seen}",
         devin_ok)
     add("5 wire method names (WP0 §1)",
         "initialize / session/new / session/prompt / "
@@ -2567,11 +2577,13 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
         "close sent best-effort; the process group killed; no orphan "
         "devin survives",
         (f"orphan check: "
-         + ("PASS on all " + str(len(records)) + " instance(s)"
+         + ("PASS on all " + str(n_own) + " instance(s)"
             if orphan_checked and not orphan_unchecked
             else ("FAILED (an orphan survived)" if not orphan_checked
                  else "NOT PERFORMED (a close() failure — recorded in "
                       "the checkpoint meta close_error)")))
+        + (f" (+ {n_imp} imported — not closed this run)"
+           if n_imp else "")
         if records else "no instances",
         (orphan_checked and not orphan_unchecked)
         if records else devin_ok)
@@ -3526,7 +3538,18 @@ def run_pilot(config: PilotConfig,
         state["imported"] = sorted(imported)
         state["import_source"] = imported
         state["imported_run"] = config.import_run
-        state["import_workdir"] = config.import_workdir
+        # the round-17 Medium fix (issue #22 AC2): persist the
+        # import workdir ABSOLUTE — a relative --import-workdir
+        # resolved against this invocation's cwd at import time;
+        # a continuation window (a different cwd — the operator
+        # re-invokes from wherever) must re-resolve it to the
+        # SAME source workdir, or the artifact self-heal copy
+        # finds missing sources and the WP5 cross-check fails —
+        # a report_failed wedge every subsequent resume re-hits
+        # (when the flag's workdir is absent the source is this
+        # run's workdir — persist that, absolute)
+        state["import_workdir"] = os.path.abspath(
+            config.import_workdir or workdir)
         state["import_retry_class"] = {
             k: v for k, v in sorted(import_retry.items())}
         _write_state(workdir, run_id, state)
@@ -3819,9 +3842,17 @@ def run_pilot(config: PilotConfig,
         "imported": sorted(imported) or state.get("imported", []),
         "import_source": (imported
                          or state.get("import_source", {})),
-        "import_workdir": (config.import_workdir
-                          if config.import_workdir
-                          else state.get("import_workdir")),
+        # the round-17 Medium fix (issue #22 AC2): persist the
+        # import workdir ABSOLUTE here too (the same contract as
+        # the early import record — a relative flag value must
+        # not survive into the state: a continuation window with
+        # a different cwd would re-resolve it against the wrong
+        # cwd — missing sources → the cross-check fails → a
+        # report_failed wedge)
+        "import_workdir": (os.path.abspath(
+            config.import_workdir or workdir)
+            if config.import_workdir
+            else state.get("import_workdir")),
         "import_retry_class": ({k: v
                                for k, v in
                                sorted(import_retry.items())}
@@ -3911,9 +3942,10 @@ def run_pilot(config: PilotConfig,
             "imported": sorted(imported) or state.get("imported", []),
             "import_source": (imported
                              or state.get("import_source", {})),
-            "import_workdir": (config.import_workdir
-                              if config.import_workdir
-                              else state.get("import_workdir")),
+            "import_workdir": (os.path.abspath(
+                config.import_workdir or workdir)
+                if config.import_workdir
+                else state.get("import_workdir")),
             "import_retry_class": ({k: v
                                    for k, v in
                                    sorted(import_retry.items())}

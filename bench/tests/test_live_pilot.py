@@ -4566,3 +4566,71 @@ def test_wp6b_round16_self_import_symlink_rejected(tmp_path, live):
     else:
         raise AssertionError("a symlinked self-import was "
                            "accepted")
+
+
+def test_wp6b_round17_import_workdir_persisted_absolute(
+        tmp_path, live):
+    """The round-17 Medium fix (issue #22 AC2): state
+    'import_workdir' persisted config.import_workdir VERBATIM —
+    a relative --import-workdir re-resolved on continuation
+    windows against that invocation's cwd (a different cwd
+    silently broke the artifact self-heal copy — missing
+    sources → the WP5 cross-check fails → a report_failed
+    wedge every subsequent resume re-hits). Now it is
+    persisted ABSOLUTE (resolved at import time; the flag-
+    absent default is this run's workdir, absolute)."""
+    repos, inst = _two_pilot_b_repos(tmp_path)
+    i0, i1, i2 = [e["instance_id"] for e in repos]
+    src = tmp_path / "src"
+    src.mkdir()
+    wd2 = tmp_path / "wd2"
+    old_cwd = os.getcwd()
+    try:
+        os.chdir(str(tmp_path))
+        # the source run (its checkpoint in src/)
+        cfg1 = _cfg(tmp_path, inst, run_id="src", workdir=str(src),
+                   host_check=False)
+        assert _run(cfg1, _mock_make_session(
+            {i0: "no_patch", i1: "no_patch", i2: "ok"})) == lp.EXIT_OK
+        # the import window: a RELATIVE --import-workdir (./src)
+        cfg2 = _cfg(tmp_path, inst, run_id="pilotB",
+                   workdir=str(wd2), resume=True, host_check=False,
+                   pilot="b", import_run="src",
+                   import_workdir=os.path.join(".", "src"))
+        assert _run(cfg2, _mock_make_session(
+            {i0: "no_patch", i1: "no_patch", i2: "no_patch"})) \
+            == lp.EXIT_OK
+        state = json.loads(
+            (wd2 / "pilot-pilotB.state.json").read_text())
+        assert os.path.isabs(state["import_workdir"]), state
+        assert state["import_workdir"] == os.path.abspath(
+            str(src)), state
+    finally:
+        os.chdir(old_cwd)
+
+
+def test_wp6b_round17_item4_7_own_session_counts(tmp_path, live):
+    """The round-17 Minor fix (issue #22 AC2): with imported
+    lines skipped in the session checks, the item-4 / item-7
+    observations still reported len(records) (deduped finals
+    including imports) — the gating record claimed 'initialize
+    ok on 25 instance(s)' / 'orphan check: PASS on all 25' for
+    sessions this run never exercised. The obs now count this
+    run's own sessions + an explicit imported annotation."""
+    imported_rec = {"instance_id": "imp", "status": "resolved",
+                   "ts": 1.0,
+                   "meta": {"imported_from": "pilotA"}}
+    recs = [imported_rec, _rec("r1", "resolved"),
+            _rec("r2", "resolved")]
+    items = _cb(records=recs, imported={"imp": imported_rec})
+    assert "initialize ok on 2 instance(s) (+ 1 imported — " \
+        "not initialized this run)" in _item(items, "4")["observed"], \
+        _item(items, "4")["observed"]
+    it7 = _item(items, "7")["observed"]
+    assert "PASS on all 2 instance(s)" in it7, it7
+    assert "(+ 1 imported — not closed this run)" in it7, it7
+    # a non-import run renders the plain count (no annotation)
+    items2 = _cb(records=[_rec("r1", "resolved")])
+    assert "initialize ok on 1 instance(s)" in \
+        _item(items2, "4")["observed"]
+    assert "(+ " not in _item(items2, "4")["observed"]
