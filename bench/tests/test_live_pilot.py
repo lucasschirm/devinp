@@ -2284,9 +2284,26 @@ def test_dry_run_pilot_b_writes_17_skeleton(tmp_path, live):
     repos = _three_repos(tmp_path)
     inst = _instances_file(tmp_path / "inst.json", repos)
     wd = tmp_path / "wd"
+    # the round-13 Medium fix: a pilot-B dry run requires the
+    # import (the AC2 evidence is pilot B's definition) — the
+    # minimal valid source checkpoint (one never-rerun line for an
+    # instance-file id)
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "run-src.jsonl").write_text(
+        json.dumps({"instance_id": repos[0]["instance_id"],
+                    "status": "resolved", "ts": 1.0}) + "\n")
+    # a no-import pilot-B dry run is a config error (exit 2)
     rc = lp.main(["--dry-run", "--pilot", "b", "--devin-bin",
                   MOCK_PATH, "--instances", inst,
-                  "--workdir", str(wd), "--run-id", "dryb"])
+                  "--workdir", str(tmp_path / "wd0"),
+                  "--run-id", "dryb0"])
+    assert rc == lp.EXIT_CONFIG
+    rc = lp.main(["--dry-run", "--pilot", "b", "--devin-bin",
+                  MOCK_PATH, "--instances", inst,
+                  "--workdir", str(wd), "--run-id", "dryb",
+                  "--import-run", "src",
+                  "--import-workdir", str(src)])
     assert rc == lp.EXIT_OK
     md = (wd / "wp6b-pilot-b.md").read_text()
     for i in range(1, 18):
@@ -2578,9 +2595,24 @@ def test_pilot_b_default_selection_via_main(tmp_path, live, capsys):
     """The Blocker fix: the documented invocations omit
     --instances — --pilot b must select pilot_b_instances.json
     (the 25-instance file) by default; --pilot a keeps
-    pilot_instances.json (the 3)."""
+    pilot_instances.json (the 3). Round-13 Medium fix: a no-import
+    pilot-B invocation is a fail-closed config error (exit 2) —
+    the documented invocation carries the import."""
+    # a minimal valid source checkpoint (one never-rerun line for a
+    # pinned 25-set id)
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "run-src.jsonl").write_text(
+        json.dumps({"instance_id": "django__django-10097",
+                    "status": "resolved", "ts": 1.0}) + "\n")
+    # the no-import pilot-B dry run: a config error (exit 2)
+    rc = lp.main(["--dry-run", "--pilot", "b",
+                  "--workdir", str(tmp_path / "w0"), "--run-id", "x0"])
+    assert rc == lp.EXIT_CONFIG
     out = lp.main(["--dry-run", "--pilot", "b",
-                  "--workdir", str(tmp_path / "w"), "--run-id", "x"])
+                  "--workdir", str(tmp_path / "w"), "--run-id", "x",
+                  "--import-run", "src",
+                  "--import-workdir", str(src)])
     captured = capsys.readouterr()
     assert out == lp.EXIT_OK
     assert "25 instances:" in captured.out
@@ -2865,7 +2897,11 @@ def test_wp6b_round2_no_import_record_consistent(tmp_path, live):
     """The round-2 Minor fix (issue #22 AC2): a pilot-B run with NO
     import renders ``Overlap match: n/a (no import)`` in the section
     — not ``FAIL`` (zero rows is not a mismatch) — consistent with
-    item 16's n/a (the record does not contradict itself)."""
+    item 16's n/a (the record does not contradict itself). Round-13
+    Medium fix: a no-import pilot-B *run* is a fail-closed config
+    error (item 16 must not be the path to a GO with zero AC2
+    evidence); the checklist's no-import rendering (the plain n/a,
+    non-gating) is preserved for a direct build."""
     repos, inst = _two_pilot_b_repos(tmp_path)
     ids = [e["instance_id"] for e in repos]
     i0, i1, i2 = ids
@@ -2873,13 +2909,19 @@ def test_wp6b_round2_no_import_record_consistent(tmp_path, live):
     modes = {i0: "no_patch", i1: "no_patch", i2: "ok"}
     cfg = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
                host_check=False, pilot="b")
-    assert _run(cfg, _mock_make_session(modes)) == lp.EXIT_OK
-    gng = (wd / "wp6b-pilot-b.md").read_text()
-    assert "Overlap match: n/a (no import)" in gng
-    assert "Overlap match: FAIL" not in gng
-    i16 = [l for l in gng.splitlines()
-          if l.startswith("| 16 |")][0]
-    assert "n/a" in i16, i16
+    try:
+        _run(cfg, _mock_make_session(modes))
+    except lp.PilotConfigError:
+        pass
+    else:
+        raise AssertionError("a no-import pilot-B run was accepted")
+    # the checklist's no-import rendering: the plain n/a (non-
+    # gating) — the record does not contradict itself
+    recs = [_rec(f"r{i}", "resolved") for i in range(3)]
+    items = _cb(records=recs, import_attempted=False)
+    i16 = _item(items, "16")
+    assert i16["pass"] is None
+    assert "n/a (no import" in i16["observed"]
 
 
 def test_wp6b_round2_session_spec_carrys_the_run_id(tmp_path, live):
@@ -4149,3 +4191,81 @@ def test_wp6b_round12_item12_wp5_sessions_annotation(tmp_path, live):
     it12 = next(i for i in items if i["item"].startswith("12 "))
     assert "the WP5 report's sessions-used also counts the 1 " \
         "imported line(s)" in it12["observed"], it12["observed"]
+
+
+def test_wp6b_round13_item10_excludes_imported(tmp_path, live):
+    """The round-13 Blocker fix (issue #22 AC2): the imported
+    (never-rerun) finals flow through the item-10 per-line loop
+    verbatim — the real Pilot-A source lines (and the already-
+    seeded lines) carry no meta.pruning (the per-line pruning
+    record postdates that run), so the missing-record check
+    flipped pruning_ok to False: item 10 is gating, so the
+    completing record rendered a permanent NO-GO. Fix: imported
+    lines are excluded from the check (the source run's own
+    record gates its own pruning; this run's item 10 gates the
+    sessions it actually ran). The check still applies to this
+    run's own lines (a fresh line without the record fails)."""
+    imported_rec = {"instance_id": "imp", "status": "resolved",
+                   "ts": 1.0,
+                   "meta": {"imported_from": "pilotA",
+                           "wall": {"session_s": 60.0},
+                           "usage": {"totalTokens": 100},
+                           "permissions": {"requests": 1,
+                                           "allowed": 1, "denied": 0},
+                           "vendor_notifications": 0,
+                           "orphan_check": True,
+                           "leak_verify": {"remotes": [],
+                                           "tags": [],
+                                           "clean": True}}}
+    recs = [imported_rec, _rec("fresh", "resolved")]
+    items = _cb(records=recs, imported={"imp": imported_rec})
+    assert _item(items, "10")["pass"] is True
+    assert "imported (the source run's record gates the " \
+        "pruning)" in _item(items, "10")["observed"]
+    # the check still applies to this run's OWN lines
+    bad = _rec("bad", "resolved")
+    bad["meta"].pop("pruning")
+    items2 = _cb(records=[bad])
+    assert _item(items2, "10")["pass"] is False
+
+
+def test_wp6b_round13_pilot_b_requires_import(tmp_path, live):
+    """The round-13 Medium fix (issue #22 AC2): a --pilot b run
+    that omits --import-run rendered item 16 'n/a (no import —
+    non-gating)' and could GO with zero AC2 overlap evidence —
+    the same under-evidenced-verdict hole the zero-overlap
+    guard closed for a mismatched source. Fail-closed: a config
+    error before any session. A --resume on a workdir whose
+    state carries the import bookkeeping passes (the documented
+    continuation window)."""
+    repos, inst = _two_pilot_b_repos(tmp_path)
+    i0, i1, i2 = [e["instance_id"] for e in repos]
+    wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
+    modes = {i0: "no_patch", i1: "no_patch", i2: "ok"}
+    # a no-import pilot-B run is a config error (exit 2)
+    cfg = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               resume=True, host_check=False, pilot="b")
+    try:
+        _run(cfg, _mock_make_session(modes))
+    except lp.PilotConfigError:
+        pass
+    else:
+        raise AssertionError("a no-import pilot-B run was accepted")
+    # the documented flow: window 1 with the import, then the
+    # continuation window (state re-derivation) passes
+    cfg1 = _cfg(tmp_path, inst, run_id="src", workdir=str(wd1),
+               host_check=False)
+    assert _run(cfg1, _mock_make_session(modes)) == lp.EXIT_OK
+    cfg2 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               resume=True, host_check=False, pilot="b",
+               import_run="src", import_workdir=str(wd1))
+    assert _run(cfg2, _mock_make_session(
+        {i0: "no_patch", i1: "no_patch", i2: "no_patch"})) \
+        == lp.EXIT_OK
+    # the continuation window (no --import-run — the state
+    # re-derivation satisfies the check)
+    cfg3 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               resume=True, host_check=False, pilot="b")
+    assert _run(cfg3, _mock_make_session(
+        {i0: "no_patch", i1: "no_patch", i2: "no_patch"})) \
+        == lp.EXIT_OK

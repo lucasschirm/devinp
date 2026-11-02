@@ -2443,16 +2443,30 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
         elif oc is False:
             orphan_checked = False
         # item 10: the pruning record must be present in the line and
-        # free of failures (written before the line is persisted)
-        pr = m.get("pruning")
-        if not isinstance(pr, dict) or pr.get("failed"):
-            pruning_ok = False
-        pruning_obs.append(
-            f"{rec.get('instance_id')}: "
-            + (f"removed {pr.get('removed')}" if isinstance(pr, dict)
-               else "no record in the checkpoint line")
-            + (f"; FAILED {pr.get('failed')}" if isinstance(pr, dict)
-               and pr.get("failed") else ""))
+        # free of failures (written before the line is persisted).
+        # Imported (never-rerun) lines are EXCLUDED from the check
+        # (the round-13 Blocker fix, issue #22 AC2): they carry the
+        # source run's meta verbatim — the per-line pruning record
+        # postdates that run (Pilot A ran before the harness wrote
+        # meta.pruning), so the documented --import-run import could
+        # never pass item 10 and the completing record rendered a
+        # permanent NO-GO. The source run's own record gates its
+        # own pruning (the pilot-a record); this run's item 10
+        # gates the sessions it actually ran
+        if m.get("imported_from"):
+            pruning_obs.append(
+                f"{rec.get('instance_id')}: imported (the source "
+                f"run's record gates the pruning)")
+        else:
+            pr = m.get("pruning")
+            if not isinstance(pr, dict) or pr.get("failed"):
+                pruning_ok = False
+            pruning_obs.append(
+                f"{rec.get('instance_id')}: "
+                + (f"removed {pr.get('removed')}" if isinstance(pr, dict)
+                   else "no record in the checkpoint line")
+                + (f"; FAILED {pr.get('failed')}" if isinstance(pr, dict)
+                   and pr.get("failed") else ""))
         # item 14: the recorded guard + post-session verification
         lg = m.get("leak_guard") or {}
         lv = m.get("leak_verify") or {}
@@ -3287,6 +3301,32 @@ def _usage_total(usage: object) -> "Optional[int]":
     return None
 
 
+def _check_pilot_b_import(config: PilotConfig, state: dict,
+                         imported: "Optional[dict]" = None) -> None:
+    """The round-13 Medium fix (issue #22 AC2): a pilot-B run
+    requires the 2-run overlap evidence (AC2) — the ``--import-run``
+    source (this or an earlier window — the state or checkpoint
+    re-derivation). A ``--pilot b`` invocation with no import at
+    all rendered item 16 ``n/a (no import — non-gating)`` and could
+    GO with zero AC2 overlap evidence — the same under-evidenced-
+    verdict hole the zero-overlap guard closed for a mismatched
+    source. Fail-closed: a config error before any session (pilot B
+    is defined as reusing the Pilot A checkpoint — a no-import
+    pilot-B run is not the documented pilot B; run it as a pilot
+    A)."""
+    if (config.pilot == "b"
+            and not config.import_run
+            and not imported
+            and not state.get("imported_run")
+            and not state.get("import_source")):
+        raise PilotConfigError(
+            "--pilot b requires --import-run (AC2 — the 2-run "
+            "overlap/variance evidence is pilot B's definition; a "
+            "no-import pilot-B run would GO with item 16 n/a and "
+            "zero AC2 evidence) — or a --resume on a workdir whose "
+            "state carries the import bookkeeping")
+
+
 def run_pilot(config: PilotConfig,
               make_session: "Optional[Callable]" = None) -> int:
     """The pilot driver (the tests call this with the injected
@@ -3317,6 +3357,12 @@ def run_pilot(config: PilotConfig,
 
     # -- dry run: the zero-quota validation ------------------------------
     if config.dry_run:
+        # the round-13 Medium fix (issue #22 AC2): the pilot-B
+        # import requirement in the dry run too — the dry run
+        # renders no verdict (all n/a), but fail-closed
+        # consistency: a dry run that passes must be an invocation
+        # that would actually work
+        _check_pilot_b_import(config, _load_state(workdir, run_id))
         cal = calibrate([], config)
         items = build_checklist(
             config=config, dry_run=True, gate=None, preflight_ok=None,
@@ -3438,6 +3484,11 @@ def run_pilot(config: PilotConfig,
                 print(f"[pilot] import re-derived from the "
                       f"checkpoint's seeded lines ({len(imported)} "
                       f"line(s) from {label})")
+    # the round-13 Medium fix (issue #22 AC2): the pilot-B import
+    # requirement (this or an earlier window — the re-derivation
+    # above satisfies it; a no-import pilot-B run is a config
+    # error before any session)
+    _check_pilot_b_import(config, state, imported)
     # the WP6b import seeding (issue #22 AC2) — BEFORE the resume
     # read: the imported (never-rerun) lines must be in the
     # checkpoint when ``resume_queue`` decides what to skip. The
