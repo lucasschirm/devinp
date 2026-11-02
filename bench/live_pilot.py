@@ -696,8 +696,20 @@ def seed_import_lines(jsonl_path: str, imported: dict,
     if os.path.isfile(jsonl_path):
         # post-repair: the file ends on a clean boundary, so the
         # read is well-defined (a mid-file corruption is still
-        # fail-loud — the config error class, before any session)
-        recs, _ = rr.load_checkpoint(jsonl_path)
+        # fail-loud — the config error class, before any session:
+        # the tail repair covers only the tail, so a mid-file
+        # corrupt line still makes load_checkpoint raise
+        # RunnerProtocolError — the round-9 fix: catch it here and
+        # fail closed (exit 2) as the comment promises, instead of
+        # letting it propagate to the exit-4 runner-error path)
+        try:
+            recs, _ = rr.load_checkpoint(jsonl_path)
+        except rr.RunnerProtocolError as exc:
+            raise PilotConfigError(
+                f"checkpoint {jsonl_path!r} is corrupt (a "
+                f"mid-file corruption — the tail repair covers "
+                f"only the tail; the config error class, before "
+                f"any session): {exc}") from exc
         existing = {r.get("instance_id") for r in recs
                    if isinstance(r, dict) and r.get("instance_id")}
     seeded = []
@@ -2463,6 +2475,25 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
             f"{k} skipped ({v})" for k, v in sorted(
                 skipped_on_resume.items()))
         p = True
+    # an interrupted invocation IS the interrupt leg of the
+    # pair — whether or not it is ALSO a resume with skipped
+    # instances (the pilot-B window-1 flow: --resume + the
+    # import + the interrupt): the pair's AC3 evidence
+    # completes on the FOLLOWING resume invocation (the
+    # first branch). Ordered BEFORE the plain
+    # resume-with-skip branch (the round-9 fix): a
+    # pilot-B window-1 interrupted record previously
+    # rendered "the pair was not the intentional
+    # interrupt (AC3 not exercised)" + FAIL on the very
+    # invocation that just performed the interrupt (its
+    # skipped_on_resume was non-empty — the seeded import /
+    # prior lines — while resume_after_interrupt was still
+    # False)
+    elif interrupted_this_run:
+        obs = (f"interrupted after "
+               f"{interrupted_this_run.get('completed')} instance(s); "
+               "the resume invocation must follow")
+        p = None
     elif config.resume and skipped_on_resume:
         # a resume with skipped instances, but the pair was not the
         # intentional interrupt (a crash/abort resume — the AC3 path
@@ -2473,11 +2504,6 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
                + ") — but the pair was not the intentional interrupt "
                  "(AC3 not exercised)")
         p = False
-    elif interrupted_this_run:
-        obs = (f"interrupted after "
-               f"{interrupted_this_run.get('completed')} instance(s); "
-               "the resume invocation must follow")
-        p = None
     elif records:
         obs = ("not exercised (run the pilot with --interrupt-after "
                "1 + --resume to exercise it)")

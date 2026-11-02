@@ -3777,3 +3777,86 @@ def test_wp6b_round8_preflight_failed_wall_counts(tmp_path):
     # not a session
     assert out[day]["wall_s"] == 450.0, out  # but its wall (300s)
     # counts
+
+
+def test_wp6b_round9_interrupted_resume_record_item11(tmp_path, live):
+    """The round-9 Minor fix (issue #22 AC4 / WP3b item 11): on a
+    pilot-B window-1 interrupted record, the seeded import lines
+    leave skipped_on_resume non-empty while resume_after_interrupt
+    is still False — the OLD ordering let the plain
+    resume-with-skip branch shadow the interrupted branch, so item
+    11 rendered \"the pair was not the intentional interrupt (AC3
+    not exercised)\" + FAIL on the very invocation that just
+    performed the interrupt. The interrupted invocation IS the
+    interrupt leg of the pair: the AC3 evidence completes on the
+    following resume invocation (the first branch)."""
+    repos = _three_repos(tmp_path)
+    inst = _instances_file(tmp_path / "inst.json", repos)
+    ids = [e["instance_id"] for e in repos]
+    i0, i1, i2 = ids
+    wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
+    # the source run: i0 no_patch (never-rerun — the import), i1 /
+    # i2 ok -> eval_error (the retry class — re-run in pilot B)
+    modes1 = {i0: "no_patch", i1: "ok", i2: "ok"}
+    cfg1 = _cfg(tmp_path, inst, run_id="src", workdir=str(wd1),
+               host_check=False)
+    assert _run(cfg1, _mock_make_session(modes1)) == lp.EXIT_OK
+    # the import window: i0 imported (skipped on the resume), i1 /
+    # i2 re-run (the retry class); the interrupt fires after i1
+    # (ONE session — i2 remains); skipped_on_resume is non-empty
+    # (i0), resume_after_interrupt is False (no prior interrupt)
+    cfg2 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               resume=True, host_check=False, pilot="b",
+               import_run="src", import_workdir=str(wd1),
+               interrupt_after=1)
+    assert _run(cfg2, _mock_make_session(
+        {i0: "no_patch", i1: "no_patch", i2: "no_patch"}))         == lp.EXIT_INTERRUPT
+    gng = (wd2 / "wp6b-pilot-b.md").read_text()
+    row11 = [l for l in gng.splitlines()
+            if l.startswith("| 11 |")][0]
+    assert "the resume invocation must follow" in row11, row11
+    assert "AC3 not exercised" not in row11, row11
+    # the following resume completes the pair: item 11 PASS (the
+    # first branch — the AC3 evidence)
+    cfg3 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               resume=True, host_check=False, pilot="b")
+    assert _run(cfg3, _mock_make_session(
+        {i0: "no_patch", i1: "no_patch", i2: "no_patch"}))         == lp.EXIT_OK
+    gng3 = (wd2 / "wp6b-pilot-b.md").read_text()
+    row11_3 = [l for l in gng3.splitlines()
+              if l.startswith("| 11 |")][0]
+    assert "resumed after the intentional interrupt" in row11_3, \
+        row11_3
+    assert "PASS" in row11_3, row11_3
+
+
+def test_wp6b_round9_mid_file_corruption_is_config_error(tmp_path):
+    """The round-9 Minor fix (issue #22 AC2): a mid-file corrupt
+    line in this run's own checkpoint makes load_checkpoint raise
+    RunnerProtocolError (the tail repair covers only the tail) —
+    seed_import_lines now catches it and fails closed (exit 2, the
+    config error class, before any session) as the comment
+    promises, instead of letting it propagate to the exit-4
+    runner-error path."""
+    wd = tmp_path / "wd"
+    wd.mkdir()
+    cp = wd / "run-t.jsonl"
+    good1 = json.dumps({"instance_id": "a", "status": "no_patch",
+                        "ts": 1.0, "meta": {}})
+    good2 = json.dumps({"instance_id": "b", "status": "ok",
+                        "ts": 2.0, "meta": {}})
+    # a MID-FILE corrupt line (not the tail — the tail repair
+    # truncates only the torn tail; a mid-file line survives the
+    # repair and makes load_checkpoint raise)
+    cp.write_text(good1 + "\n" + "this-is-not-json\n" + good2 + "\n")
+    try:
+        lp.seed_import_lines(str(cp), {"c": {"instance_id": "c",
+                                             "status": "no_patch",
+                                             "ts": 3.0,
+                                             "meta": {}}},
+                            "src", str(wd))
+    except lp.PilotConfigError:
+        pass
+    else:
+        raise AssertionError("a mid-file corruption was not a "
+                             "config error")
