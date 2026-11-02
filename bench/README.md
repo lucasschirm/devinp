@@ -603,16 +603,20 @@ re-run:
 
 ```bash
 cd bench
-# the WP3 runner window model: at the local daily cap the run exits
-# 43 and the operator re-invokes with --resume (next UTC-midnight
-# window); item 12 gates the budget per window
+# the per-window model: the harness never sleeps — at the local daily
+# cap the window's remaining sessions are recorded quota_limited
+# (the retry class — nothing was burned) and the run finishes
+# (exit 0); the operator re-invokes with --resume in the next
+# UTC-midnight window. Item 12 gates the budget per window.
+# (--pilot b selects pilot_b_instances.json by default.)
 BENCH_LIVE=1 python live_pilot.py --pilot b --mode sandbox \
   --run-id pilotB --workdir ./pilot-b --resume \
   --import-run pilotA \
   --import-workdir <wp6a-workspace>/pilot-a \
   --interrupt-after 8
 # next UTC-midnight window — same workdir, no --import-* (the lines
-# are already in the checkpoint; seeding is idempotent):
+# are already in the checkpoint; seeding is idempotent, and the
+# import re-derives from the state file so item 16 still gates):
 BENCH_LIVE=1 python live_pilot.py --pilot b --mode sandbox \
   --run-id pilotB --workdir ./pilot-b --resume
 ```
@@ -632,7 +636,14 @@ BENCH_LIVE=1 python live_pilot.py --pilot b --mode sandbox \
   `eval_error` / `preflight_failed`; the only pass@1 retry class,
   PLAN §2.5 — e.g. the Pilot-A `psf__requests-1142` no-container
   skip) are **not** imported: the instance runs in this run. A repeat
-  `--resume` never re-seeds (no duplicate import lines).
+  `--resume` never re-seeds (no duplicate import lines). The import
+  is a pilot-B mechanism: `--import-run` under `--pilot a` is a
+  config error (items 15–17, which verify it, never render there),
+  and `--import-workdir` requires `--import-run`. On the continuation
+  windows (a `--resume` without `--import-run`) the source lines are
+  re-derived from the state file, so item 16 still gates on the
+  completing record. The run id charset is the SWE-bench id charset
+  (`[A-Za-z0-9][A-Za-z0-9._-]*`, no `..` — no path traversal).
 - **The measurement (issue #22 AC1/AC3/AC4):** the same per-instance
   measurement as Pilot A, plus — (AC1) the per-repo stratification
   (item 15: every repo in `stratified_repos` has a final line;

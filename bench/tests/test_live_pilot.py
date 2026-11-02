@@ -2186,12 +2186,17 @@ def test_item16_overlap_variance_gates(tmp_path, monkeypatch):
     src = {"instance_id": "a", "status": "resolved",
            "meta": {"wall": {"session_s": 60.0},
                    "usage": {"totalTokens": 100}}}
-    # the GO case needs item 11 to pass too (the resume pair)
+    # the GO case needs item 11 to pass too (the resume pair); the
+    # final line of an imported instance carries imported_from (the
+    # seeded line) — the arithmetic excludes it from the new count
     items = _cb(imported={"a": src},
                config=lp.PilotConfig(pilot="b", max_wall_s=2700.0,
                                    resume=True),
                resume_after_interrupt=True,
-               skipped_on_resume={"a": "no_patch"})
+               skipped_on_resume={"a": "no_patch"},
+               records=[_rec("a", "resolved",
+                            usage={"totalTokens": 100},
+                            imported_from="x")])
     assert _item(items, "16")["pass"] is True
     verdict, failed = lp._verdict(items,
                                  gating=lp._pilot_gating(
@@ -2306,7 +2311,8 @@ def test_import_run_source_missing_is_config_error(tmp_path, live):
     wd = tmp_path / "wd"
     # missing source (a path that does not exist)
     cfg = _cfg(tmp_path, str(inst), run_id="imp", workdir=str(wd),
-              import_run="nope", import_workdir=str(tmp_path / "absent"))
+              pilot="b", import_run="nope",
+              import_workdir=str(tmp_path / "absent"))
     with pytest.raises(lp.PilotConfigError):
         _run(cfg, _mock_make_session("ok"))
     # a corrupt source (a non-JSON line in the MIDDLE of the file —
@@ -2321,7 +2327,8 @@ def test_import_run_source_missing_is_config_error(tmp_path, live):
         + json.dumps({"instance_id": "y", "status": "resolved",
                      "meta": {}, "ts": 2.0}) + "\n")
     cfg = _cfg(tmp_path, str(inst), run_id="imp", workdir=str(wd),
-              import_run="nope", import_workdir=str(bad))
+              pilot="b", import_run="nope",
+              import_workdir=str(bad))
     with pytest.raises(lp.PilotConfigError):
         _run(cfg, _mock_make_session("ok"))
 
@@ -2560,3 +2567,223 @@ def test_container_eval_error_root_cause(tmp_path, monkeypatch):
             lp.ev.HarnessFailedError("the harness process failed")))
     assert s._eval_container("patch body") == "eval_error"
     assert s.meta["eval_error_root_cause"] == "env"
+
+
+
+# ---------------------------------------------------------------------------
+# WP6b review round 1 (PR #38 pr-review — the fixes)
+# ---------------------------------------------------------------------------
+
+def test_pilot_b_default_selection_via_main(tmp_path, live, capsys):
+    """The Blocker fix: the documented invocations omit
+    --instances — --pilot b must select pilot_b_instances.json
+    (the 25-instance file) by default; --pilot a keeps
+    pilot_instances.json (the 3)."""
+    out = lp.main(["--dry-run", "--pilot", "b",
+                  "--workdir", str(tmp_path / "w"), "--run-id", "x"])
+    captured = capsys.readouterr()
+    assert out == lp.EXIT_OK
+    assert "25 instances:" in captured.out
+    assert "django__django-10097" in captured.out
+    out = lp.main(["--dry-run",
+                  "--workdir", str(tmp_path / "w2"), "--run-id", "y"])
+    captured = capsys.readouterr()
+    assert "3 instances:" in captured.out
+    # the record name follows the pilot kind
+    assert (tmp_path / "w" / "wp6b-pilot-b.md").is_file()
+    assert (tmp_path / "w2" / "wp6a-go-no-go.md").is_file()
+
+
+def test_import_flag_pairing_and_charset(tmp_path):
+    """--import-workdir requires --import-run; --import-run is
+    pilot-B-only; the run id is charset-restricted (no path
+    traversal: the codebase charset-restricts ids for exactly this
+    reason)."""
+    with pytest.raises(lp.PilotConfigError):
+        lp.PilotConfig(import_workdir="/x")
+    with pytest.raises(lp.PilotConfigError):
+        lp.PilotConfig(pilot="a", import_run="pilotA")
+    with pytest.raises(lp.PilotConfigError):
+        lp.PilotConfig(pilot="b", import_run="../x")
+    with pytest.raises(lp.PilotConfigError):
+        lp.PilotConfig(pilot="b", import_run="a..b")
+    # the valid shape passes
+    lp.PilotConfig(pilot="b", import_run="pilotA",
+                  import_workdir="/x")
+    # the CLI (exit 2)
+    assert lp.main(["--dry-run", "--pilot", "b",
+                    "--import-workdir", "/x",
+                    "--workdir", str(tmp_path / "w"),
+                    "--run-id", "z"]) == lp.EXIT_CONFIG
+    assert lp.main(["--dry-run", "--pilot", "a",
+                    "--import-run", "pilotA",
+                    "--workdir", str(tmp_path / "w2"),
+                    "--run-id", "z"]) == lp.EXIT_CONFIG
+    assert lp.main(["--dry-run", "--pilot", "b",
+                    "--import-run", "../x",
+                    "--workdir", str(tmp_path / "w3"),
+                    "--run-id", "z"]) == lp.EXIT_CONFIG
+
+
+def test_import_run_corrupt_source_report_protocol(tmp_path, live):
+    """a charset-invalid instance_id in the source (the WP5 dedupe
+    is fail-loud on it) is a corrupt source — the documented
+    exit-2 config error, not an exit-4 run failure."""
+    repos = _three_repos(tmp_path)
+    inst = _instances_file(tmp_path / "inst.json", repos)
+    bad = tmp_path / "srcwd"
+    bad.mkdir()
+    (bad / "run-bad.jsonl").write_text(
+        json.dumps({"instance_id": "bad id with spaces",
+                   "status": "resolved", "meta": {}, "ts": 1.0})
+        + "\n")
+    wd = tmp_path / "wd"
+    cfg = _cfg(tmp_path, str(inst), run_id="imp", workdir=str(wd),
+              pilot="b", import_run="bad", import_workdir=str(bad))
+    with pytest.raises(lp.PilotConfigError):
+        _run(cfg, _mock_make_session({"test__repo0-1": "ok",
+                                     "test__repo1-1": "ok",
+                                     "test__repo2-1": "ok"}))
+    # and the CLI path: exit 2
+    repos_b, inst_b = _two_pilot_b_repos(tmp_path)
+    assert lp.main(["--dry-run", "--pilot", "b",
+                    "--instances", inst_b,
+                    "--import-run", "bad",
+                    "--import-workdir", str(bad),
+                    "--workdir", str(tmp_path / "wd2"),
+                    "--run-id", "z"]) == lp.EXIT_CONFIG
+
+
+def test_seed_import_repairs_torn_tail_first(tmp_path, live):
+    """the host-crash class on a resume that imports: the torn tail
+    is truncated BEFORE the import lines are appended (the import
+    lines are durable — not glued onto the fragment and dropped by
+    the next open — and the idempotency read post-repair sees the
+    clean file, so no duplicate import lines)."""
+    p = tmp_path / "run-x.jsonl"
+    good = json.dumps({"instance_id": "a", "status": "no_patch",
+                      "meta": {}, "ts": 1.0})
+    prior_seed = json.dumps(
+        {"instance_id": "b", "status": "resolved",
+         "meta": {"wall": {"session_s": 5.0}, "imported_from": "x"},
+         "ts": 2.0})
+    src = {"b": {"instance_id": "b", "status": "resolved",
+                 "meta": {"wall": {"session_s": 5.0}}, "ts": 2.0}}
+    # a prior invocation seeded 'b' (a complete line — newline-
+    # terminated), then a crash tore the next write (the torn
+    # fragment is the LAST line, the host-crash class)
+    p.write_text(good + "\n" + prior_seed + "\n" +
+                '{"instance_id": "c", "status": ' + '"no_pat')
+    seeded = lp.seed_import_lines(str(p), src, "x")
+    assert seeded == []  # the post-repair read sees the prior seed
+    recs, _ = rr.load_checkpoint(str(p))
+    assert [r["instance_id"] for r in recs] == ["a", "b"]
+    assert len([r for r in recs if r["instance_id"] == "b"]) == 1
+    # a fresh file (no prior seed): the import line is durable and
+    # the torn fragment is gone
+    p2 = tmp_path / "run-y.jsonl"
+    p2.write_text(good + "\n" + '{"instance_id": "a", "status": '
+                 + '"no_pat')
+    seeded = lp.seed_import_lines(str(p2), src, "x")
+    assert seeded == ["b"]
+    recs, _ = rr.load_checkpoint(str(p2))
+    assert [r["instance_id"] for r in recs] == ["a", "b"]
+    # a mid-file corruption (not the torn-tail class) fails loud —
+    # the config error class, before any session
+    p3 = tmp_path / "run-z.jsonl"
+    p3.write_text(good + "\n" + "not json at all\n" + good + "\n")
+    with pytest.raises(lp.PilotConfigError):
+        lp.seed_import_lines(str(p3), src, "x")
+
+
+def test_same_workdir_import_no_same_file_error(tmp_path, live):
+    """--import-workdir defaults to this run's workdir: src == dst
+    for every referenced artifact — the copy must be skipped (the
+    shutil.copyfile SameFileError class), the seeding completes."""
+    repos, inst = _two_pilot_b_repos(tmp_path)
+    i0, i1, i2 = [e["instance_id"] for e in repos]
+    wd = tmp_path / "wd"
+    # the source run lives in the SAME workdir (run-src.jsonl)
+    cfg1 = _cfg(tmp_path, inst, run_id="src", workdir=str(wd),
+               host_check=False)
+    assert _run(cfg1, _mock_make_session(
+        {i0: "no_patch", i1: "no_patch", i2: "no_patch"})) \
+        == lp.EXIT_OK
+    # the pilot-B import from the same workdir
+    cfg2 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
+               resume=True, host_check=False, pilot="b",
+               import_run="src", import_workdir=str(wd))
+    assert _run(cfg2, _mock_make_session(
+        {i0: "no_patch", i1: "no_patch", i2: "no_patch"})) \
+        == lp.EXIT_OK
+    lines = _read_jsonl(wd / "run-pilotB.jsonl")
+    assert sum(1 for l in lines if l["instance_id"] == i0) == 1
+    assert sum(1 for l in lines if l["instance_id"] == i1) == 1
+    # the artifact survived (it was never copied — it is in place)
+    assert (wd / "runs" / i0 / "trajectory.jsonl").is_file()
+
+
+def test_multi_window_item16_via_state_rederivation(tmp_path, live):
+    """the documented multi-window flow: the continuation window
+    drops --import-run — the source lines re-derive from the state
+    file, so item 16 still evaluates (and gates) on the completing
+    (verdict-producing) record."""
+    repos, inst = _two_pilot_b_repos(tmp_path)
+    i0, i1, i2 = [e["instance_id"] for e in repos]
+    wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
+    modes = {i0: "no_patch", i1: "no_patch", i2: "ok"}
+    # the source run
+    cfg1 = _cfg(tmp_path, inst, run_id="src", workdir=str(wd1),
+               host_check=False)
+    assert _run(cfg1, _mock_make_session(modes)) == lp.EXIT_OK
+    # window 1: the import + the i2 re-run (eval_error)
+    cfg2 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               resume=True, host_check=False, pilot="b",
+               import_run="src", import_workdir=str(wd1))
+    assert _run(cfg2, _mock_make_session(modes)) == lp.EXIT_OK
+    # the state persists the source lines
+    state = json.loads((wd2 / "pilot-pilotB.state.json").read_text())
+    assert state["import_source"], state
+    # window 2 (the completing record): --resume, NO --import-run
+    cfg3 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               resume=True, host_check=False, pilot="b")
+    assert _run(cfg3, _mock_make_session(
+        {i0: "no_patch", i1: "no_patch", i2: "no_patch"})) \
+        == lp.EXIT_OK
+    gng = (wd2 / "wp6b-pilot-b.md").read_text()
+    row16 = [l for l in gng.splitlines()
+            if l.startswith("| 16 |")][0]
+    assert "n/a" not in row16, row16
+    assert "PASS" in row16, row16
+    # item 16's arithmetic holds with the i2 retry (3 lines for 1
+    # instance: 2 imported + 1 new = 3 unique)
+    assert "Session arithmetic: 2 imported + 1 new = 3 unique — " \
+        "holds" in gng
+
+
+def test_item16_gates_on_arithmetic(tmp_path, monkeypatch):
+    """the session arithmetic (unique-instance basis) is part of
+    item 16's gate: a preflight_failed line (no session burned —
+    excluded from the new-instance count, but a unique instance)
+    breaks the arithmetic → FAIL → NO-GO."""
+    monkeypatch.setenv(lp.LIVE_ENV, "1")
+    src = {"a": {"instance_id": "a", "status": "resolved",
+                 "meta": {"wall": {"session_s": 60.0},
+                         "usage": {"totalTokens": 100}}}}
+    items = _cb(imported={"a": src},
+               config=lp.PilotConfig(pilot="b", max_wall_s=2700.0,
+                                    resume=True),
+               resume_after_interrupt=True,
+               skipped_on_resume={"a": "no_patch"},
+               records=[
+                   _rec("a", "resolved",
+                        usage={"totalTokens": 100},
+                        imported_from="x"),
+                   _rec("b", "resolved"),
+                   _rec("c", "preflight_failed")])
+    assert _item(items, "16")["pass"] is False
+    verdict, failed = lp._verdict(items,
+                                 gating=lp._pilot_gating(
+                                     lp.PilotConfig(pilot="b")))
+    assert verdict == "NO-GO"
+    assert any(f.split(" ", 1)[0] == "16" for f in failed)

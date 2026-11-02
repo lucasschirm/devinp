@@ -10,10 +10,14 @@ re-run per pass@1). `PLAN-WP6B.md` is the plan of record.
 **Status: IN PROGRESS** — the live run is delegated (the operator
 session is bash-blocked from `devin`; a delegated session runs it, the
 WP0 §3.4 pattern). The commands below are the calibrated plan; the
-measured numbers are recorded here per window as the run completes
-(the WP3 runner window model: at the local daily cap the run exits 43
-and the next invocation continues with `--resume` in the same workdir,
-next UTC-midnight window).
+measured numbers are recorded here per window as the run completes.
+The harness itself never sleeps: at the local daily cap the window's
+remaining sessions are refused and recorded `quota_limited` (the
+retry class — nothing was burned), the run finishes (exit 0), and
+the operator re-invokes with `--resume` in the next UTC-midnight
+window (the WP3 `Runner`'s sleep-to-next-window is the 500-run
+model, not the pilot harness' — the pilot's exit codes are 0/2/3/
+4/42).
 
 ## Calibrated budget (the WP6a calibration — the 3-window plan)
 
@@ -34,14 +38,17 @@ window recorded below)
 cd bench
 # window 1 — the intentional interrupt after 8 sessions (exit 42, the
 # host-crash class — resume-eligible per PLAN §2.5; the AC4 resume
-# leg) + the import of the Pilot-A checkpoint
+# leg) + the import of the Pilot-A checkpoint. At the local daily
+# cap the window's remaining sessions are recorded quota_limited
+# (retry class — nothing burned) and the run finishes (exit 0).
 BENCH_LIVE=1 /tmp/benchvenv/bin/python live_pilot.py --pilot b \
   --mode sandbox --run-id pilotB --workdir ./pilot-b --resume \
   --import-run pilotA \
   --import-workdir /home/lucas/orca/workspaces/devinp/wp6a-pilot-a-3-real-instances-go-no-go-gate/pilot-a \
   --interrupt-after 8
-# window 1, continuation — same workdir, no --import-* (the lines are
-# already in the checkpoint; the seeding is idempotent)
+# window 1, continuation — same workdir, no --import-* (the lines
+# are already in the checkpoint; the seeding is idempotent, and the
+# import re-derives from the state file so item 16 still gates)
 BENCH_LIVE=1 /tmp/benchvenv/bin/python live_pilot.py --pilot b \
   --mode sandbox --run-id pilotB --workdir ./pilot-b --resume
 # window 2 (next UTC-midnight window) + window 3 (the final 3) — the

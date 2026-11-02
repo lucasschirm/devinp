@@ -126,6 +126,13 @@ BUDGET_FILE = str(_BENCH_DIR / "live_pilot_budget.json")
 #: removes BOTH — a stale verdict from a previous kind in the same
 #: workdir is never kept).
 RECORD_NAMES = {"a": "wp6a-go-no-go.md", "b": "wp6b-pilot-b.md"}
+# The ``--import-run`` id is interpolated into ``run-<id>.jsonl`` —
+# the same charset contract as the SWE-bench instance id (the WP5
+# ``_IID_CHARSET`` / container-name charset, no ``..``): a run id
+# outside it could point the import outside the workdir (path
+# traversal) — the codebase charset-restricts ids for exactly this
+# reason.
+_RUN_ID_CHARSET = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 EXIT_OK = 0
 EXIT_CONFIG = 2
@@ -274,6 +281,27 @@ class PilotConfig:
             raise PilotConfigError(
                 f"import_workdir must be a string (got "
                 f"{type(self.import_workdir).__name__})")
+        if self.import_run is not None:
+            if (".." in self.import_run
+                    or _RUN_ID_CHARSET.fullmatch(self.import_run)
+                    is None):
+                raise PilotConfigError(
+                    "--import-run must be a run id of the SWE-bench "
+                    "id charset [A-Za-z0-9][A-Za-z0-9._-]* without "
+                    f"'..' (got {self.import_run!r})")
+        # the pairing (fail-closed): --import-workdir is meaningless
+        # without --import-run; --import-run is the pilot-B import
+        # (checklist items 15–17 verify it — they never render
+        # under --pilot a, where a seeded import would go
+        # unverified)
+        if (self.import_workdir is not None
+                and self.import_run is None):
+            raise PilotConfigError(
+                "--import-workdir requires --import-run")
+        if (self.import_run is not None and self.pilot != "b"):
+            raise PilotConfigError(
+                "--import-run is the pilot-B import (items 15–17 "
+                "verify it — they do not render under --pilot a)")
         # ``--host-check`` is a sandbox-mode flag (the documented no-
         # container fallback) — in container mode the eval leg is the
         # official WP4 harness, and the flag would be accepted but
@@ -450,8 +478,15 @@ def load_imported(config: PilotConfig, workdir: str,
     except rr.RunnerProtocolError as exc:
         raise PilotConfigError(
             f"--import-run source {src!r} is corrupt: {exc}") from exc
-    finals, _ = rep.dedupe([r for r in src_records
-                          if isinstance(r, dict)])
+    try:
+        finals, _ = rep.dedupe([r for r in src_records
+                              if isinstance(r, dict)])
+    except rep.ReportProtocolError as exc:
+        # a charset-invalid instance_id in the source (the WP5
+        # dedupe is fail-loud on it) is a corrupt source — the
+        # documented exit-2 config error, not an exit-4 run failure
+        raise PilotConfigError(
+            f"--import-run source {src!r} is corrupt: {exc}") from exc
     known = {i["instance_id"] for i in insts}
     imported: dict = {}
     retry_class: dict = {}
@@ -504,6 +539,11 @@ def _copy_imported_artifacts(rec: dict, src_workdir: str,
             # artifact — not an import-time concern
         src = os.path.join(src_base, val) if src_base else val
         dst = os.path.join(dst_base, val) if dst_base else val
+        if os.path.abspath(src) == os.path.abspath(dst):
+            continue  # a same-workdir import (the --import-workdir
+            # default is this run's workdir): the artifact is
+            # already in place (shutil.copyfile onto itself would
+            # raise SameFileError)
         if os.path.isfile(src):
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             shutil.copyfile(src, dst)
@@ -518,24 +558,42 @@ def seed_import_lines(jsonl_path: str, imported: dict,
     source run's window, never this run's daily budget) and are
     skipped when the file already carries a line for the instance (a
     repeat ``--resume`` never re-seeds — no duplicate import lines).
-    Well-formed lines pass the ``JsonlCheckpoint`` open repair through
-    untouched. The referenced artifacts are copied from
+    The write-side repair (the ``JsonlCheckpoint`` open — the
+    torn-tail truncation) runs **before** the seeding, so a crash-
+    resume never glues an import line onto a torn tail (which the
+    next open would drop — a silent re-run of a never-rerun
+    instance); the post-repair idempotency read then sees the clean
+    file. The referenced artifacts are copied from
     ``src_workdir`` (the WP5 cross-check — see
-    :func:`_copy_imported_artifacts`). Returns the instance ids
-    actually seeded."""
+    :func:`_copy_imported_artifacts`). A mid-file corruption is a
+    :class:`PilotConfigError` (exit 2, before any session). Returns
+    the instance ids actually seeded."""
     if not imported:
         return []
+    # the write-side repair FIRST (the WP3a torn-tail contract):
+    # if this file carries a torn tail (the host-crash class), it
+    # is truncated to the last clean boundary BEFORE the import
+    # lines are appended — otherwise the import lines glue onto the
+    # fragment and the next checkpoint open drops them, and the
+    # never-rerun instance silently re-runs (a pass@1 violation).
+    # The idempotency read happens AFTER the repair: a pre-repair
+    # read of a torn file would fail and empty the ``existing``
+    # set, and already-seeded lines would be duplicated
+    try:
+        with rr.JsonlCheckpoint(jsonl_path):
+            pass  # the __init__ IS the repair
+    except rr.RunnerProtocolError as exc:
+        raise PilotConfigError(
+            f"checkpoint {jsonl_path!r} is corrupt before the "
+            f"import seeding: {exc}") from exc
     existing = set()
     if os.path.isfile(jsonl_path):
-        try:
-            recs, _ = rr.load_checkpoint(jsonl_path)
-            existing = {r.get("instance_id") for r in recs
-                       if isinstance(r, dict) and r.get("instance_id")}
-        except rr.RunnerProtocolError:
-            # a torn tail in the CURRENT file is the normal crash-
-            # resume state — the checkpoint open repairs it; only the
-            # set of existing ids matters here
-            pass
+        # post-repair: the file ends on a clean boundary, so the
+        # read is well-defined (a mid-file corruption is still
+        # fail-loud — the config error class, before any session)
+        recs, _ = rr.load_checkpoint(jsonl_path)
+        existing = {r.get("instance_id") for r in recs
+                   if isinstance(r, dict) and r.get("instance_id")}
     seeded = []
     dst_workdir = os.path.dirname(jsonl_path) or "."
     for iid in sorted(imported):
@@ -2076,12 +2134,14 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
 
     Items 15/16 render ``n/a`` (non-gating) when their data is
     absent (a pilot-B run over a non-stratified file / without an
-    import); item 17 is always evaluable (zero ``eval_error`` lines
-    pass vacuously). Item 12 gates **per window** when
-    ``window_buckets`` is given (the WP3 runner sleeps to the next
-    UTC-midnight window at the local daily cap — a multi-window run
-    must never fail the per-day cap by construction); a run that
-    spans one window renders the verbatim WP6a text."""
+    import — the import re-derives from the state file on the
+    continuation windows, so a multi-window run still gates item 16
+    on the completing record); item 17 is always evaluable (zero
+    ``eval_error`` lines pass vacuously). Item 12 gates **per
+    window** when ``window_buckets`` is given (the quota window is
+    the next UTC midnight — a multi-window run never fails the
+    per-day cap by construction); a run that spans one window
+    renders the verbatim WP6a text."""
     items: list = []
 
     def add(item: str, expected: str, observed: str,
@@ -2402,6 +2462,22 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
                              f"{fin.get('status') if fin else '-'}, "
                              f"wall {s_wall}/{f_wall}, tokens "
                              f"{s_tok}/{f_tok}, patch {s_pb}/{f_pb})")
+            # the session arithmetic (the unique-instance basis):
+            # imported + the unique NEW instances == unique — a legal
+            # pass@1 retry (several attempt lines for one instance)
+            # is the item-12 budget basis, not an arithmetic break
+            new_iids = {r.get("instance_id") for r in records
+                       if r.get("instance_id")
+                       and not (r.get("meta") or {}).get(
+                           "imported_from")
+                       and r.get("status") != "preflight_failed"}
+            unique = len({r.get("instance_id") for r in records
+                         if r.get("instance_id")})
+            arith_holds = (len(imported) + len(new_iids) == unique)
+            ok16 = ok16 and arith_holds
+            frag.append(f"arithmetic {len(imported)} + "
+                        f"{len(new_iids)} = {unique} "
+                        + ("holds" if arith_holds else "BROKEN"))
             add("16 2-run overlap/variance (WP6b AC2)",
                 "each imported (reused) instance: the source line == "
                 "this run's final line (status / session wall / "
@@ -2509,10 +2585,11 @@ def _render_pilot_b_sections(wp6b: dict) -> list:
                 f"{'PASS' if r['match'] else 'FAIL'} |")
         lines += ["",
                   f"Session arithmetic: {imp.get('imported')} imported "
-                  f"+ {imp.get('new_sessions')} new = "
+                  f"+ {imp.get('new_instances')} new = "
                   f"{imp.get('unique')} unique — "
-                  f"{'holds' if imp.get('arithmetic_holds') else 'BROKEN'}. "
-                  f"Overlap match: "
+                  f"{'holds' if imp.get('arithmetic_holds') else 'BROKEN'} "
+                  f"({imp.get('new_sessions')} attempt lines — the "
+                  f"budget basis, item 12). Overlap match: "
                   f"{'PASS' if imp.get('all_match') else 'FAIL'}.", ""]
     tax = wp6b.get("taxonomy") or {}
     rc = wp6b.get("root_causes") or []
@@ -2694,10 +2771,14 @@ def _window_buckets(records: list) -> dict:
     """The AC4 per-window budget view (issue #22): the checkpoint
     lines (instance id, non-``preflight_failed`` — the WP3 contract:
     it consumed no session) bucketed by their ``ts``'s **UTC day**
-    (the WP3 quota window boundary, ``next_quota_window``). Imported
-    lines keep the source run's ``ts`` — they land in the source
-    window, never this run's daily budget. A run that spans one
-    window renders the verbatim WP6a item-12 text."""
+    (the quota window boundary, ``next_quota_window`` — the next UTC
+    midnight; the WP3 ``Runner`` sleeps there to the next window in
+    the 500-run model, the pilot harness instead records
+    ``quota_limited`` — the retry class — and exits 0, the operator
+    resuming in the next window). Imported lines keep the source
+    run's ``ts`` — they land in the source window, never this run's
+    daily budget. A run that spans one window renders the verbatim
+    WP6a item-12 text."""
     out: dict = {}
     for r in records:
         if not r.get("instance_id"):
@@ -2787,15 +2868,20 @@ def _pilot_b_sections(config: PilotConfig, insts: list, records: list,
     new_lines = [r for r in records if r.get("instance_id")
                 and not (r.get("meta") or {}).get("imported_from")
                 and r.get("status") != "preflight_failed"]
+    # the session arithmetic counts UNIQUE new instances (a legal
+    # pass@1 retry of one instance is several attempt lines — the
+    # attempts are the item-12 budget basis, not the arithmetic
+    # basis)
+    new_iids = {r.get("instance_id") for r in new_lines}
     unique = len({r.get("instance_id") for r in records
                  if r.get("instance_id")})
     import_section = {
         "rows": import_rows,
         "imported": len(imported),
+        "new_instances": len(new_iids),
         "new_sessions": len(new_lines),
         "unique": unique,
-        "arithmetic_holds": (len(imported) + len(new_lines)
-                            == unique),
+        "arithmetic_holds": (len(imported) + len(new_iids) == unique),
         "all_match": all(r["match"] for r in import_rows)
         if import_rows else False,
     }
@@ -2925,6 +3011,24 @@ def run_pilot(config: PilotConfig,
     interrupted_before = bool(state.get("interrupted"))
     aborted_before = bool(state.get("aborted"))
     resume_exercised_before = bool(state.get("resume_exercised"))
+    # the WP6b import re-derivation (issue #22 AC2): the documented
+    # multi-window flow drops --import-run on the continuation
+    # windows — but item 16 must still gate on the completing
+    # (verdict-producing) record, so the source lines are persisted
+    # in the state file by the importing invocation and re-derived
+    # here (filtered to the current instance file — a stale id is
+    # ignored, the load_imported semantics)
+    if (not imported and config.resume
+            and state.get("imported")
+            and isinstance(state.get("import_source"), dict)):
+        known = {i["instance_id"] for i in insts}
+        imported = {iid: line for iid, line in
+                    state["import_source"].items()
+                    if iid in known}
+        if imported:
+            print(f"[pilot] import re-derived from the state file "
+                  f"({len(imported)} line(s) from "
+                  f"{state.get('imported_run', '?')})")
     # the WP6b import seeding (issue #22 AC2) — BEFORE the resume
     # read: the imported (never-rerun) lines must be in the
     # checkpoint when ``resume_queue`` decides what to skip
@@ -3116,6 +3220,8 @@ def run_pilot(config: PilotConfig,
         "completed_this_invocation": rep_.done_count,
         "imported_run": config.import_run,
         "imported": sorted(imported),
+        "import_source": imported,
+        "import_workdir": config.import_workdir,
         "import_retry_class": {k: v for k, v in sorted(import_retry.items())},
         "ts": time.time(),
     })
@@ -3183,6 +3289,8 @@ def run_pilot(config: PilotConfig,
             "completed_this_invocation": rep_.done_count,
             "imported_run": config.import_run,
             "imported": sorted(imported),
+            "import_source": imported,
+            "import_workdir": config.import_workdir,
             "import_retry_class": {k: v
                                   for k, v in sorted(import_retry.items())},
             "ts": time.time(),
@@ -3209,11 +3317,12 @@ def run_pilot(config: PilotConfig,
         resume_after_interrupt=(interrupted_before
                                or resume_exercised_before),
         devin_ok=bool(inst_records) and not run_failed,
-        # the budget gate counts ATTEMPTS (all checkpoint lines with
-        # an instance id — a superseded eval_error→rerun or a stale
-        # preflight_failed line burned a session / wall that the
-        # deduped view would silently drop), consistent with the
-        # wall sum and with WP5's session arithmetic
+        # the budget gate counts ATTEMPTS (every checkpoint line
+        # with an instance id, EXCEPT a preflight_failed line — the
+        # WP3 contract: the pre-flight failed before the session, so
+        # it burned nothing; _window_buckets skips those lines),
+        # consistent with the wall sum and with WP5's session
+        # arithmetic
         sessions_used=sessions_used,
         wall_budget_s=config.max_wall_s * config.max_sessions_per_day,
         wall_used_s=wall_used_s,
@@ -3264,7 +3373,12 @@ def _build_parser() -> argparse.ArgumentParser:
                     "BENCH_LIVE=1 required for a real run")
     p.add_argument("--mode", choices=("container", "sandbox"),
                    default="sandbox")
-    p.add_argument("--instances", default=DEFAULT_INSTANCES_FILE)
+    p.add_argument("--instances", default=None,
+                   help="the instances file (default: "
+                        f"{os.path.basename(DEFAULT_INSTANCES_FILE)} "
+                        "for --pilot a, "
+                        f"{os.path.basename(DEFAULT_B_INSTANCES_FILE)} "
+                        "for --pilot b)")
     p.add_argument("--devin-bin", default="devin")
     p.add_argument("--model", default=DEFAULT_MODEL)
     p.add_argument("--workdir", default=None)
@@ -3286,10 +3400,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--import-run", default=None,
                    help="the WP6b checkpoint import: the source run's "
                         "id (issue #22 AC2 — the 3 Pilot A instances "
-                        "are reused inside the 25, never re-run)")
+                        "are reused inside the 25, never re-run; "
+                        "a pilot-B flag, verified by items 15–17; "
+                        "the run id charset "
+                        "[A-Za-z0-9][A-Za-z0-9._-]*)")
     p.add_argument("--import-workdir", default=None,
                    help="the source run's workdir (default: this "
-                        "run's workdir)")
+                        "run's workdir; requires --import-run)")
     return p
 
 
@@ -3327,7 +3444,10 @@ def main(argv: "Optional[list]" = None) -> int:
             raise PilotConfigError("--largest-bytes must be > 0")
         config = PilotConfig(
             mode=args.mode, devin_bin=args.devin_bin, model=args.model,
-            instances_file=args.instances, workdir=args.workdir,
+            instances_file=args.instances
+            or (DEFAULT_B_INSTANCES_FILE if args.pilot == "b"
+                else DEFAULT_INSTANCES_FILE),
+            workdir=args.workdir,
             run_id=args.run_id, max_sessions_per_day=msp,
             max_wall_s=mw,
             largest_bytes=args.largest_bytes
