@@ -600,6 +600,27 @@ def load_imported(config: PilotConfig, workdir: str,
                     "before any session; a seeded non-string "
                     "reference would wedge every later --resume "
                     "in report_failed)")
+            # the round-15 Medium fix (issue #22): the reference
+            # values join into the artifact copy's source /
+            # destination paths (os.path.join(base, ref)) — reject
+            # the traversal class (a ``..`` path element) and
+            # absolute paths (os.path.join(base, abs) IS abs — it
+            # escapes the workdir entirely; the WP5 _ref_path
+            # contract: a relative reference resolves against the
+            # JSONL's directory) — the same traversal class the
+            # run-id / instance-id charsets exist to prevent (a
+            # source line with e.g. artifacts_dir: "../../x"
+            # would make the copy's makedirs/replace write
+            # outside this run's workdir)
+            if isinstance(v, str) and v and (
+                    os.path.isabs(v) or ".." in v.split("/")):
+                raise PilotConfigError(
+                    f"--import-run source line for {iid!r} "
+                    f"carries a {k} with a path traversal or an "
+                    f"absolute reference ({v!r}) — fail-closed: "
+                    f"the value joins into the artifact copy's "
+                    f"paths (a '../../x' reference would write "
+                    f"outside this run's workdir)")
         # the SOURCE-ARTIFACT LAYOUT normalization (the round-11
         # Blocker fix, issue #22 AC2): the pre-commit Pilot-A run
         # (2026-10-28 20:46–20:56 UTC — before commit 4259460)
@@ -2427,37 +2448,47 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
                     break
     for rec in records:
         m = _meta_of(rec)
-        p = m.get("permissions") or {}
-        perms_req += int(p.get("requests", 0))
-        if int(p.get("requests", 0)) != int(p.get("allowed", 0)) + int(
-                p.get("denied", 0)):
-            perms_all_answered = False
-        perms_send_failures += int(
-            m.get("permission_send_failures", 0))
-        vendor_seen += int(m.get("vendor_notifications", 0))
-        # item 7: a check that did not run (a close() failure —
-        # ``orphan_check`` stays None) is a FAIL, not a pass
-        oc = m.get("orphan_check")
-        if oc is None:
-            orphan_unchecked = True
-        elif oc is False:
-            orphan_checked = False
-        # item 10: the pruning record must be present in the line and
-        # free of failures (written before the line is persisted).
-        # Imported (never-rerun) lines are EXCLUDED from the check
-        # (the round-13 Blocker fix, issue #22 AC2): they carry the
-        # source run's meta verbatim — the per-line pruning record
-        # postdates that run (Pilot A ran before the harness wrote
-        # meta.pruning), so the documented --import-run import could
-        # never pass item 10 and the completing record rendered a
-        # permanent NO-GO. The source run's own record gates its
-        # own pruning (the pilot-a record); this run's item 10
-        # gates the sessions it actually ran
+        # the per-instance session-derived gating checks (items 5,
+        # 6, 7, 10, 14) apply to THIS RUN'S sessions only (the
+        # round-15 Major fix, issue #22 AC2 — extending the
+        # round-13 item-10 exclusion): imported (never-rerun) lines
+        # carry the source run's meta verbatim — a source whose
+        # lines lack these keys (or carry a send failure / a
+        # permissions mismatch / a non-clean leak verify / the
+        # pre-harness missing pruning record) would fail the
+        # gating items on evidence from the source run's sessions —
+        # a permanent NO-GO on this run's record for sessions it
+        # never ran. The source run's own record gates its own
+        # sessions. Items 8/9 (the attempt stats) and 12/16 (the
+        # budget / overlap arithmetic) exclude the imported lines by
+        # their own filters; item 13 (the eval leg verdict) is
+        # non-gating and renders every final line
         if m.get("imported_from"):
             pruning_obs.append(
                 f"{rec.get('instance_id')}: imported (the source "
                 f"run's record gates the pruning)")
+            leak_obs.append(
+                f"{rec.get('instance_id')}: imported (the source "
+                f"run's record gates the leak guard)")
         else:
+            p = m.get("permissions") or {}
+            perms_req += int(p.get("requests", 0))
+            if (int(p.get("requests", 0)) != int(p.get("allowed", 0))
+                    + int(p.get("denied", 0))):
+                perms_all_answered = False
+            perms_send_failures += int(
+                m.get("permission_send_failures", 0))
+            vendor_seen += int(m.get("vendor_notifications", 0))
+            # item 7: a check that did not run (a close() failure —
+            # ``orphan_check`` stays None) is a FAIL, not a pass
+            oc = m.get("orphan_check")
+            if oc is None:
+                orphan_unchecked = True
+            elif oc is False:
+                orphan_checked = False
+            # item 10: the pruning record must be present in the
+            # line and free of failures (written before the line
+            # is persisted)
             pr = m.get("pruning")
             if not isinstance(pr, dict) or pr.get("failed"):
                 pruning_ok = False
@@ -2467,19 +2498,21 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
                    else "no record in the checkpoint line")
                 + (f"; FAILED {pr.get('failed')}" if isinstance(pr, dict)
                    and pr.get("failed") else ""))
-        # item 14: the recorded guard + post-session verification
-        lg = m.get("leak_guard") or {}
-        lv = m.get("leak_verify") or {}
-        if lv.get("clean") is not True or lg.get("remotes_after"):
-            leak_ok = False
-        leak_obs.append(
-            f"{rec.get('instance_id')}: verify="
-            + (f"clean={lv.get('clean')} remotes={lv.get('remotes')} "
-               f"tags={lv.get('tags')}" if lv else "no record")
-            + (f"; guard remotes_after={lg.get('remotes_after')} "
-               f"warnings={lg.get('warnings')}" if lg else ""))
-        if m.get("suspected_untrusted_cwd"):
-            untrusted = True
+            # item 14: the recorded guard + post-session
+            # verification
+            lg = m.get("leak_guard") or {}
+            lv = m.get("leak_verify") or {}
+            if (lv.get("clean") is not True
+                    or lg.get("remotes_after")):
+                leak_ok = False
+            leak_obs.append(
+                f"{rec.get('instance_id')}: verify="
+                + (f"clean={lv.get('clean')} remotes={lv.get('remotes')} "
+                   f"tags={lv.get('tags')}" if lv else "no record")
+                + (f"; guard remotes_after={lg.get('remotes_after')} "
+                   f"warnings={lg.get('warnings')}" if lg else ""))
+            if m.get("suspected_untrusted_cwd"):
+                untrusted = True
         gb = m.get("graded_by")
         s = rec.get("status")
         eval_legs.append(

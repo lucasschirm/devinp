@@ -4357,3 +4357,93 @@ def test_wp6b_round14_multi_window_obs12_annotation(tmp_path, live):
     it12 = next(i for i in items if i["item"].startswith("12 "))
     assert "the WP5 report's sessions-used also counts the 1 " \
         "imported line(s)" in it12["observed"], it12["observed"]
+
+
+def _imported_rec_bad(iid: str, **meta) -> dict:
+    """A source-run shaped imported line (no this-run session
+    meta keys — the round-15 Major class) + the given meta."""
+    m = {"imported_from": "pilotA", "ts": 1.0}
+    m.update(meta)
+    return {"instance_id": iid, "status": "resolved",
+            "ts": 1.0, "meta": m}
+
+
+def test_wp6b_round15_imported_excluded_from_session_items(
+        tmp_path, live):
+    """The round-15 Major fix (issue #22 AC2): the imported
+    lines' source-run meta fed the gating checks for items 5
+    (untrusted cwd), 6 (permissions arithmetic / send failures),
+    7 (orphan_check), 14 (leak_guard / leak_verify.clean) — a
+    source whose lines carry a send failure / permissions
+    mismatch / a non-clean leak verify / a missing orphan check
+    fails those gating items on evidence from the source run's
+    sessions: a permanent NO-GO on this run's record for
+    sessions it never ran. Fix: imported lines are excluded from
+    items 5/6/7/10/14 (the source run's own record gates its own
+    sessions) with an explicit obs annotation. The checks still
+    apply to this run's own lines."""
+    bad = _imported_rec_bad(
+        "imp",
+        permissions={"requests": 3, "allowed": 1, "denied": 0},
+        permission_send_failures=2,
+        orphan_check=False,
+        leak_verify={"clean": False, "remotes": ["origin"],
+                     "tags": []},
+        suspected_untrusted_cwd=True)
+    recs = [bad, _rec("fresh", "resolved")]
+    items = _cb(records=recs, imported={"imp": bad})
+    for n in ("5", "6", "7", "10", "14"):
+        assert _item(items, n)["pass"] is True, \
+            (n, _item(items, n))
+    assert "imported (the source run's record gates the " \
+        "leak guard)" in _item(items, "14")["observed"]
+    # the checks still apply to this run's OWN lines
+    own = _rec("own", "resolved")
+    own["meta"]["leak_verify"] = {"clean": False, "remotes": [],
+                                  "tags": []}
+    items2 = _cb(records=[own])
+    assert _item(items2, "14")["pass"] is False
+
+
+def test_wp6b_round15_import_ref_traversal_rejected(
+        tmp_path, live):
+    """The round-15 Medium fix (issue #22): the reference
+    values (artifacts_dir / patch_diff / trajectory / eval_log)
+    join into the artifact copy's source/destination paths
+    (os.path.join(base, ref)) — a source line with a '..' path
+    element or an absolute reference would make the copy's
+    makedirs/replace write outside this run's workdir (the
+    traversal class the run-id / instance-id charsets exist to
+    prevent). Fail-closed: a config error before any session."""
+    repos, inst = _two_pilot_b_repos(tmp_path)
+    ids = [e["instance_id"] for e in repos]
+    wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
+    wd1.mkdir()
+    src = wd1 / "run-src.jsonl"
+    cfg = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               host_check=False, pilot="b",
+               import_run="src", import_workdir=str(wd1))
+    insts = json.loads(Path(inst).read_text())["instances"]
+    for key, bad in (("artifacts_dir", "../../x"),
+                     ("artifacts_dir", "/abs/x"),
+                     ("patch_diff", "../evil.diff"),
+                     ("trajectory", "/etc/evil.jsonl")):
+        with open(src, "w") as f:
+            f.write(json.dumps({"instance_id": ids[0],
+                                "status": "resolved", "ts": 1.0,
+                                "meta": {key: bad}}) + "\n")
+        try:
+            lp.load_imported(cfg, str(wd2), insts)
+        except lp.PilotConfigError:
+            pass
+        else:
+            raise AssertionError(f"{key}={bad!r} was accepted")
+    # a conforming relative reference still passes
+    with open(src, "w") as f:
+        f.write(json.dumps({"instance_id": ids[0],
+                            "status": "resolved", "ts": 1.0,
+                            "meta": {"artifacts_dir": "runs/x",
+                                    "patch_diff": "patch.diff"}})
+               + "\n")
+    imported, _ = lp.load_imported(cfg, str(wd2), insts)
+    assert ids[0] in imported

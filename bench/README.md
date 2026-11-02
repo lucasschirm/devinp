@@ -657,7 +657,8 @@ BENCH_LIVE=1 python live_pilot.py --pilot b --mode sandbox \
   (item 17 gates on it; the harness auto-classifies every failure
   point — the host-check install/apply/pytest legs, the WP4 typed
   errors, the oversize-patch cap — and records
-  `meta.eval_error_root_cause` + `meta.eval_error_root_cause.detail`
+  `meta.eval_error_root_cause` + `meta.eval_error_root_cause_detail`
+  (the flat sibling key)
   on the checkpoint line itself, which is the record's source of
   truth); (AC4) the per-UTC-window budget gate (item 12 buckets the
   checkpoint by day; a single-window run renders the verbatim WP6a
