@@ -21,6 +21,7 @@ export default class Devinp extends Command {
     '<%= config.bin %> -o=bench -g=family',
     '<%= config.bin %> --web --port 8080',
     '<%= config.bin %> --source sample/models.json',
+    'devin models list --format json | <%= config.bin %> --source=-',
   ]
 
   static flags = {
@@ -46,7 +47,8 @@ export default class Devinp extends Command {
       dependsOn: ['web'],
     }),
     source: Flags.string({
-      summary: 'load prices from a saved `devin models list --format json` file',
+      summary:
+        'load prices from a saved `devin models list --format json` file, or from stdin with --source=- (use it when the CLI pages its output instead of writing it to the pipe)',
     }),
     json: Flags.boolean({
       summary: 'print normalized rows as JSON instead of a table',
@@ -62,6 +64,9 @@ export default class Devinp extends Command {
       const loaded = await loadModelData({source: flags.source})
       if (loaded.truncated) {
         this.warn('devin output was truncated mid-stream — showing partial data, re-run for the full list')
+      }
+      if (loaded.retries > 0) {
+        this.warn(`devin needed ${loaded.retries + 1} attempts to hand over the model list — something on this machine (pager, paged "show more" view, wrapper) interferes with \`devin models list\``)
       }
       data = loaded.data
     } catch (error) {
