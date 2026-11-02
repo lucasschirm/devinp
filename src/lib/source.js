@@ -28,15 +28,27 @@ const NON_INTERACTIVE_ENV = {
 }
 
 /**
+ * Spawn `devin` in its own session (`detached`). On POSIX that is a
+ * `setsid()`, which leaves the child with **no controlling terminal**:
+ * opening `/dev/tty` fails, so a TUI or pager that paints onto the
+ * terminal — behind a "click to show more" — has nowhere to draw and the
+ * data has to go to stdout. Ctrl-C in the user's terminal also stops
+ * reaching the lookup. On Windows there is no `/dev/tty`; `windowsHide`
+ * just keeps the child's console from flashing on screen.
+ */
+const DETACHED_SPAWN = {detached: true, windowsHide: true}
+
+/**
  * Capture strategies, cheapest first. The first is the healthy path and
  * keeps the caller's environment untouched; the later ones only run when
- * the previous attempt produced nothing usable, and progressively force
- * `devin` out of interactive/paged mode.
+ * the previous attempt produced nothing usable, and progressively strip
+ * the interactive terminal away from `devin`: first the conventions that
+ * disable paging/colour, then the controlling terminal itself.
  */
 const STRATEGIES = [
   {label: 'temp file', file: true, env: null},
-  {label: 'temp file + non-interactive env', file: true, env: NON_INTERACTIVE_ENV},
-  {label: 'pipe + non-interactive env', file: false, env: NON_INTERACTIVE_ENV},
+  {label: 'temp file, paging disabled, no controlling terminal', file: true, env: NON_INTERACTIVE_ENV, detached: true},
+  {label: 'pipe, paging disabled, no controlling terminal', file: false, env: NON_INTERACTIVE_ENV, detached: true},
 ]
 
 // CSI colour/cursor sequences plus OSC hyperlinks — some wrappers dress
@@ -75,11 +87,12 @@ function parseJsonLoosely(text) {
  * Spawn `devin models list --format json` and collect its streams. Never
  * rejects, except for a missing executable (`error.code === 'ENOENT'`).
  */
-function spawnDevin({command, env, stdout, timeoutMs}) {
+function spawnDevin({command, env, stdout, timeoutMs, detached = false}) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, ['models', 'list', '--format', 'json'], {
       stdio: ['ignore', stdout, 'pipe'],
       ...(env ? {env: {...process.env, ...env}} : {}),
+      ...(detached ? DETACHED_SPAWN : {}),
     })
     let stdoutText = ''
     let stderr = ''
@@ -116,11 +129,11 @@ function spawnDevin({command, env, stdout, timeoutMs}) {
  * file (a file write persists in full). The temp file is always removed
  * in `finally`, on the success and failure paths alike.
  */
-async function captureToFile({command, env, timeoutMs}) {
+async function captureToFile({command, env, timeoutMs, detached}) {
   const file = join(tmpdir(), `devinp-models-${process.pid}-${Date.now()}.json`)
   const handle = await open(file, 'w')
   try {
-    const result = await spawnDevin({command, env, stdout: handle.fd, timeoutMs})
+    const result = await spawnDevin({command, env, stdout: handle.fd, timeoutMs, detached})
     // A killed run still leaves whatever it managed to write, which is
     // worth more than nothing on the truncation-repair path.
     result.stdout = await readFile(file, 'utf8')
@@ -150,8 +163,8 @@ export async function runDevinJson({command = 'devin', timeoutMs = DEVIN_TIMEOUT
     let result
     try {
       result = strategy.file
-        ? await captureToFile({command, env: strategy.env, timeoutMs})
-        : await spawnDevin({command, env: strategy.env, stdout: 'pipe', timeoutMs})
+        ? await captureToFile({command, env: strategy.env, timeoutMs, detached: strategy.detached})
+        : await spawnDevin({command, env: strategy.env, stdout: 'pipe', timeoutMs, detached: strategy.detached})
     } catch (error) {
       if (error.code === 'ENOENT') throw error
       attempts.push({label: strategy.label, bytes: 0, code: null, stderr: '', timedOut: false, note: error.message})
@@ -226,9 +239,10 @@ function describeFailure(attempts, timeoutMs) {
   if (bytes === 0) {
     lines.push(
       'Unable to get model prices: `devin models list --format json` exited without writing ' +
-        'the JSON to stdout (0 bytes). Something between devinp and the CLI — a pager, an ' +
-        'interactive "click to show more" view, or a shell/agent wrapper around `devin` — ' +
-        'kept the output for the screen.',
+        'the JSON to stdout (0 bytes). devinp re-ran it with paging disabled and in a ' +
+        'session with no controlling terminal, so the CLI had no terminal to paint a ' +
+        '"click to show more" view on — whatever swallowed the output sits between ' +
+        'devinp and `devin` (a shell function or agent wrapper around it, or a broken install).',
     )
   } else {
     let parseError = ''
@@ -247,7 +261,7 @@ function describeFailure(attempts, timeoutMs) {
   lines.push('Capture the JSON yourself and hand it to devinp — piping or redirecting makes `devin` write the whole document in one go:')
   lines.push('  devin models list --format json > models.json && devinp --source models.json')
   lines.push('  devin models list --format json | devinp --source=-')
-  lines.push('If a plain `devin models list --format json > models.json` still prints a paged view, update the CLI (`devin update`).')
+  lines.push('Check `command -v devin` — if that is not the real CLI, devinp is asking the wrong program. If a plain redirect still prints a paged view, update the CLI (`devin update`).')
   return lines.join('\n')
 }
 
