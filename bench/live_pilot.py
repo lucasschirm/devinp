@@ -496,8 +496,8 @@ def load_imported(config: PilotConfig, workdir: str,
     # (the real 2-run overlap evidence clobbered)
     if (config.import_run == config.run_id
             and (config.import_workdir is None
-                 or os.path.abspath(config.import_workdir)
-                 == os.path.abspath(workdir))):
+                 or os.path.realpath(config.import_workdir)
+                 == os.path.realpath(workdir))):
         raise PilotConfigError(
             f"--import-run {config.import_run!r} is this run's own "
             "run id with this run's workdir — a self-import is "
@@ -3270,12 +3270,23 @@ def _pilot_b_sections(config: PilotConfig, insts: list, records: list,
     new_lines = [r for r in records if r.get("instance_id")
                 and not _meta_of(r).get("imported_from")
                 and r.get("status") != "preflight_failed"]
+    # the session arithmetic is on the DEDUPED-FINALS basis
+    # (the round-16 Medium fix, issue #22 AC2 — it must match
+    # item 16, which gates on the same equation over the deduped
+    # finals): an instance whose final line is preflight_failed
+    # (an eval_error attempt superseded by it) must not count as
+    # "new" here yet be excluded in item 16 — the record would
+    # render "holds" and "BROKEN" for the same run. new_sessions
+    # stays on the raw (attempt) basis — it is a session count
+    fin_new = [r for r in inst_records if r.get("instance_id")
+               and not _meta_of(r).get("imported_from")
+               and r.get("status") != "preflight_failed"]
     # the session arithmetic counts UNIQUE new instances (a legal
     # pass@1 retry of one instance is several attempt lines — the
     # attempts are the item-12 budget basis, not the arithmetic
     # basis)
-    new_iids = {r.get("instance_id") for r in new_lines}
-    unique = len({r.get("instance_id") for r in records
+    new_iids = {r.get("instance_id") for r in fin_new}
+    unique = len({r.get("instance_id") for r in inst_records
                  if r.get("instance_id")})
     import_section = {
         "rows": import_rows,
@@ -3315,15 +3326,16 @@ def _pilot_b_sections(config: PilotConfig, insts: list, records: list,
             "detail": (m.get("eval_error_root_cause_detail")
                       or m.get("eval_skip_reason") or "")[:200]})
     return {
+        # the round-16 Minor fix (issue #22): all_repos_covered /
+        # all_root_caused were computed here but never consumed by
+        # the renderer or the checklist (the gating items 15 / 17
+        # compute their own coverage / classification over the same
+        # data) — dead record keys, removed
         "per_repo": per_repo,
         "expected_repos": strat,
-        "all_repos_covered": all(per_repo[r]["count"] >= 1
-                                for r in strat),
         "import": import_section,
         "taxonomy": taxonomy,
         "root_causes": root_rows,
-        "all_root_caused": all(r["root_cause"] is not None
-                              for r in root_rows),
         "windows": [{"day": _window_day_str(d), "sessions": w["sessions"],
                     "wall_s": round(w["wall_s"], 1)}
                    for d, w in sorted(buckets.items())],
@@ -3423,9 +3435,39 @@ def run_pilot(config: PilotConfig,
         # renders no verdict (all n/a), but fail-closed
         # consistency: a dry run that passes must be an invocation
         # that would actually work (the round-14 AC1 stratification
-        # requirement too — the same check)
-        _check_pilot_b_requirements(config,
-                                   _load_state(workdir, run_id))
+        # requirement too — the same check). The round-16 Minor
+        # fix (issue #22 AC2): the check applies the checkpoint
+        # re-derivation the live path performs — a --pilot b
+        # --dry-run --resume on a workdir whose checkpoint carries
+        # seeded import lines but whose state file is absent must
+        # be treated like the equivalent live --resume (it used to
+        # be rejected while the live path proceeded)
+        dry_state = _load_state(workdir, run_id)
+        dry_imported = None
+        if (config.resume and not config.import_run
+                and not dry_state.get("imported_run")
+                and not dry_state.get("import_source")
+                and os.path.isfile(
+                    os.path.join(workdir,
+                                f"run-{run_id}.jsonl"))):
+            try:
+                pre_recs, _ = rr.load_checkpoint(
+                    os.path.join(workdir, f"run-{run_id}.jsonl"))
+            except rr.RunnerProtocolError:
+                pre_recs = []
+            known = {i["instance_id"] for i in insts}
+            der: dict = {}
+            for r in pre_recs:
+                m = _meta_of(r)
+                if m.get("imported_from"):
+                    line = dict(r)
+                    line["meta"] = m
+                    m.pop("imported_from", None)
+                    der[r.get("instance_id")] = line
+            dry_imported = {iid: l for iid, l in der.items()
+                           if iid in known}
+        _check_pilot_b_requirements(config, dry_state,
+                                   dry_imported)
         cal = calibrate([], config)
         items = build_checklist(
             config=config, dry_run=True, gate=None, preflight_ok=None,

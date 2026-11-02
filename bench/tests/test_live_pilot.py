@@ -4447,3 +4447,122 @@ def test_wp6b_round15_import_ref_traversal_rejected(
                + "\n")
     imported, _ = lp.load_imported(cfg, str(wd2), insts)
     assert ids[0] in imported
+
+
+def test_wp6b_round16_section_arithmetic_matches_item16(tmp_path, live):
+    """The round-16 Medium fix (issue #22 AC2): the AC2 section's
+    session arithmetic counted an instance as 'new' when ANY raw
+    checkpoint line was non-import/non-preflight_failed, while
+    item 16 computes the same equation over the DEDUPED finals —
+    an instance with an eval_error attempt superseded by a
+    preflight_failed final counted as new here yet was excluded
+    in item 16, so the record could render 'holds' and 'BROKEN'
+    for the same run. The section's arithmetic is now on the
+    deduped-finals basis (matching item 16); new_sessions stays
+    on the raw (attempt) basis (it is a session count)."""
+    repos, inst = _two_pilot_b_repos(tmp_path)
+    i0, i1, i2 = [e["instance_id"] for e in repos]
+    # raw lines: an eval_error attempt for i2 superseded by a
+    # preflight_failed final
+    raw = [
+        {"instance_id": i0, "status": "resolved", "ts": 1.0,
+         "meta": {"imported_from": "pilotA"}},
+        {"instance_id": i2, "status": "eval_error", "ts": 2.0,
+         "meta": {}},
+        {"instance_id": i2, "status": "preflight_failed",
+         "ts": 3.0, "meta": {}},
+    ]
+    # the deduped finals (last line per instance)
+    finals = {r["instance_id"]: r for r in raw}
+    cfg = _cfg(tmp_path, inst, run_id="pilotB", host_check=False,
+               pilot="b")
+    sec = lp._pilot_b_sections(
+        cfg, json.loads(Path(inst).read_text())["instances"],
+        raw, list(finals.values()),
+        {i0: raw[0]},
+        {19000: {"sessions": 1, "wall_s": 10.0}})
+    ar = sec["import"]
+    # i2's final is preflight_failed (a RETRY class — i2 is not
+    # yet complete): the equation is legitimately broken (1 + 0
+    # != 2 — i2 has no final line) — but it must be the SAME
+    # result item 16 renders (the record no longer shows 'holds'
+    # here and 'BROKEN' there)
+    assert ar["new_instances"] == 0, ar
+    items = _cb(records=[dict(r) for r in list(finals.values())],
+               imported={i0: raw[0]})
+    it16 = _item(items, "16")
+    assert ("BROKEN" in it16["observed"]) == (not ar["arithmetic_holds"]), \
+        (it16["observed"], ar["arithmetic_holds"])
+    # new_sessions stays on the raw (attempt) basis: the i2
+    # eval_error attempt IS a session (the preflight line is not)
+    assert ar["new_sessions"] == 1, ar
+    # a COMPLETE record (i2's final is terminal): both sides hold
+    raw_done = raw + [{"instance_id": i2, "status": "resolved",
+                      "ts": 4.0, "meta": {}}]
+    finals_done = {r["instance_id"]: r for r in raw_done}
+    sec2 = lp._pilot_b_sections(
+        cfg, json.loads(Path(inst).read_text())["instances"],
+        raw_done, list(finals_done.values()),
+        {i0: raw[0]},
+        {19000: {"sessions": 2, "wall_s": 20.0}})
+    assert sec2["import"]["arithmetic_holds"] is True, sec2["import"]
+    items2 = _cb(records=[dict(r) for r in list(finals_done.values())],
+                imported={i0: raw[0]})
+    assert _item(items2, "16")["pass"] is True
+
+
+def test_wp6b_round16_dry_run_checkpoint_derivation(tmp_path, live):
+    """The round-16 Minor fix (issue #22 AC2): the dry-run
+    requirement check did not apply the checkpoint re-derivation
+    the live path performs — a --pilot b --dry-run --resume on a
+    workdir whose checkpoint carries seeded import lines but
+    whose state file is absent was rejected while the equivalent
+    live --resume proceeded. Now the dry run re-derives the
+    import from the checkpoint's seeded lines."""
+    repos, inst = _two_pilot_b_repos(tmp_path)
+    i0, i1, i2 = [e["instance_id"] for e in repos]
+    wd = tmp_path / "wd"
+    wd.mkdir()
+    # a checkpoint with a seeded import line (the marker) and NO
+    # state file (the graceful-early-exit class)
+    with open(wd / "run-pilotB.jsonl", "w") as f:
+        f.write(json.dumps({"instance_id": i0,
+                            "status": "no_patch", "ts": 1.0,
+                            "meta": {"imported_from": "src"}})
+               + "\n")
+    rc = lp.main(["--dry-run", "--pilot", "b", "--resume",
+                  "--devin-bin", MOCK_PATH,
+                  "--instances", inst, "--workdir", str(wd),
+                  "--run-id", "pilotB"])
+    assert rc == lp.EXIT_OK, rc
+    # a fresh workdir (no checkpoint, no state) is still rejected
+    rc2 = lp.main(["--dry-run", "--pilot", "b",
+                   "--devin-bin", MOCK_PATH,
+                   "--instances", inst,
+                   "--workdir", str(tmp_path / "wd2"),
+                   "--run-id", "pilotB"])
+    assert rc2 == lp.EXIT_CONFIG, rc2
+
+
+def test_wp6b_round16_self_import_symlink_rejected(tmp_path, live):
+    """The round-16 Minor fix (issue #22): the self-import
+    guard compared os.path.abspath paths, which do not resolve
+    symlinks — an --import-workdir that is a symlinked alias of
+    this run's workdir bypassed the rejection. Now
+    os.path.realpath (which resolves symlinks) is compared."""
+    repos, inst = _two_pilot_b_repos(tmp_path)
+    wd = tmp_path / "wd"
+    wd.mkdir()
+    alias = tmp_path / "alias"
+    os.symlink(str(wd), str(alias))
+    cfg = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
+               host_check=False, pilot="b",
+               import_run="pilotB", import_workdir=str(alias))
+    insts = json.loads(Path(inst).read_text())["instances"]
+    try:
+        lp.load_imported(cfg, str(wd), insts)
+    except lp.PilotConfigError:
+        pass
+    else:
+        raise AssertionError("a symlinked self-import was "
+                           "accepted")
