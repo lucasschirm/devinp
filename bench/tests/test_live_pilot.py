@@ -5289,3 +5289,82 @@ def test_wp6b_round26_rederivation_non_dict_source_value(
     else:
         raise AssertionError("a non-dict import_source value "
                            "was accepted by the re-derivation")
+
+
+def test_wp6b_round28_stratify_rule(tmp_path):
+    """The round-28 Medium fix (issue #22, 4451495681): stratify
+    — the documented reproducibility rule (1 per each of the 12
+    repos; the remaining 13 seats round-robin in descending repo
+    size, ties by name, capped at each repo's row count in the
+    split; first N rows in dataset order) — had no unit test: a
+    regression would silently produce a different 25-instance
+    pin. The test rebuilds the 500-row split with the committed
+    per-repo sizes (the pilot_b_instances.json
+    per_repo_total_in_split) and asserts the rule's full
+    contract: the 25 selection, the per-repo seat distribution
+    (django 3, sympy 3, nine repos 2, flask 1 — the flask cap:
+    its single split row exhausts its seat), the 12-repo
+    coverage, the first-N-in-row_idx selection, and the fail-
+    loud on a 11-repo split."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "pin_pilot_b", str(Path(__file__).parent.parent
+                          / "scripts" /
+                          "pin_pilot_b_instances.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    totals = {"django/django": 231, "sympy/sympy": 75,
+              "sphinx-doc/sphinx": 44, "matplotlib/matplotlib": 34,
+              "scikit-learn/scikit-learn": 32, "astropy/astropy": 22,
+              "pydata/xarray": 22, "pytest-dev/pytest": 19,
+              "pylint-dev/pylint": 10, "psf/requests": 8,
+              "mwaskom/seaborn": 2, "pallets/flask": 1}
+    rows = []
+    idx = 0
+    for repo in sorted(totals):  # a deterministic dataset order
+        for _ in range(totals[repo]):
+            rows.append({"row_idx": idx,
+                        "row": {"repo": repo,
+                               "instance_id": f"{repo}-{idx}"}})
+            idx += 1
+    assert len(rows) == 500
+    selected, per_repo = mod.stratify(rows)
+    assert len(selected) == 25
+    assert per_repo == totals
+    # stratify returns the row OBJECTS (the wrapper dicts carry
+    # the row_idx) — map back for the order checks
+    sel_count = {}
+    for r in selected:
+        sel_count[r["repo"]] = sel_count.get(r["repo"], 0) + 1
+    # the documented distribution (the committed pin's
+    # per_repo_selected): 1 per repo + the 13 seats dealt
+    # round-robin in descending size (flask — its single split
+    # row — is exhausted by its first seat and takes no extra)
+    assert sel_count == {
+        "django/django": 3, "sympy/sympy": 3,
+        "astropy/astropy": 2, "matplotlib/matplotlib": 2,
+        "mwaskom/seaborn": 2, "psf/requests": 2,
+        "pydata/xarray": 2, "pylint-dev/pylint": 2,
+        "pytest-dev/pytest": 2, "scikit-learn/scikit-learn": 2,
+        "sphinx-doc/sphinx": 2, "pallets/flask": 1}, sel_count
+    assert len(sel_count) == 12  # all 12 repos covered
+    # the flask cap: 1 seat — its single split row
+    assert sel_count["pallets/flask"] == 1
+    # within a repo: the FIRST N rows in dataset (row_idx) order
+    for repo, n in sel_count.items():
+        picked = sorted(r["row_idx"] for r in rows
+                       if r["row"] in selected
+                       and r["row"]["repo"] == repo)
+        all_in_repo = sorted(r["row_idx"] for r in rows
+                            if r["row"]["repo"] == repo)
+        assert picked == all_in_repo[:n], repo
+    # fail-loud: an 11-repo split is a SystemExit (not a silent
+    # 11-repo pin)
+    rows11 = [r for r in rows
+             if r["row"]["repo"] != "pallets/flask"]
+    try:
+        mod.stratify(rows11)
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("an 11-repo split was accepted")
