@@ -512,13 +512,29 @@ def _validate_imported_line(rec: dict, iid: str,
             f"before any session; a seeded non-terminal status "
             f"would wedge every later load_checkpoint in "
             f"RunnerProtocolError)")
+    if "ts" not in rec:
+        # the round-22 Minor fix (issue #22, 4450983658): an
+        # ABSENT ts is rejected too (the first draft only
+        # checked a present ts — an absent one skipped the
+        # check and the seeding stamped it with time.time():
+        # silently re-stamped into this run's window — and
+        # the WP5 date range — instead of preserving the
+        # source ts the import contract promises). The source
+        # line's ts is its timestamp; a line without one is
+        # corrupt for the import (fail-closed; the WP3 runner
+        # always writes a ts, so a missing one is an
+        # anomalous / hand-crafted line)
+        raise PilotConfigError(
+            f"{origin} for {iid!r} carries no ts — the import "
+            f"preserves the source timestamp (a seed without "
+            f"one would be re-stamped into this run's window "
+            f"— and the WP5 date range — instead); fail-closed")
     ts = rec.get("ts")
-    if "ts" in rec:
-        if (ts is None
-                or isinstance(ts, bool)
-                or not isinstance(ts, (int, float))
-                or not math.isfinite(ts) or ts <= 0):
-            raise PilotConfigError(
+    if (ts is None
+            or isinstance(ts, bool)
+            or not isinstance(ts, (int, float))
+            or not math.isfinite(ts) or ts <= 0):
+        raise PilotConfigError(
                 f"{origin} for {iid!r} carries a ts the WP5 "
                 f"_parse_ts contract rejects ({ts!r}) — fail-closed "
                 f"(a seeded non-finite / non-positive / bool / null "
@@ -3597,7 +3613,23 @@ def run_pilot(config: PilotConfig,
     # (the full set) take precedence on that resume — the missing
     # lines re-seed (the idempotent seeding skips the present
     # ones), and item 16's comparison set is the true source set
-    if imported and config.import_run:
+    # the round-22 Medium fix (issue #22, 4450983654): the
+    # early import record is written for EVERY --import-run
+    # invocation — not only when ``imported`` is non-empty. An
+    # all-retry-class import (no never-rerun shared ids) seeds
+    # nothing and previously persisted no bookkeeping before the
+    # sessions: a crash — or a graceful pre-flight / model-gate
+    # early exit (which also writes no state) — then left the
+    # documented bare --resume failing the pilot-B import
+    # requirement (exit 2) with neither state nor seeded
+    # imported_from lines to re-derive from. Persisting the
+    # bookkeeping (an empty imported set + the retry class +
+    # the absolute workdir) on every --import-run makes the
+    # resume re-derive from the state (the requirements check
+    # accepts state bookkeeping; the retry-class ids stay in
+    # the queue — they were never seeded and run in this run,
+    # the pass@1 contract)
+    if config.import_run:
         state["imported"] = sorted(imported)
         state["import_source"] = imported
         state["imported_run"] = config.import_run

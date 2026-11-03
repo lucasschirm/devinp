@@ -289,9 +289,17 @@ interrupt after 8 completions (mid-batch); the windowed resumes.
    contract — a killed session never had a verdict line), the state
    file records `run_failed`.
 4. **Pilot A's `run-pilotA.jsonl` is gone by the live run** → the
-   import is optional: without it the 3 shared instances simply run
-   fresh (3 extra sessions — recorded as a deviation in
-   `notes/wp6b-pilot-b.md`; item 16 renders `n/a`).
+   import is **mandatory** (the round-22 Medium fix, issue #22:
+   `_check_pilot_b_requirements` makes any no-import `--pilot b`
+   a config error — exit 2 — because a no-import pilot-B run
+   would GO with item 16 `n/a` and zero AC2 evidence). The
+   documented fallback "the 3 shared instances simply run fresh"
+   can never execute: if the source checkpoint is missing, the
+   operator must restore it (the Pilot-A workdir's
+   `run-pilotA.jsonl` — or a byte-identical copy) before the
+   pilot-B import window; pilot B cannot run without its AC2
+   evidence (the deviation is recorded in
+   `notes/wp6b-pilot-b.md`).
 5. **The HF rows API drift** (the pinning script's shape) → the
    committed `pilot_b_instances.json` is the source of truth (the
    script is the provenance, re-runnable while the API holds).

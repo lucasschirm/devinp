@@ -4972,3 +4972,77 @@ def test_wp6b_round21_rederivation_corrupt_meta_status(
                   "--import-run", "srcbad",
                   "--import-workdir", str(src2)])
     assert rc == lp.EXIT_CONFIG, rc
+
+
+def test_wp6b_round22_all_retry_class_import_persists_bookkeeping(
+        tmp_path, live):
+    """The round-22 Medium fix (issue #22, 4450983654): the early
+    import record was only written when ``imported`` was
+    non-empty — an all-retry-class --import-run (no never-rerun
+    shared ids) seeded nothing and persisted no bookkeeping
+    before the sessions: a crash — or a graceful pre-flight /
+    model-gate early exit (no state write) — left the documented
+    bare --resume failing the pilot-B import requirement (exit 2)
+    with neither state nor seeded imported_from lines to
+    re-derive from. The early record now writes on EVERY
+    --import-run (empty imported set + the retry class + the
+    absolute workdir), so the resume re-derives from the state
+    and the pilot-B requirement holds."""
+    repos, inst = _two_pilot_b_repos(tmp_path)
+    i0, i1, i2 = [e["instance_id"] for e in repos]
+    wd = tmp_path / "wd"
+    wd.mkdir()
+    src = tmp_path / "src"
+    src.mkdir()
+    # an ALL-RETRY-CLASS source: nothing to import, 2 re-runs
+    (src / "run-src.jsonl").write_text(
+        json.dumps({"instance_id": i0, "status": "eval_error",
+                    "ts": 1.0}) + "\n"
+        + json.dumps({"instance_id": i1,
+                     "status": "quota_limited", "ts": 2.0}) + "\n")
+    # the import window: all-retry-class — no seeding
+    cfg2 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
+               resume=True, host_check=False, pilot="b",
+               import_run="src", import_workdir=str(src))
+    assert _run(cfg2, _mock_make_session(
+        {r["instance_id"]: "ok" for r in repos})) == lp.EXIT_OK
+    st = json.loads((wd / "pilot-pilotB.state.json").read_text())
+    # the bookkeeping persisted despite the empty imported set
+    assert st.get("imported_run") == "src"
+    assert st.get("imported") == []
+    assert st.get("import_retry_class")
+    assert st.get("import_workdir")
+    # the bare --resume: the pilot-B import requirement holds via
+    # the state bookkeeping (exit 0 — not the round-22 exit-2
+    # wedge); the checkpoint has no imported_from lines (nothing
+    # was seeded) — the state branch re-derives
+    cfg3 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
+               resume=True, host_check=False, pilot="b")
+    assert _run(cfg3, _mock_make_session(
+        {r["instance_id"]: "ok" for r in repos})) == lp.EXIT_OK
+
+
+def test_wp6b_round22_absent_ts_rejected(
+        tmp_path, live):
+    """The round-22 Minor fix (issue #22, 4450983658): a source
+    line with no ts key skipped the ts check (only a PRESENT ts
+    was checked) and was seeded with time.time() — silently
+    re-stamped into this run's window (and the WP5 date range)
+    instead of preserving the source ts the import contract
+    promises. An absent ts is now a fail-closed config error
+    (the source line's ts is its timestamp; a line without one
+    is corrupt for the import)."""
+    repos, inst = _two_pilot_b_repos(tmp_path)
+    i0 = repos[0]["instance_id"]
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "run-src.jsonl").write_text(
+        json.dumps({"instance_id": i0, "status": "no_patch"}) + "\n")
+    rc = lp.main(["--dry-run", "--pilot", "b", "--resume",
+                  "--devin-bin", MOCK_PATH,
+                  "--instances", inst,
+                  "--workdir", str(tmp_path / "wd"),
+                  "--run-id", "pilotB",
+                  "--import-run", "src",
+                  "--import-workdir", str(src)])
+    assert rc == lp.EXIT_CONFIG, rc
