@@ -5169,3 +5169,80 @@ def test_wp6b_round24_checkpoint_provenance_not_laundered(
           if l.startswith("| 16 |")][0]
     assert "faithfulness n/a (self-derived" in i16, i16
     assert "FAIL" not in i16, i16
+
+
+def test_wp6b_round25_out_of_range_ts_rejected(
+        tmp_path, live):
+    """The round-25 Minor fix (issue #22, 4451208198): the ts
+    guard enforced math.isfinite (the _parse_ts contract) but
+    the WP5 date_range consumer calls datetime.fromtimestamp,
+    which raises OSError / ValueError on finite-but-out-of-
+    range values (e.g. ts: 1e18) — such a source line would
+    seed durably and crash rep.generate with an error outside
+    the ReportError handler on every later --resume (the
+    permanent-wedge class the guard exists to close). The
+    guard now range-checks with the consumer's own function
+    (whatever fromtimestamp accepts is the contract)."""
+    repos, inst = _two_pilot_b_repos(tmp_path)
+    i0 = repos[0]["instance_id"]
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "run-src.jsonl").write_text(
+        json.dumps({"instance_id": i0, "status": "no_patch",
+                    "ts": 1e18}) + "\n")
+    rc = lp.main(["--dry-run", "--pilot", "b", "--resume",
+                  "--devin-bin", MOCK_PATH,
+                  "--instances", inst,
+                  "--workdir", str(tmp_path / "wd"),
+                  "--run-id", "pilotB",
+                  "--import-run", "src",
+                  "--import-workdir", str(src)])
+    assert rc == lp.EXIT_CONFIG, rc
+
+
+def test_wp6b_round25_mid_file_corruption_surfaces(
+        tmp_path, live):
+    """The round-25 Minor fix (issue #22, 4451208201): the
+    checkpoint-fallback comment mischaracterized the contract —
+    load_checkpoint SILENTLY DROPS a torn tail (it never raises
+    for one); only a MID-FILE corruption raises
+    RunnerProtocolError. The old code swallowed the raise to an
+    empty derivation, so a corrupt checkpoint with no state
+    bookkeeping surfaced the misleading '--pilot b requires
+    --import-run' config error instead of the corruption. The
+    fallback now fails closed with the corruption itself
+    (exit 2, before any session)."""
+    repos, inst = _two_pilot_b_repos(tmp_path)
+    i0, i1, i2 = [e["instance_id"] for e in repos]
+    wd = tmp_path / "wd"
+    wd.mkdir()
+    src = tmp_path / "src"
+    src.mkdir()
+    modes = {i0: "no_patch", i1: "no_patch", i2: "ok"}
+    cfg1 = _cfg(tmp_path, inst, run_id="src", workdir=str(src),
+               host_check=False)
+    assert _run(cfg1, _mock_make_session(modes)) == lp.EXIT_OK
+    cfg2 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
+               resume=True, host_check=False, pilot="b",
+               import_run="src", import_workdir=str(src))
+    assert _run(cfg2, _mock_make_session(modes)) == lp.EXIT_OK
+    # remove the state (no bookkeeping) + corrupt the
+    # checkpoint MID-FILE (a non-JSON line — the second of
+    # three, so the torn-tail drop cannot apply)
+    (wd / "pilot-pilotB.state.json").unlink()
+    p = wd / "run-pilotB.jsonl"
+    lines = p.read_text().splitlines()
+    assert len(lines) >= 3
+    lines[1] = "not json at all"
+    p.write_text("\n".join(lines) + "\n")
+    cfg3 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
+               resume=True, host_check=False, pilot="b")
+    try:
+        _run(cfg3, _mock_make_session(
+            {r["instance_id"]: "ok" for r in repos}))
+    except lp.PilotConfigError as e:
+        assert "corrupt" in str(e), str(e)
+    else:
+        raise AssertionError("a mid-file corrupt checkpoint "
+                           "with no state did not surface the "
+                           "corruption")

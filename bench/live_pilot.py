@@ -93,6 +93,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -535,11 +536,28 @@ def _validate_imported_line(rec: dict, iid: str,
             or not isinstance(ts, (int, float))
             or not math.isfinite(ts) or ts <= 0):
         raise PilotConfigError(
-                f"{origin} for {iid!r} carries a ts the WP5 "
-                f"_parse_ts contract rejects ({ts!r}) — fail-closed "
-                f"(a seeded non-finite / non-positive / bool / null "
-                f"ts would wedge every later --resume in "
-                f"report_failed)")
+            f"{origin} for {iid!r} carries a ts the WP5 "
+            f"_parse_ts contract rejects ({ts!r}) — fail-closed "
+            f"(a seeded non-finite / non-positive / bool / null "
+            f"ts would wedge every later --resume in "
+            f"report_failed)")
+    # the round-25 Minor fix (issue #22, 4451208198): a FINITE
+    # but out-of-range ts (e.g. 1e18) passes the _parse_ts
+    # contract but crashes the WP5 date_range consumer's
+    # datetime.fromtimestamp (OSError / ValueError) — such a
+    # line would seed durably and crash rep.generate with an
+    # error outside the ReportError handler on every later
+    # --resume (the permanent-wedge class this guard exists to
+    # close). Range-check with the consumer's own function:
+    # whatever fromtimestamp accepts is the contract
+    try:
+        datetime.fromtimestamp(ts)
+    except (OSError, ValueError, OverflowError):
+        raise PilotConfigError(
+            f"{origin} for {iid!r} carries a ts outside the "
+            f"datetime.fromtimestamp range ({ts!r}) — fail-closed "
+            f"(a seeded out-of-range ts would crash the WP5 "
+            f"date_range on every later --resume)")
     for k in ("artifacts_dir", "patch_diff", "trajectory",
               "eval_log"):
         v = meta.get(k)
@@ -3522,13 +3540,32 @@ def _rederive_import(state: dict, workdir: str, run_id: str,
                     f"{state.get('imported_run') or '?'})")
     elif os.path.isfile(
             os.path.join(workdir, f"run-{run_id}.jsonl")):
+        # the round-25 Minor fix (issue #22, 4451208201): the
+        # old comment mischaracterized the contract —
+        # load_checkpoint SILENTLY DROPS a torn tail (it never
+        # raises for one — the torn-tail drop is the issue #15
+        # AC1 contract); only a MID-FILE corruption (a
+        # non-record / non-JSON / non-UTF-8 line anywhere but
+        # the last) raises RunnerProtocolError. So a raised
+        # RunnerProtocolError here is NEVER a recoverable torn
+        # tail — it is a mid-file corruption, and silently
+        # treating it as an empty derivation (the old
+        # pre_recs = []) let a corrupt checkpoint with no state
+        # bookkeeping surface the misleading "--pilot b
+        # requires --import-run" config error instead of the
+        # corruption. Fail closed with the corruption itself:
         try:
             pre_recs, _ = rr.load_checkpoint(
                 os.path.join(workdir, f"run-{run_id}.jsonl"))
-        except rr.RunnerProtocolError:
-            pre_recs = []  # a torn tail (the host-crash class)
-            # makes the read fail — the state source is the only
-            # re-derivation available on that path
+        except rr.RunnerProtocolError as exc:
+            raise PilotConfigError(
+                f"this run's checkpoint is corrupt (a "
+                f"mid-file line — not a kill artifact: a torn "
+                f"tail would have been dropped silently, not "
+                f"raised): {exc} — repair or restore the "
+                f"checkpoint (a --resume on a corrupt "
+                f"checkpoint is a config error, exit 2, before "
+                f"any session)") from exc
         for r in pre_recs:
             m = _meta_of(r)
             if m.get("imported_from"):
