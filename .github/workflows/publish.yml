@@ -5,6 +5,18 @@ name: publish
 # Requires the trusted publisher to be configured on npmjs.com:
 #   package Settings → Publishing access → GitHub Actions
 #   repository: lucasschirm/devinp · workflow: publish.yml
+#
+# Nothing is committed to main. The "Main" ruleset requires every change to
+# arrive through a pull request, so the release commit used to be refused
+# (GH013) and `npm publish` — which ran after it — never happened:
+#
+#   * [new tag]         v0.1.12 -> v0.1.12
+#   ! [remote rejected] main -> main (push declined due to repository rule violations)
+#
+# The released version therefore lives in the npm registry and in the git tag
+# (`git ls-remote --tags`), not in main's package.json. Tags are not affected
+# by that rule, and the next version is picked as the first patch that exists
+# in neither place.
 
 on:
   push:
@@ -15,7 +27,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write # push the version-bump commit + tag
+  contents: write # push the release tag (nothing is pushed to main)
   id-token: write # OIDC token for npm trusted publishing
 
 concurrency:
@@ -25,10 +37,6 @@ concurrency:
 jobs:
   release:
     runs-on: ubuntu-latest
-    # Skip when the pushed commit is the version bump this workflow created.
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      !startsWith(github.event.head_commit.message, 'chore(release)')
     steps:
       - uses: actions/checkout@v4
 
@@ -45,12 +53,25 @@ jobs:
       - run: npm test
       - run: npm run build # bundle src → bin/ (also runs via prepack)
 
-      - name: Bump patch version
+      - name: Publish next patch
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          npm version patch -m "chore(release): %s"
+          pkg=$(node -p "require('./package.json').name")
+          v=$(node -p "require('./package.json').version")
+          # Walk past anything already on npm or already tagged (v0.1.12 is a
+          # tag left behind by the run that could not push its commit).
+          while npm view "$pkg@$v" --json >/dev/null 2>&1 ||
+                git ls-remote --exit-code --tags origin "refs/tags/v$v" >/dev/null 2>&1; do
+            v=$(node -e "const [a,b,c] = process.argv[1].split('.').map(Number); console.log(a + '.' + b + '.' + (c + 1))" "$v")
+          done
+          echo "Publishing $pkg@$v"
+          npm version "$v" --no-git-tag-version --allow-same-version
+          npm publish --provenance --access public
+          git tag "v$v"
+          git push origin "v$v"
+          echo "Published $pkg@$v (tag v$v; main's package.json keeps the previous version)" | tee -a "$GITHUB_STEP_SUMMARY"
 
-      - run: git push --follow-tags
-
-      - run: npm publish --provenance --access public
+      # Nothing is pushed to main on purpose: see the note at the top of this
+      # file. If the ruleset ever allows the Actions app to push, an
+      # `npm version patch -m "chore(release): %s"` + `git push --follow-tags`
+      # pair can go back — but publish first, so a refused push can never
+      # strand a release again.
