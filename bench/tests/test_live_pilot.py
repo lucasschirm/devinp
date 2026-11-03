@@ -4893,3 +4893,82 @@ def test_wp6b_round20_pin_fetch_error_body(tmp_path):
     else:
         raise AssertionError("a 200 error-shaped body was "
                            "accepted")
+
+
+def test_wp6b_round21_rederivation_corrupt_meta_status(
+        tmp_path, live):
+    """The round-21 Medium fix (issue #22, 4450889550): the
+    shared _validate_imported_line did not reproduce the full
+    load_imported contract — a non-dict meta was normalized
+    (accepted) rather than rejected as corrupt, and status was
+    never checked. A corrupt state["import_source"] / checkpoint
+    line with a non-dict meta would crash the seeding (uncaught,
+    exit 4 — not the fail-closed exit 2); a non-terminal status
+    would seed verbatim and poison the checkpoint (every later
+    load_checkpoint raises RunnerProtocolError — a permanent
+    resume wedge). The helper now rejects both (exit 2, before
+    any session, on both import paths)."""
+    repos, inst = _two_pilot_b_repos(tmp_path)
+    i0, i1, i2 = [e["instance_id"] for e in repos]
+    wd = tmp_path / "wd"
+    wd.mkdir()
+    src = tmp_path / "src"
+    src.mkdir()
+    cfg1 = _cfg(tmp_path, inst, run_id="src", workdir=str(src),
+               host_check=False)
+    modes = {i0: "no_patch", i1: "no_patch", i2: "ok"}
+    assert _run(cfg1, _mock_make_session(modes)) == lp.EXIT_OK
+    cfg2 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
+               resume=True, host_check=False, pilot="b",
+               import_run="src", import_workdir=str(src))
+    assert _run(cfg2, _mock_make_session(modes)) == lp.EXIT_OK
+    st = json.loads((wd / "pilot-pilotB.state.json").read_text())
+    # (a) a non-dict meta in the state's import_source line
+    st["import_source"][i0]["meta"] = "corrupt"
+    (wd / "pilot-pilotB.state.json").write_text(json.dumps(st))
+    cfg3 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
+               resume=True, host_check=False, pilot="b")
+    try:
+        _run(cfg3, _mock_make_session({r["instance_id"]: "ok"
+                                      for r in repos}))
+    except lp.PilotConfigError:
+        pass
+    else:
+        raise AssertionError("a non-dict meta in the "
+                           "re-derivation was accepted")
+    # (b) a non-terminal status in the state's import_source
+    # line (the state branch feeds the shared validation
+    # directly — without it, the seeding would write the
+    # non-terminal status verbatim, and the next load_checkpoint
+    # would fail-loud on the durable line: a permanent resume
+    # wedge)
+    st = json.loads((wd / "pilot-pilotB.state.json").read_text())
+    st["import_source"][i0]["meta"] = {}  # reset (a)
+    st["import_source"][i0]["status"] = "running"  # non-terminal
+    (wd / "pilot-pilotB.state.json").write_text(json.dumps(st))
+    cfg4 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
+               resume=True, host_check=False, pilot="b")
+    try:
+        _run(cfg4, _mock_make_session({r["instance_id"]: "ok"
+                                      for r in repos}))
+    except lp.PilotConfigError:
+        pass
+    else:
+        raise AssertionError("a non-terminal status in the "
+                           "re-derivation was accepted")
+    # (c) the --import-run path still rejects a non-dict meta
+    # (the round-7 behavior — the shared helper did not
+    # regress it)
+    src2 = tmp_path / "srcbad"
+    src2.mkdir()
+    (src2 / "run-srcbad.jsonl").write_text(
+        json.dumps({"instance_id": i0, "status": "no_patch",
+                    "meta": "corrupt", "ts": 1.0}) + "\n")
+    rc = lp.main(["--dry-run", "--pilot", "b", "--resume",
+                  "--devin-bin", MOCK_PATH,
+                  "--instances", inst,
+                  "--workdir", str(tmp_path / "wdbad"),
+                  "--run-id", "pilotB",
+                  "--import-run", "srcbad",
+                  "--import-workdir", str(src2)])
+    assert rc == lp.EXIT_CONFIG, rc

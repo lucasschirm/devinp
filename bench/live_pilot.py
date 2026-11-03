@@ -482,9 +482,36 @@ def _validate_imported_line(rec: dict, iid: str,
     line is written back by the seeding; a non-conforming ts
     would wedge every later ``--resume`` in ``report_failed``).
     ``origin`` is the error-message label (the source-line vs.
-    re-derivation phrasing).
+    the re-derivation phrasing).
     """
-    meta = _meta_of(rec)
+    # the round-21 Medium fix (issue #22, 4450889550): the
+    # helper must reproduce the FULL load_imported contract it
+    # mirrors — a non-dict ``meta`` is REJECTED as a corrupt
+    # line (the round-7 contract on the --import-run path; the
+    # _meta_of normalization the first draft used would have
+    # silently accepted it), and a non-terminal ``status`` is
+    # rejected too (load_imported fail-closes on an unknown
+    # status; a seeded non-terminal status would poison the
+    # checkpoint — every later load_checkpoint raises
+    # RunnerProtocolError, a permanent resume wedge)
+    meta = rec.get("meta")
+    if meta is not None and not isinstance(meta, dict):
+        raise PilotConfigError(
+            f"{origin} for {iid!r} carries a non-dict meta "
+            f"({type(meta).__name__}) — a corrupt line "
+            f"(fail-closed before any session; the seeding "
+            f"would crash or seed a meta the WP5 report "
+            f"rejects)")
+    if meta is None:
+        meta = {}
+    status = rec.get("status")
+    if status not in rr.TERMINAL_STATUSES:
+        raise PilotConfigError(
+            f"{origin} for {iid!r} carries a non-terminal "
+            f"status ({status!r}) — a corrupt line (fail-closed "
+            f"before any session; a seeded non-terminal status "
+            f"would wedge every later load_checkpoint in "
+            f"RunnerProtocolError)")
     ts = rec.get("ts")
     if "ts" in rec:
         if (ts is None
@@ -2997,7 +3024,6 @@ def render_checklist_md(items: list, config: PilotConfig,
              f"- budget: max_sessions_per_day="
              f"{config.max_sessions_per_day} · max_wall_per_session="
              f"{config.max_wall_s:.0f}s", ""]
-    ac_label = "issue #22" if config.pilot == "b" else "issue #21"
     # the Calibration and Checklist sections are the INHERITED
     # WP6a sections — #21's AC2 / AC4 (the round-19 Minor fix,
     # issue #22): pilot-B's AC numbers (PLAN-WP6B) map AC2 to the
