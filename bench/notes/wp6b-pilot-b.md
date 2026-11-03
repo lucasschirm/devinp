@@ -31,7 +31,9 @@ codes are 0/2/3/4/42.
 ## Calibrated budget (the WP6a calibration — the 3-window plan)
 
 - Pilot A measured 3 instances in 1 window (3/10 sessions, 4324 s of
-  27000 s wall, ~15 s session wall each).
+  27000 s wall — the per-session walls were 411 / 251 / 105 s
+  (the WP6a record; the ~15 s figure was a stale draft number —
+  the round-27 Minor fix, issue #22)).
 - 23 fresh instances (25 − 2 imported) ÷ 10 sessions/window =
   **3 windows** (10 + 10 + 3). The `max_sessions_per_day` budget is
   the operator's 10-session/day quota (PLAN §2.6, `--max-sessions` is

@@ -2369,10 +2369,12 @@ def test_import_run_source_missing_is_config_error(tmp_path, live):
         _run(cfg, _mock_make_session("ok"))
 
 
-def _two_pilot_b_repos(tmp_path) -> "tuple[list, str]":
-    """3 fixture repos with a distinct ``repo`` per instance + a
-    ``stratified_repos`` meta (the 12-repo shape, scaled to 3 for
-    the fixture)."""
+def _pilot_b_repos(tmp_path) -> "tuple[list, str]":
+    """The 3-fixture-repo pilot-B helper (the round-27 Minor fix,
+    issue #22 — the old _two_pilot_b_repos name was stale: it
+    builds THREE repos). A distinct ``repo`` per instance + a
+    ``stratified_repos`` meta (the 12-repo shape, scaled to 3
+    for the fixture)."""
     repos = []
     for i in range(3):
         r = tmp_path / f"srcrepo{i}"
@@ -2397,7 +2399,7 @@ def test_import_run_reuses_never_rerun_and_reruns_retry(
     status is NOT imported — the instance runs (the pass@1 retry
     class). The source file is untouched; the repeat --resume is
     idempotent (no duplicate import lines)."""
-    repos, inst = _two_pilot_b_repos(tmp_path)
+    repos, inst = _pilot_b_repos(tmp_path)
     ids = [e["instance_id"] for e in repos]
     i0, i1, i2 = ids
     wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
@@ -2480,7 +2482,7 @@ def test_pilot_b_full_mock_run_verdict(tmp_path, live):
     (the pair was not the intentional interrupt — the live run's
     ``--interrupt-after`` is the AC4 leg; the mock pair asserts the
     items 15/16/17 + the arithmetic + the state)."""
-    repos, inst = _two_pilot_b_repos(tmp_path)
+    repos, inst = _pilot_b_repos(tmp_path)
     i0, i1, i2 = [e["instance_id"] for e in repos]
     wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
     modes = {i0: "no_patch", i1: "no_patch", i2: "ok"}
@@ -2696,7 +2698,7 @@ def test_import_run_corrupt_source_report_protocol(tmp_path, live):
                                      "test__repo1-1": "ok",
                                      "test__repo2-1": "ok"}))
     # and the CLI path: exit 2
-    repos_b, inst_b = _two_pilot_b_repos(tmp_path)
+    repos_b, inst_b = _pilot_b_repos(tmp_path)
     assert lp.main(["--dry-run", "--pilot", "b",
                     "--instances", inst_b,
                     "--import-run", "bad",
@@ -2751,7 +2753,7 @@ def test_same_workdir_import_no_same_file_error(tmp_path, live):
     """--import-workdir defaults to this run's workdir: src == dst
     for every referenced artifact — the copy must be skipped (the
     shutil.copyfile SameFileError class), the seeding completes."""
-    repos, inst = _two_pilot_b_repos(tmp_path)
+    repos, inst = _pilot_b_repos(tmp_path)
     i0, i1, i2 = [e["instance_id"] for e in repos]
     wd = tmp_path / "wd"
     # the source run lives in the SAME workdir (run-src.jsonl)
@@ -2779,7 +2781,7 @@ def test_multi_window_item16_via_state_rederivation(tmp_path, live):
     drops --import-run — the source lines re-derive from the state
     file, so item 16 still evaluates (and gates) on the completing
     (verdict-producing) record."""
-    repos, inst = _two_pilot_b_repos(tmp_path)
+    repos, inst = _pilot_b_repos(tmp_path)
     i0, i1, i2 = [e["instance_id"] for e in repos]
     wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
     modes = {i0: "no_patch", i1: "no_patch", i2: "ok"}
@@ -2850,7 +2852,7 @@ def test_wp6b_round2_import_rederives_from_checkpoint_after_graceful_exit(
     is absent (a pre-seed process death), from the checkpoint's own
     seeded lines (they carry ``meta.imported_from`` + the original
     ``ts``) — item 16 still gates on the completing record."""
-    repos, inst = _two_pilot_b_repos(tmp_path)
+    repos, inst = _pilot_b_repos(tmp_path)
     ids = [e["instance_id"] for e in repos]
     i0, i1, i2 = ids
     wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
@@ -2926,7 +2928,7 @@ def test_wp6b_round2_no_import_record_consistent(tmp_path, live):
     error (item 16 must not be the path to a GO with zero AC2
     evidence); the checklist's no-import rendering (the plain n/a,
     non-gating) is preserved for a direct build."""
-    repos, inst = _two_pilot_b_repos(tmp_path)
+    repos, inst = _pilot_b_repos(tmp_path)
     ids = [e["instance_id"] for e in repos]
     i0, i1, i2 = ids
     wd = tmp_path / "wd"
@@ -2983,7 +2985,7 @@ def test_wp6b_round3_early_import_record_persists_before_seeding(
     made to die (a simulated power loss) and the _write_state
     calls are recorded: the FIRST state write (the early import
     record) must carry the full import set + the source run id."""
-    repos, inst = _two_pilot_b_repos(tmp_path)
+    repos, inst = _pilot_b_repos(tmp_path)
     ids = [e["instance_id"] for e in repos]
     i0, i1, i2 = ids
     wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
@@ -3034,7 +3036,7 @@ def test_wp6b_round3_mid_seed_crash_resume_reseeds_full_set(
     silent AC2 violation, and item 16's comparison set is the true
     source set."""
     import json as _json
-    repos, inst = _two_pilot_b_repos(tmp_path)
+    repos, inst = _pilot_b_repos(tmp_path)
     ids = [e["instance_id"] for e in repos]
     i0, i1, i2 = ids
     wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
@@ -3099,7 +3101,7 @@ def test_wp6b_round3_artifact_copy_self_heals(tmp_path, live,
     invocation, not just the newly seeded ones) self-heals that on
     the next invocation instead of leaving the cross-check to
     fail report_failed with no automated recovery."""
-    repos, inst = _two_pilot_b_repos(tmp_path)
+    repos, inst = _pilot_b_repos(tmp_path)
     ids = [e["instance_id"] for e in repos]
     i0, i1, i2 = ids
     wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
@@ -3161,7 +3163,7 @@ def test_wp6b_round3_state_preserves_import_bookkeeping(
     end-of-run write on a continuation window (the flag is dropped
     there) preserves the previous invocation's import bookkeeping —
     imported_run / import_workdir stay the source's, not None."""
-    repos, inst = _two_pilot_b_repos(tmp_path)
+    repos, inst = _pilot_b_repos(tmp_path)
     ids = [e["instance_id"] for e in repos]
     i0, i1, i2 = ids
     wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
@@ -3215,7 +3217,7 @@ def test_wp6b_round3_calibrate_excludes_imported(tmp_path, live):
     run's sessions (their source-run wall/usage) are not this
     run's attempts; folding them in would misstate the run the
     calibration measures."""
-    repos, inst = _two_pilot_b_repos(tmp_path)
+    repos, inst = _pilot_b_repos(tmp_path)
     ids = [e["instance_id"] for e in repos]
     i0, i1, i2 = ids
     wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
@@ -3262,7 +3264,7 @@ def test_wp6b_round4_report_failed_state_preserves_import(
     source workdir from them; without the fallback a missing
     referenced artifact could never be self-healed and every
     subsequent resume stayed wedged in report_failed)."""
-    repos, inst = _two_pilot_b_repos(tmp_path)
+    repos, inst = _pilot_b_repos(tmp_path)
     ids = [e["instance_id"] for e in repos]
     i0, i1, i2 = ids
     wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
@@ -3329,7 +3331,7 @@ def test_wp6b_round4_first_import_window_requires_resume(tmp_path,
     creates the very file the guard trips on. The seeded lines
     survive (the operator's --resume re-invocation is the
     documented window-1 continuation)."""
-    repos, inst = _two_pilot_b_repos(tmp_path)
+    repos, inst = _pilot_b_repos(tmp_path)
     ids = [e["instance_id"] for e in repos]
     i0, i1, i2 = ids
     wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
@@ -3392,7 +3394,7 @@ def test_wp6b_round5_self_import_rejected(tmp_path, live):
     ``state.import_source`` / ``imported_run``, and item 16 would
     pass on a self-comparison (the real 2-run overlap evidence
     clobbered). Fail-closed: a config error before the pre-flight."""
-    repos, inst = _two_pilot_b_repos(tmp_path)
+    repos, inst = _pilot_b_repos(tmp_path)
     wd = tmp_path / "wd"
     # the self-import: import_run == run_id, the default workdir
     cfg = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
@@ -3666,7 +3668,7 @@ def test_wp6b_round7_corrupt_source_line_meta(tmp_path, live):
     error (exit 2, before any session) — and the persisted early
     import record made every later --resume hit the same crash.
     load_imported now validates both, before any session."""
-    repos, inst = _two_pilot_b_repos(tmp_path)
+    repos, inst = _pilot_b_repos(tmp_path)
     ids = [e["instance_id"] for e in repos]
     wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
     # a corrupt source: a line whose meta is a STRING (plus a
@@ -3795,7 +3797,7 @@ def test_wp6b_round8_ts_wp5_contract(tmp_path, live):
     ...)`` writes the literal value when the key is present) then
     fails ``rep.generate`` as ``report_failed`` and wedges every
     later --resume on the same durable line. Fail-closed instead."""
-    repos, inst = _two_pilot_b_repos(tmp_path)
+    repos, inst = _pilot_b_repos(tmp_path)
     ids = [e["instance_id"] for e in repos]
     wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
     wd1.mkdir()
@@ -3997,7 +3999,7 @@ def test_wp6b_round11_source_layout_normalization(tmp_path, live):
     imported line's meta is rewritten to the current layout. A
     normal-layout source is unchanged; a genuinely missing
     reference is left as-is (the WP5 fail-loud semantics)."""
-    repos, inst = _two_pilot_b_repos(tmp_path)
+    repos, inst = _pilot_b_repos(tmp_path)
     ids = [e["instance_id"] for e in repos]
     i0, i1, i2 = ids
     wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
@@ -4077,7 +4079,7 @@ def test_wp6b_round11_ref_path_schema_validation(tmp_path, live):
     ReportProtocolError → report_failed (the same durable-line
     wedge class the meta/ts guards were added to close).
     Fail-closed instead: a config error before any session."""
-    repos, inst = _two_pilot_b_repos(tmp_path)
+    repos, inst = _pilot_b_repos(tmp_path)
     ids = [e["instance_id"] for e in repos]
     wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
     wd1.mkdir()
@@ -4123,7 +4125,7 @@ def test_wp6b_round12_null_meta_normalized(tmp_path, live):
     re-hit the same crash). Now: a missing / null meta is
     schema-conformant (all references absent) — normalized to {}
     and imported without error."""
-    repos, inst = _two_pilot_b_repos(tmp_path)
+    repos, inst = _pilot_b_repos(tmp_path)
     ids = [e["instance_id"] for e in repos]
     wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
     wd1.mkdir()
@@ -4154,7 +4156,7 @@ def test_wp6b_round12_zero_overlap_import_fail_closed(tmp_path, live):
     before any session. A source whose shared ids are all
     retry-class still passes (the import re-runs them — item 16
     renders the explicit vacuous state)."""
-    repos, inst = _two_pilot_b_repos(tmp_path)
+    repos, inst = _pilot_b_repos(tmp_path)
     ids = [e["instance_id"] for e in repos]
     wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
     wd1.mkdir()
@@ -4213,7 +4215,7 @@ def test_wp6b_round12_item12_wp5_sessions_annotation(tmp_path, live):
     them. Item 12's observation now states the difference
     explicitly when imports are present (the same record no
     longer contradicts the WP5 report)."""
-    repos, inst = _two_pilot_b_repos(tmp_path)
+    repos, inst = _pilot_b_repos(tmp_path)
     cfg = _cfg(tmp_path, inst, host_check=False, pilot="b")
     items = lp.build_checklist(
         config=cfg, dry_run=False, gate=None, preflight_ok=None,
@@ -4273,7 +4275,7 @@ def test_wp6b_round13_pilot_b_requires_import(tmp_path, live):
     error before any session. A --resume on a workdir whose
     state carries the import bookkeeping passes (the documented
     continuation window)."""
-    repos, inst = _two_pilot_b_repos(tmp_path)
+    repos, inst = _pilot_b_repos(tmp_path)
     i0, i1, i2 = [e["instance_id"] for e in repos]
     wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
     modes = {i0: "no_patch", i1: "no_patch", i2: "ok"}
@@ -4342,9 +4344,9 @@ def test_wp6b_round14_pilot_b_requires_stratified_meta(tmp_path, live):
     else:
         raise AssertionError("a non-stratified pilot-B run was "
                            "accepted")
-    # and the documented pilot-B file (the _two_pilot_b_repos
+    # and the documented pilot-B file (the _pilot_b_repos
     # helper carries the meta) still passes
-    repos2, inst2 = _two_pilot_b_repos(tmp_path)
+    repos2, inst2 = _pilot_b_repos(tmp_path)
     i0, i1, i2 = [e["instance_id"] for e in repos2]
     wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
     modes2 = {i0: "no_patch", i1: "no_patch", i2: "ok"}
@@ -4438,7 +4440,7 @@ def test_wp6b_round15_import_ref_traversal_rejected(
     makedirs/replace write outside this run's workdir (the
     traversal class the run-id / instance-id charsets exist to
     prevent). Fail-closed: a config error before any session."""
-    repos, inst = _two_pilot_b_repos(tmp_path)
+    repos, inst = _pilot_b_repos(tmp_path)
     ids = [e["instance_id"] for e in repos]
     wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
     wd1.mkdir()
@@ -4483,7 +4485,7 @@ def test_wp6b_round16_section_arithmetic_matches_item16(tmp_path, live):
     for the same run. The section's arithmetic is now on the
     deduped-finals basis (matching item 16); new_sessions stays
     on the raw (attempt) basis (it is a session count)."""
-    repos, inst = _two_pilot_b_repos(tmp_path)
+    repos, inst = _pilot_b_repos(tmp_path)
     i0, i1, i2 = [e["instance_id"] for e in repos]
     # raw lines: an eval_error attempt for i2 superseded by a
     # preflight_failed final
@@ -4542,7 +4544,7 @@ def test_wp6b_round16_dry_run_checkpoint_derivation(tmp_path, live):
     whose state file is absent was rejected while the equivalent
     live --resume proceeded. Now the dry run re-derives the
     import from the checkpoint's seeded lines."""
-    repos, inst = _two_pilot_b_repos(tmp_path)
+    repos, inst = _pilot_b_repos(tmp_path)
     i0, i1, i2 = [e["instance_id"] for e in repos]
     wd = tmp_path / "wd"
     wd.mkdir()
@@ -4573,7 +4575,7 @@ def test_wp6b_round16_self_import_symlink_rejected(tmp_path, live):
     symlinks — an --import-workdir that is a symlinked alias of
     this run's workdir bypassed the rejection. Now
     os.path.realpath (which resolves symlinks) is compared."""
-    repos, inst = _two_pilot_b_repos(tmp_path)
+    repos, inst = _pilot_b_repos(tmp_path)
     wd = tmp_path / "wd"
     wd.mkdir()
     alias = tmp_path / "alias"
@@ -4602,7 +4604,7 @@ def test_wp6b_round17_import_workdir_persisted_absolute(
     wedge every subsequent resume re-hits). Now it is
     persisted ABSOLUTE (resolved at import time; the flag-
     absent default is this run's workdir, absolute)."""
-    repos, inst = _two_pilot_b_repos(tmp_path)
+    repos, inst = _pilot_b_repos(tmp_path)
     i0, i1, i2 = [e["instance_id"] for e in repos]
     src = tmp_path / "src"
     src.mkdir()
@@ -4671,7 +4673,7 @@ def test_wp6b_round18_zero_overlap_rerivation_fail_closed(
     the completing record could GO with no AC2 evidence (the same
     under-evidenced-verdict class the flag-path zero-overlap
     guard made a config error). Fail-closed: a config error."""
-    repos, inst = _two_pilot_b_repos(tmp_path)
+    repos, inst = _pilot_b_repos(tmp_path)
     i0, i1, i2 = [e["instance_id"] for e in repos]
     src, wd2 = tmp_path / "src", tmp_path / "wd2"
     src.mkdir()
@@ -4721,7 +4723,7 @@ def test_wp6b_round18_dry_run_import_requires_resume(
     fails EXIT_CONFIG. The dry run now rejects it up front (the
     contract: a dry run that passes is an invocation that would
     actually work)."""
-    repos, inst = _two_pilot_b_repos(tmp_path)
+    repos, inst = _pilot_b_repos(tmp_path)
     i0, i1, i2 = [e["instance_id"] for e in repos]
     src = tmp_path / "src"
     src.mkdir()
@@ -4762,7 +4764,7 @@ def test_wp6b_round19_dry_run_reflects_live_predicate(
     exactly when the live guard would fire (existing checkpoint,
     or a non-empty import that would create one) — the contract
     holds in both directions."""
-    repos, inst = _two_pilot_b_repos(tmp_path)
+    repos, inst = _pilot_b_repos(tmp_path)
     i0, i1 = [e["instance_id"] for e in repos[:2]]
     src = tmp_path / "src"
     src.mkdir()
@@ -4828,7 +4830,7 @@ def test_wp6b_round20_rederivation_traversal_fail_closed(
     the --import-run path. The re-derivation now applies the
     SHARED validation: such a line is a PilotConfigError (exit 2)
     before any session."""
-    repos, inst = _two_pilot_b_repos(tmp_path)
+    repos, inst = _pilot_b_repos(tmp_path)
     i0, i1, i2 = [e["instance_id"] for e in repos]
     wd = tmp_path / "wd"
     wd.mkdir()
@@ -4913,7 +4915,7 @@ def test_wp6b_round21_rederivation_corrupt_meta_status(
     load_checkpoint raises RunnerProtocolError — a permanent
     resume wedge). The helper now rejects both (exit 2, before
     any session, on both import paths)."""
-    repos, inst = _two_pilot_b_repos(tmp_path)
+    repos, inst = _pilot_b_repos(tmp_path)
     i0, i1, i2 = [e["instance_id"] for e in repos]
     wd = tmp_path / "wd"
     wd.mkdir()
@@ -4993,7 +4995,7 @@ def test_wp6b_round22_all_retry_class_import_persists_bookkeeping(
     --import-run (empty imported set + the retry class + the
     absolute workdir), so the resume re-derives from the state
     and the pilot-B requirement holds."""
-    repos, inst = _two_pilot_b_repos(tmp_path)
+    repos, inst = _pilot_b_repos(tmp_path)
     i0, i1, i2 = [e["instance_id"] for e in repos]
     wd = tmp_path / "wd"
     wd.mkdir()
@@ -5037,7 +5039,7 @@ def test_wp6b_round22_absent_ts_rejected(
     promises. An absent ts is now a fail-closed config error
     (the source line's ts is its timestamp; a line without one
     is corrupt for the import)."""
-    repos, inst = _two_pilot_b_repos(tmp_path)
+    repos, inst = _pilot_b_repos(tmp_path)
     i0 = repos[0]["instance_id"]
     src = tmp_path / "src"
     src.mkdir()
@@ -5067,7 +5069,7 @@ def test_wp6b_round23_dry_run_full_rederivation(tmp_path, live):
     (state branch + checkpoint fallback + validation +
     zero-overlap guard) — the contract: a dry run that passes is
     an invocation that would actually work."""
-    repos, inst = _two_pilot_b_repos(tmp_path)
+    repos, inst = _pilot_b_repos(tmp_path)
     i0, i1, i2 = [e["instance_id"] for e in repos]
     wd = tmp_path / "wd"
     wd.mkdir()
@@ -5131,7 +5133,7 @@ def test_wp6b_round24_checkpoint_provenance_not_laundered(
     stays bookkeeping-less (the later resumes stay on the
     checkpoint fallback — the honest rendering), while a
     state-provenance (or flag) run persists as before."""
-    repos, inst = _two_pilot_b_repos(tmp_path)
+    repos, inst = _pilot_b_repos(tmp_path)
     i0, i1, i2 = [e["instance_id"] for e in repos]
     wd = tmp_path / "wd"
     wd.mkdir()
@@ -5183,7 +5185,7 @@ def test_wp6b_round25_out_of_range_ts_rejected(
     permanent-wedge class the guard exists to close). The
     guard now range-checks with the consumer's own function
     (whatever fromtimestamp accepts is the contract)."""
-    repos, inst = _two_pilot_b_repos(tmp_path)
+    repos, inst = _pilot_b_repos(tmp_path)
     i0 = repos[0]["instance_id"]
     src = tmp_path / "src"
     src.mkdir()
@@ -5212,7 +5214,7 @@ def test_wp6b_round25_mid_file_corruption_surfaces(
     --import-run' config error instead of the corruption. The
     fallback now fails closed with the corruption itself
     (exit 2, before any session)."""
-    repos, inst = _two_pilot_b_repos(tmp_path)
+    repos, inst = _pilot_b_repos(tmp_path)
     i0, i1, i2 = [e["instance_id"] for e in repos]
     wd = tmp_path / "wd"
     wd.mkdir()
@@ -5259,7 +5261,7 @@ def test_wp6b_round26_rederivation_non_dict_source_value(
     PilotConfigError before any session (the checkpoint branch's
     lines are dicts by construction — load_checkpoint validates
     the record shape — so the guard is for the state branch)."""
-    repos, inst = _two_pilot_b_repos(tmp_path)
+    repos, inst = _pilot_b_repos(tmp_path)
     i0, i1, i2 = [e["instance_id"] for e in repos]
     wd = tmp_path / "wd"
     wd.mkdir()
