@@ -866,7 +866,17 @@ def seed_import_lines(jsonl_path: str, imported: dict,
         m = dict(rec.get("meta") or {})
         m["imported_from"] = import_run or "imported"
         line = {"instance_id": iid, "status": rec.get("status"),
-                "meta": m, "ts": rec.get("ts", time.time())}
+                # the round-23 Minor fix (issue #22, 4451051308):
+                # the time.time() default is unreachable — an
+                # absent ts is now a fail-closed PilotConfigError
+                # in _validate_imported_line on both import
+                # paths, so the seeding receives only validated
+                # lines (the import preserves the source
+                # timestamp — the exact anomaly the check
+                # exists to prevent); the bare subscript fails
+                # loud (not a silent re-stamp) if the contract
+                # is ever broken
+                "meta": m, "ts": rec["ts"]}
         with open(jsonl_path, "a", encoding="utf-8", newline="") as f:
             f.write(json.dumps(line) + "\n")
             f.flush()
@@ -3417,6 +3427,100 @@ def _usage_total(usage: object) -> "Optional[int]":
     return None
 
 
+def _rederive_import(state: dict, workdir: str, run_id: str,
+                    insts: list) -> "tuple[dict, str]":
+    """The SHARED import re-derivation (issue #22 AC2; the
+    round-23 Major fix, 4451051304): the state / checkpoint
+    re-derivation + the fail-closed checks (the shared line
+    validation — the round-20 fix — and the zero-overlap guard
+    — the round-18 fix) used by BOTH the live ``--resume`` path
+    and the dry run, so the dry run renders the identical
+    verdict for the identical invocation (the 'a dry run that
+    passes is an invocation that would actually work' contract —
+    the first draft's dry-run block only covered the checkpoint
+    fallback and skipped the state branch entirely, so the
+    zero-overlap guard never fired in a dry run and the
+    state / checkpoint-derived lines bypassed the validation).
+    Returns ``(derived imported set filtered to the current
+    instance file, the print label — empty when nothing was
+    derived)``; raises :class:`PilotConfigError` on a
+    validation / zero-overlap failure. The caller prints the
+    label (the live path prints it; the dry run does not).
+    """
+    known = {i["instance_id"] for i in insts}
+    imported: dict = {}
+    label = ""
+    if (state.get("imported")
+            and isinstance(state.get("import_source"), dict)
+            and state["import_source"]):
+        imported = {iid: line for iid, line in
+                    state["import_source"].items()
+                    if iid in known}
+        if imported:
+            label = ("the state file "
+                    f"({len(imported)} line(s) from "
+                    f"{state.get('imported_run') or '?'})")
+    elif os.path.isfile(
+            os.path.join(workdir, f"run-{run_id}.jsonl")):
+        try:
+            pre_recs, _ = rr.load_checkpoint(
+                os.path.join(workdir, f"run-{run_id}.jsonl"))
+        except rr.RunnerProtocolError:
+            pre_recs = []  # a torn tail (the host-crash class)
+            # makes the read fail — the state source is the only
+            # re-derivation available on that path
+        for r in pre_recs:
+            m = _meta_of(r)
+            if m.get("imported_from"):
+                line = dict(r)
+                line["meta"] = m
+                m.pop("imported_from", None)
+                imported[r.get("instance_id")] = line
+        imported = {iid: line for iid, line in imported.items()
+                   if iid in known}
+        if imported:
+            label = ("the checkpoint's seeded lines "
+                    f"({len(imported)} line(s) from "
+                    f"{state.get('imported_run') or '?'})")
+    # the round-20 Medium fix (issue #22, 4450828209): the
+    # shared fail-closed validation of every re-derived line
+    # (the ts contract + the reference schema + the round-15
+    # ref traversal guard)
+    for _iid, _rec in imported.items():
+        _validate_imported_line(
+            _rec, _iid,
+            "the import re-derivation (state / checkpoint "
+            "line)")
+    # the round-18 Medium fix (issue #22 AC2): the re-derivation
+    # must fail-closed on ZERO overlap with the current
+    # instance file — the state's import bookkeeping is truthy
+    # but the re-derived set (imported + the state's retry
+    # class, filtered to the current file) is empty: a
+    # --resume pointed at a different (still stratified)
+    # --instances file would otherwise proceed with zero
+    # overlap and item 16 renders the vacuous non-gating n/a
+    # (the completing record can GO with no AC2 evidence — the
+    # same under-evidenced-verdict class the flag-path
+    # zero-overlap guard made a config error)
+    state_retry = {k for k in
+                  (state.get("import_retry_class") or {})
+                  if k in known}
+    if (not imported and not state_retry
+            and (state.get("imported_run")
+                 or state.get("import_source"))
+            and (state.get("imported")
+                 or state.get("import_retry_class"))):
+        raise PilotConfigError(
+            f"the --resume import re-derivation "
+            f"({state.get('imported_run')!r}) shares no "
+            "instance ids with this invocation's instance "
+            "file — a source / instance mismatch "
+            "(fail-closed: a zero-overlap re-derivation "
+            "would let the record GO with item 16 n/a and "
+            "zero AC2 evidence)")
+    return imported, label
+
+
 def _check_pilot_b_requirements(config: PilotConfig, state: dict,
                                imported: "Optional[dict]" = None) -> None:
     """The round-13 Medium fix (issue #22 AC2): a pilot-B run
@@ -3497,36 +3601,26 @@ def run_pilot(config: PilotConfig,
         # consistency: a dry run that passes must be an invocation
         # that would actually work (the round-14 AC1 stratification
         # requirement too — the same check). The round-16 Minor
-        # fix (issue #22 AC2): the check applies the checkpoint
-        # re-derivation the live path performs — a --pilot b
-        # --dry-run --resume on a workdir whose checkpoint carries
-        # seeded import lines but whose state file is absent must
-        # be treated like the equivalent live --resume (it used to
-        # be rejected while the live path proceeded)
+        # fix (issue #22 AC2) applied the checkpoint re-derivation;
+        # the round-23 Major fix (issue #22, 4451051304) extends
+        # it to the FULL shared re-derivation (the state branch —
+        # the first draft's truthy state bookkeeping skipped the
+        # derivation entirely, so the zero-overlap guard never
+        # fired in a dry run: a --dry-run --resume pointed at a
+        # different stratified --instances file exited 0 where
+        # the identical live invocation exits 2 — and the
+        # state / checkpoint-derived lines' fail-closed
+        # validation, which the checkpoint-only draft bypassed).
+        # The guard mirrors the live path's exact predicate
+        # (``not imported and config.resume`` — a flag invocation
+        # whose imported set is empty — the all-retry-class or
+        # all-stale case — re-derives live, so the dry run must
+        # too)
         dry_state = _load_state(workdir, run_id)
         dry_imported = None
-        if (config.resume and not config.import_run
-                and not dry_state.get("imported_run")
-                and not dry_state.get("import_source")
-                and os.path.isfile(
-                    os.path.join(workdir,
-                                f"run-{run_id}.jsonl"))):
-            try:
-                pre_recs, _ = rr.load_checkpoint(
-                    os.path.join(workdir, f"run-{run_id}.jsonl"))
-            except rr.RunnerProtocolError:
-                pre_recs = []
-            known = {i["instance_id"] for i in insts}
-            der: dict = {}
-            for r in pre_recs:
-                m = _meta_of(r)
-                if m.get("imported_from"):
-                    line = dict(r)
-                    line["meta"] = m
-                    m.pop("imported_from", None)
-                    der[r.get("instance_id")] = line
-            dry_imported = {iid: l for iid, l in der.items()
-                           if iid in known}
+        if (config.resume and not imported):
+            dry_imported, _ = _rederive_import(
+                dry_state, workdir, run_id, insts)
         # the round-19 Minor fix (issue #22, 4450720403): the dry
         # run reproduces the LIVE guard's exact predicate — the
         # live path rejects a non-resume --import-run only when a
@@ -3674,81 +3768,11 @@ def run_pilot(config: PilotConfig,
     # import window (the seeding is idempotent; the state is
     # rewritten).
     if (not imported and config.resume):
-        known = {i["instance_id"] for i in insts}
-        if (state.get("imported")
-                and isinstance(state.get("import_source"), dict)
-                and state["import_source"]):
-            imported = {iid: line for iid, line in
-                        state["import_source"].items()
-                        if iid in known}
-            if imported:
-                label = state.get("imported_run") or "?"
-                print(f"[pilot] import re-derived from the state "
-                      f"file ({len(imported)} line(s) from "
-                      f"{label})")
-        elif os.path.isfile(jsonl):
-            try:
-                pre_recs, _ = rr.load_checkpoint(jsonl)
-            except rr.RunnerProtocolError:
-                pre_recs = []  # a torn tail (the host-crash class)
-                # makes the read fail — the state source is the only
-                # re-derivation available on that path
-            for r in pre_recs:
-                m = _meta_of(r)
-                if m.get("imported_from"):
-                    line = dict(r)
-                    line["meta"] = m
-                    m.pop("imported_from", None)
-                    imported[r.get("instance_id")] = line
-            imported = {iid: line for iid, line in imported.items()
-                       if iid in known}
-            if imported:
-                label = state.get("imported_run") or "?"
-                print(f"[pilot] import re-derived from the "
-                      f"checkpoint's seeded lines ({len(imported)} "
-                      f"line(s) from {label})")
-        # the round-18 Medium fix (issue #22 AC2): the
-        # re-derivation must fail-closed on ZERO overlap with the
-        # current instance file — the state's import bookkeeping is
-        # truthy but the re-derived set (imported + the state's
-        # retry class, filtered to the current file) is empty: a
-        # --resume pointed at a different (still stratified)
-        # --instances file would otherwise proceed with zero
-        # overlap and item 16 renders the vacuous non-gating n/a
-        # (the completing record can GO with no AC2 evidence — the
-        # same under-evidenced-verdict class the flag-path
-        # zero-overlap guard made a config error)
-        # the round-20 Medium fix (issue #22, 4450828209): the
-        # re-derivation rebuilds ``imported`` from our own state
-        # / checkpoint lines and bypasses load_imported — apply
-        # the SHARED fail-closed validation (the ts contract +
-        # the reference schema + the round-15 ref traversal
-        # guard) so a checkpoint line carrying meta.imported_from
-        # plus a .. / absolute reference is a config error here
-        # too (instead of reaching _copy_imported_artifacts and
-        # writing outside the workdir — the identical value is
-        # fail-closed on the --import-run path)
-        for _iid, _rec in imported.items():
-            _validate_imported_line(
-                _rec, _iid,
-                "the import re-derivation (state / checkpoint "
-                "line)")
-        state_retry = {k for k in
-                      (state.get("import_retry_class") or {})
-                      if k in known}
-        if (not imported and not state_retry
-                and (state.get("imported_run")
-                     or state.get("import_source"))
-                and (state.get("imported")
-                     or state.get("import_retry_class"))):
-            raise PilotConfigError(
-                f"the --resume import re-derivation "
-                f"({state.get('imported_run')!r}) shares no "
-                "instance ids with this invocation's instance "
-                "file — a source / instance mismatch "
-                "(fail-closed: a zero-overlap re-derivation "
-                "would let the record GO with item 16 n/a and "
-                "zero AC2 evidence)")
+        imported, label = _rederive_import(state, workdir, run_id,
+                                          insts)
+        if label:
+            print(f"[pilot] import re-derived from "
+                  f"{label}")
     # the round-13 Medium fix (issue #22 AC2): the pilot-B import
     # requirement (this or an earlier window — the re-derivation
     # above satisfies it; a no-import pilot-B run is a config

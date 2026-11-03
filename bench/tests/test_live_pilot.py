@@ -5046,3 +5046,70 @@ def test_wp6b_round22_absent_ts_rejected(
                   "--import-run", "src",
                   "--import-workdir", str(src)])
     assert rc == lp.EXIT_CONFIG, rc
+
+
+def test_wp6b_round23_dry_run_full_rederivation(tmp_path, live):
+    """The round-23 Major fix (issue #22, 4451051304): the dry-run
+    re-derivation skipped the live --resume path's fail-closed
+    checks — truthy state bookkeeping skipped the derivation
+    entirely (the zero-overlap guard never fired in a dry run: a
+    --dry-run --resume pointed at a different stratified
+    --instances file exited 0 where the identical live invocation
+    exits 2), and the checkpoint-derived lines bypassed
+    _validate_imported_line (a seeded line with a ../absolute
+    artifacts_dir or absent/bad ts passed dry while failing
+    live). The dry run now runs the SAME shared re-derivation
+    (state branch + checkpoint fallback + validation +
+    zero-overlap guard) — the contract: a dry run that passes is
+    an invocation that would actually work."""
+    repos, inst = _two_pilot_b_repos(tmp_path)
+    i0, i1, i2 = [e["instance_id"] for e in repos]
+    wd = tmp_path / "wd"
+    wd.mkdir()
+    src = tmp_path / "src"
+    src.mkdir()
+    modes = {i0: "no_patch", i1: "no_patch", i2: "ok"}
+    cfg1 = _cfg(tmp_path, inst, run_id="src", workdir=str(src),
+               host_check=False)
+    assert _run(cfg1, _mock_make_session(modes)) == lp.EXIT_OK
+    cfg2 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
+               resume=True, host_check=False, pilot="b",
+               import_run="src", import_workdir=str(src))
+    assert _run(cfg2, _mock_make_session(modes)) == lp.EXIT_OK
+    # (a) a dry-run --resume against a DIFFERENT (stratified)
+    # instance file: the state bookkeeping is truthy but the
+    # re-derived set has zero overlap — the live invocation is a
+    # config error; the dry run must agree
+    repos3 = _three_repos(tmp_path)
+    _instances_file(tmp_path / "inst3.json", repos3)
+    doc3 = json.loads((tmp_path / "inst3.json").read_text())
+    for e in doc3["instances"]:
+        e["instance_id"] = "other__" + e["instance_id"]
+    doc3["_meta"]["stratified_repos"] = sorted(
+        {e["repo"] for e in doc3["instances"]})
+    (tmp_path / "inst3.json").write_text(json.dumps(doc3))
+    rc = lp.main(["--dry-run", "--pilot", "b", "--resume",
+                  "--devin-bin", MOCK_PATH,
+                  "--instances", str(tmp_path / "inst3.json"),
+                  "--workdir", str(wd), "--run-id", "pilotB"])
+    assert rc == lp.EXIT_CONFIG, rc
+    # (b) a checkpoint-derived line with a traversal reference:
+    # corrupt the seeded checkpoint line (and clear the state's
+    # import set so the checkpoint fallback runs)
+    st = json.loads((wd / "pilot-pilotB.state.json").read_text())
+    st.pop("import_source")
+    st.pop("imported")
+    (wd / "pilot-pilotB.state.json").write_text(json.dumps(st))
+    p = wd / "run-pilotB.jsonl"
+    lines = []
+    for l in p.read_text().splitlines():
+        r = json.loads(l)
+        if r.get("instance_id") == i0:
+            r["meta"]["artifacts_dir"] = "/abs/evil"
+        lines.append(json.dumps(r))
+    p.write_text("\n".join(lines) + "\n")
+    rc2 = lp.main(["--dry-run", "--pilot", "b", "--resume",
+                   "--devin-bin", MOCK_PATH,
+                   "--instances", inst,
+                   "--workdir", str(wd), "--run-id", "pilotB"])
+    assert rc2 == lp.EXIT_CONFIG, rc2
