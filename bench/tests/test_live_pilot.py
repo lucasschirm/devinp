@@ -2305,7 +2305,20 @@ def test_dry_run_pilot_b_writes_17_skeleton(tmp_path, live):
                   "--workdir", str(tmp_path / "wd0"),
                   "--run-id", "dryb0"])
     assert rc == lp.EXIT_CONFIG
+    # a --import-run without --resume is a config error (exit 2)
+    # (the round-18 Minor fix — the dry run reproduces the live
+    # --resume requirement)
     rc = lp.main(["--dry-run", "--pilot", "b", "--devin-bin",
+                  MOCK_PATH, "--instances", inst,
+                  "--workdir", str(tmp_path / "wd1"),
+                  "--run-id", "dryb1",
+                  "--import-run", "src",
+                  "--import-workdir", str(src)])
+    assert rc == lp.EXIT_CONFIG
+    # the documented form (--import-run + --resume) writes the
+    # skeleton
+    rc = lp.main(["--dry-run", "--pilot", "b", "--resume",
+                  "--devin-bin",
                   MOCK_PATH, "--instances", inst,
                   "--workdir", str(wd), "--run-id", "dryb",
                   "--import-run", "src",
@@ -2615,7 +2628,7 @@ def test_pilot_b_default_selection_via_main(tmp_path, live, capsys):
     rc = lp.main(["--dry-run", "--pilot", "b",
                   "--workdir", str(tmp_path / "w0"), "--run-id", "x0"])
     assert rc == lp.EXIT_CONFIG
-    out = lp.main(["--dry-run", "--pilot", "b",
+    out = lp.main(["--dry-run", "--pilot", "b", "--resume",
                   "--workdir", str(tmp_path / "w"), "--run-id", "x",
                   "--import-run", "src",
                   "--import-workdir", str(src)])
@@ -2934,14 +2947,19 @@ def test_wp6b_round2_session_spec_carrys_the_run_id(tmp_path, live):
     """The round-2 body flag (issue #22): ``_eval_container`` must
     label its WP4 artifacts with the RUN's run id (a pilot-B run's
     artifacts are ``pilotB-<iid>-...``, not ``pilotA-...``) — the
-    spec carries the id (the default keeps the WP6a form
-    byte-identical)."""
+    spec carries the id (run_pilot always passes
+    config.run_id). The round-18 Minor fix (issue #22): the old
+    "pilotA" default was a stale literal — a direct (non-
+    run_pilot) spec construction silently labelled its WP4 eval
+    artifacts / container names ``pilotA``; the default is now the
+    neutral "run" label (the direct-construction case is visible
+    instead)."""
     spec = lp.SessionSpec(
         instance={"instance_id": "repo__a-1", "base_commit": "c1"},
         mode="sandbox", devin_bin=MOCK_PATH, model="m",
         cwd="/t", env={}, wall_s=1800.0, host_check=False,
         workdir="wd")
-    assert spec.run_id == "pilotA"  # the WP6a default
+    assert spec.run_id == "run"  # the neutral default
     spec_b = lp.SessionSpec(
         instance={"instance_id": "repo__a-1", "base_commit": "c1"},
         mode="sandbox", devin_bin=MOCK_PATH, model="m",
@@ -4634,3 +4652,92 @@ def test_wp6b_round17_item4_7_own_session_counts(tmp_path, live):
     assert "initialize ok on 1 instance(s)" in \
         _item(items2, "4")["observed"]
     assert "(+ " not in _item(items2, "4")["observed"]
+
+
+def test_wp6b_round18_zero_overlap_rerivation_fail_closed(
+        tmp_path, live):
+    """The round-18 Medium fix (issue #22 AC2): the
+    re-derivation accepted the state's import bookkeeping without
+    checking that the re-derived import actually overlaps the
+    current instance file — a --resume pointed at a different
+    (still stratified) --instances file proceeded with zero
+    overlap (the re-derived set filters to the known ids and can
+    end up {}), and item 16 rendered the vacuous non-gating n/a:
+    the completing record could GO with no AC2 evidence (the same
+    under-evidenced-verdict class the flag-path zero-overlap
+    guard made a config error). Fail-closed: a config error."""
+    repos, inst = _two_pilot_b_repos(tmp_path)
+    i0, i1, i2 = [e["instance_id"] for e in repos]
+    src, wd2 = tmp_path / "src", tmp_path / "wd2"
+    src.mkdir()
+    modes = {i0: "no_patch", i1: "no_patch", i2: "ok"}
+    cfg1 = _cfg(tmp_path, inst, run_id="src", workdir=str(src),
+               host_check=False)
+    assert _run(cfg1, _mock_make_session(modes)) == lp.EXIT_OK
+    # window 1: the import (state persists the bookkeeping)
+    cfg2 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               resume=True, host_check=False, pilot="b",
+               import_run="src", import_workdir=str(src))
+    assert _run(cfg2, _mock_make_session(modes)) == lp.EXIT_OK
+    # a DIFFERENT (still stratified) instance file: the two
+    # fixture helpers share the test__repoN-1 id namespace, so
+    # rewrite the ids to be genuinely disjoint
+    repos3 = _three_repos(tmp_path)
+    _instances_file(tmp_path / "inst3.json", repos3)
+    doc3 = json.loads((tmp_path / "inst3.json").read_text())
+    new_ids = []
+    for e in doc3["instances"]:
+        e["instance_id"] = "other__" + e["instance_id"]
+        e["repo"] = "other/" + e["repo"].split("/")[-1]
+        new_ids.append(e["instance_id"])
+    doc3["_meta"]["stratified_repos"] = sorted(
+        {e["repo"] for e in doc3["instances"]})
+    (tmp_path / "inst3.json").write_text(json.dumps(doc3))
+    inst3 = str(tmp_path / "inst3.json")
+    cfg3 = _cfg(tmp_path, inst3, run_id="pilotB",
+               workdir=str(wd2), resume=True, host_check=False,
+               pilot="b")
+    try:
+        _run(cfg3, _mock_make_session({
+            i: "ok" for i in new_ids}))
+    except lp.PilotConfigError:
+        pass
+    else:
+        raise AssertionError("a zero-overlap re-derivation was "
+                           "accepted")
+
+
+def test_wp6b_round18_dry_run_import_requires_resume(
+        tmp_path, live):
+    """The round-18 Minor fix (issue #22): the dry-run check did
+    not reproduce the --resume requirement the live path
+    enforces — --pilot b --import-run X without --resume exits 0
+    dry while the live invocation seeds the checkpoint and then
+    fails EXIT_CONFIG. The dry run now rejects it up front (the
+    contract: a dry run that passes is an invocation that would
+    actually work)."""
+    repos, inst = _two_pilot_b_repos(tmp_path)
+    i0, i1, i2 = [e["instance_id"] for e in repos]
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "run-src.jsonl").write_text(
+        json.dumps({"instance_id": i0, "status": "no_patch",
+                    "ts": 1.0}) + "\n")
+    # --import-run without --resume: a config error (exit 2)
+    rc = lp.main(["--dry-run", "--pilot", "b",
+                  "--devin-bin", MOCK_PATH,
+                  "--instances", inst,
+                  "--workdir", str(tmp_path / "wd"),
+                  "--run-id", "pilotB",
+                  "--import-run", "src",
+                  "--import-workdir", str(src)])
+    assert rc == lp.EXIT_CONFIG, rc
+    # the documented form (--import-run + --resume) passes
+    rc2 = lp.main(["--dry-run", "--pilot", "b", "--resume",
+                   "--devin-bin", MOCK_PATH,
+                   "--instances", inst,
+                   "--workdir", str(tmp_path / "wd2"),
+                   "--run-id", "pilotB",
+                   "--import-run", "src",
+                   "--import-workdir", str(src)])
+    assert rc2 == lp.EXIT_OK, rc2

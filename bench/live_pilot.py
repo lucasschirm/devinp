@@ -1183,15 +1183,17 @@ class SessionSpec:
     container: "Optional[str]" = None
     # the run's label for the eval-leg artifact names (issue #22 —
     # the WP4 artifacts are per-run; a pilot-B run must not label its
-    # artifacts ``pilotA-...``). The default is a fallback for a
+    # artifacts ``pilotA-...``). The default is a neutral label for a
     # direct spec construction — run_pilot always passes
     # run_id=config.run_id (the pilot's default run id is
     # pilot-<timestamp>), so a pilot run's WP4 artifact / container
-    # labels are run_id-labelled by construction (the round-12
-    # comment fix: the old "the default keeps the WP6a form
-    # byte-identical" claim was stale — the default is dead code
-    # on the pilot path)
-    run_id: str = "pilotA"
+    # labels are run_id-labelled by construction. The round-18
+    # Minor fix (issue #22): the old "pilotA" default was a stale
+    # literal — any direct (non-run_pilot) SessionSpec construction,
+    # including a pilot-B one, silently labelled its WP4 eval
+    # artifacts / container names ``pilotA``; the neutral "run"
+    # label makes the direct-construction case visible instead
+    run_id: str = "run"
 
 
 class PilotSession(rr.AgentSession):
@@ -3478,6 +3480,24 @@ def run_pilot(config: PilotConfig,
                     der[r.get("instance_id")] = line
             dry_imported = {iid: l for iid, l in der.items()
                            if iid in known}
+        # the round-18 Minor fix (issue #22): the dry run
+        # reproduces the --resume requirement the live path
+        # enforces — --pilot b --import-run X without --resume
+        # seeds the checkpoint and then fails EXIT_CONFIG in the
+        # live (the first import window must also pass --resume:
+        # the import seeds this run's checkpoint, and a non-
+        # resume invocation with an existing checkpoint is
+        # rejected); the dry run now rejects it up front (the
+        # contract: a dry run that passes is an invocation that
+        # would actually work)
+        if (config.import_run is not None
+                and not config.resume):
+            raise PilotConfigError(
+                "--import-run requires --resume (the first "
+                "import window must also pass --resume: the "
+                "import seeds this run's checkpoint, and a "
+                "non-resume invocation with an existing "
+                "checkpoint is rejected)")
         _check_pilot_b_requirements(config, dry_state,
                                    dry_imported)
         cal = calibrate([], config)
@@ -3612,6 +3632,33 @@ def run_pilot(config: PilotConfig,
                 print(f"[pilot] import re-derived from the "
                       f"checkpoint's seeded lines ({len(imported)} "
                       f"line(s) from {label})")
+        # the round-18 Medium fix (issue #22 AC2): the
+        # re-derivation must fail-closed on ZERO overlap with the
+        # current instance file — the state's import bookkeeping is
+        # truthy but the re-derived set (imported + the state's
+        # retry class, filtered to the current file) is empty: a
+        # --resume pointed at a different (still stratified)
+        # --instances file would otherwise proceed with zero
+        # overlap and item 16 renders the vacuous non-gating n/a
+        # (the completing record can GO with no AC2 evidence — the
+        # same under-evidenced-verdict class the flag-path
+        # zero-overlap guard made a config error)
+        state_retry = {k for k in
+                      (state.get("import_retry_class") or {})
+                      if k in known}
+        if (not imported and not state_retry
+                and (state.get("imported_run")
+                     or state.get("import_source"))
+                and (state.get("imported")
+                     or state.get("import_retry_class"))):
+            raise PilotConfigError(
+                f"the --resume import re-derivation "
+                f"({state.get('imported_run')!r}) shares no "
+                "instance ids with this invocation's instance "
+                "file — a source / instance mismatch "
+                "(fail-closed: a zero-overlap re-derivation "
+                "would let the record GO with item 16 n/a and "
+                "zero AC2 evidence)")
     # the round-13 Medium fix (issue #22 AC2): the pilot-B import
     # requirement (this or an earlier window — the re-derivation
     # above satisfies it; a no-import pilot-B run is a config
