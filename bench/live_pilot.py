@@ -3002,9 +3002,17 @@ def render_checklist_md(items: list, config: PilotConfig,
              f"{config.max_sessions_per_day} · max_wall_per_session="
              f"{config.max_wall_s:.0f}s", ""]
     ac_label = "issue #22" if config.pilot == "b" else "issue #21"
+    # the Calibration and Checklist sections are the INHERITED
+    # WP6a sections — #21's AC2 / AC4 (the round-19 Minor fix,
+    # issue #22): pilot-B's AC numbers (PLAN-WP6B) map AC2 to the
+    # 2-run overlap/variance and AC4 to the mid-batch interrupt,
+    # so labelling these sections with #22's numbers misattributes
+    # the record's own sections (the pilot-B-specific sections —
+    # 15/16/17 — carry the #22 labels)
     if calibration:
         lines += [
-            f"## Calibration ({ac_label} AC2)", "",
+            f"## Calibration (issue #21 AC2 — the inherited WP6a "
+            f"section)", "",
             f"- per-session wall (s): {calibration['per_session_wall_s']}",
             f"- median: {calibration['median_session_wall_s']} · mean: "
             f"{calibration['mean_session_wall_s']}",
@@ -3016,7 +3024,8 @@ def render_checklist_md(items: list, config: PilotConfig,
             f"chosen `max_sessions_per_day`: "
             f"{calibration['chosen_max_sessions_per_day']}",
             f"- basis: {calibration['basis']}", ""]
-    lines += [f"## Checklist ({ac_label} AC4)", "",
+    lines += [f"## Checklist (issue #21 AC4 — the inherited WP6a "
+              f"section)", "",
               "| # | item | expected | observed | pass |",
               "|---|---|---|---|---|"]
     for i in items:
@@ -3480,24 +3489,36 @@ def run_pilot(config: PilotConfig,
                     der[r.get("instance_id")] = line
             dry_imported = {iid: l for iid, l in der.items()
                            if iid in known}
-        # the round-18 Minor fix (issue #22): the dry run
-        # reproduces the --resume requirement the live path
-        # enforces — --pilot b --import-run X without --resume
-        # seeds the checkpoint and then fails EXIT_CONFIG in the
-        # live (the first import window must also pass --resume:
-        # the import seeds this run's checkpoint, and a non-
-        # resume invocation with an existing checkpoint is
-        # rejected); the dry run now rejects it up front (the
-        # contract: a dry run that passes is an invocation that
-        # would actually work)
+        # the round-19 Minor fix (issue #22, 4450720403): the dry
+        # run reproduces the LIVE guard's exact predicate — the
+        # live path rejects a non-resume --import-run only when a
+        # checkpoint EXISTS after the import seeding (the
+        # existing-checkpoint guard), which never fires when the
+        # import seeds nothing (an all-retry-class source) and
+        # the workdir has no checkpoint yet (the repair
+        # early-returns on a missing file; an empty seeding
+        # creates no file) — the identical live invocation
+        # proceeds. Rejecting unconditionally let the dry run
+        # refuse an invocation the live path accepts (the 'a dry
+        # run that passes is an invocation that would actually
+        # work' contract, both directions)
         if (config.import_run is not None
                 and not config.resume):
-            raise PilotConfigError(
-                "--import-run requires --resume (the first "
-                "import window must also pass --resume: the "
-                "import seeds this run's checkpoint, and a "
-                "non-resume invocation with an existing "
-                "checkpoint is rejected)")
+            checkpoint_exists = os.path.isfile(
+                os.path.join(config.workdir,
+                             "run-" + config.run_id + ".jsonl"))
+            # a non-empty validated import would seed (and
+            # thereby create) the checkpoint — the live guard
+            # fires then
+            import_would_seed = bool(imported)
+            if checkpoint_exists or import_would_seed:
+                raise PilotConfigError(
+                    "--import-run seeds this run's checkpoint "
+                    "(existing checkpoint / a non-empty import "
+                    "would create one); pass --resume so the "
+                    "import is the first window of a resumable "
+                    "pilot (the live path's existing-checkpoint "
+                    "guard)")
         _check_pilot_b_requirements(config, dry_state,
                                    dry_imported)
         cal = calibrate([], config)

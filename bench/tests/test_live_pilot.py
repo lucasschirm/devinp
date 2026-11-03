@@ -4741,3 +4741,70 @@ def test_wp6b_round18_dry_run_import_requires_resume(
                    "--import-run", "src",
                    "--import-workdir", str(src)])
     assert rc2 == lp.EXIT_OK, rc2
+
+
+def test_wp6b_round19_dry_run_reflects_live_predicate(
+        tmp_path, live):
+    """The round-19 Minor fix (issue #22, 4450720403): the dry-run
+    check reproduced the live existing-checkpoint guard's effect,
+    not its predicate — it rejected --import-run without --resume
+    unconditionally, while the live path rejects only when a
+    checkpoint exists after seeding, which never fires when the
+    import seeds nothing (an all-retry-class source) and the
+    workdir has no checkpoint yet (the repair early-returns on a
+    missing file; an empty seeding creates no file) — the
+    identical live invocation proceeds. The dry run now rejects
+    exactly when the live guard would fire (existing checkpoint,
+    or a non-empty import that would create one) — the contract
+    holds in both directions."""
+    repos, inst = _two_pilot_b_repos(tmp_path)
+    i0, i1 = [e["instance_id"] for e in repos[:2]]
+    src = tmp_path / "src"
+    src.mkdir()
+    # an ALL-RETRY-CLASS source: seeds nothing
+    (src / "run-src.jsonl").write_text(
+        json.dumps({"instance_id": i0, "status": "eval_error",
+                    "ts": 1.0}) + "\n"
+        + json.dumps({"instance_id": i1,
+                     "status": "quota_limited", "ts": 2.0}) + "\n")
+    # dry run, fresh workdir, no --resume: the live invocation
+    # would proceed (no checkpoint is created) — the dry run
+    # must agree (EXIT_OK)
+    rc = lp.main(["--dry-run", "--pilot", "b",
+                  "--devin-bin", MOCK_PATH,
+                  "--instances", inst,
+                  "--workdir", str(tmp_path / "wd-empty"),
+                  "--run-id", "pilotB",
+                  "--import-run", "src",
+                  "--import-workdir", str(src)])
+    assert rc == lp.EXIT_OK, rc
+    # a NON-EMPTY import (never-rerun source line) with a fresh
+    # workdir: the live invocation would seed and then be
+    # rejected by the existing-checkpoint guard — the dry run
+    # rejects up front (EXIT_CONFIG)
+    src2 = tmp_path / "src2"
+    src2.mkdir()
+    (src2 / "run-src2.jsonl").write_text(
+        json.dumps({"instance_id": i0, "status": "no_patch",
+                    "ts": 1.0}) + "\n")
+    rc2 = lp.main(["--dry-run", "--pilot", "b",
+                   "--devin-bin", MOCK_PATH,
+                   "--instances", inst,
+                   "--workdir", str(tmp_path / "wd-seed"),
+                   "--run-id", "pilotB",
+                   "--import-run", "src2",
+                   "--import-workdir", str(src2)])
+    assert rc2 == lp.EXIT_CONFIG, rc2
+    # an EXISTING checkpoint (any content) with a fresh import:
+    # the live guard fires — the dry run rejects (EXIT_CONFIG)
+    wd3 = tmp_path / "wd-pre"
+    wd3.mkdir()
+    (wd3 / "run-pilotB.jsonl").write_text("")
+    rc3 = lp.main(["--dry-run", "--pilot", "b",
+                   "--devin-bin", MOCK_PATH,
+                   "--instances", inst,
+                   "--workdir", str(wd3),
+                   "--run-id", "pilotB",
+                   "--import-run", "src",
+                   "--import-workdir", str(src)])
+    assert rc3 == lp.EXIT_CONFIG, rc3
