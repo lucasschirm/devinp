@@ -31,24 +31,32 @@ when a script calls it: the model list comes back paged ("click to show more")
 and the JSON never reaches stdout, so `devinp` used to die with *"returned
 invalid JSON (… 0 bytes)"*. It now works harder to get the whole document:
 
-- Prices are captured through a temp file in `os.tmpdir()` — a pipe stream from
-  `devin` can be truncated mid-write, so `devinp` points `devin`'s stdout at a
-  real file first. The temp file is always removed after the run.
+- **A pipe first, so `TMPDIR` cannot break anything.** The happy path captures
+  `devin`'s stdout over a pipe — no scratch file, no permissions, no sandbox.
+  Measured against the real CLI, the piped document is byte-identical to the
+  file capture (471 855 bytes, 46 families), so the old "pipes truncate" worry
+  that put a temp file first was misplaced; an unwritable or missing `TMPDIR`
+  used to cost two extra `devin` runs, and a missing one even reported *"`devin`
+  CLI not found in PATH"*.
 - **Retries that take the terminal away from `devin`.** If an attempt yields no
   usable JSON, `devinp` runs `devin` again, each time stripping more of the
   interactive terminal off it:
 
   | # | stdout goes to | environment | controlling terminal |
   | - | ------------ | -------------------------------------------------------- | --------------------- |
-  | 1 | temp file | yours, untouched | yes — the healthy path, one `devin` call |
-  | 2 | temp file | `PAGER=cat`, `GIT_PAGER=cat`, `TERM=dumb`, `NO_COLOR=1`, `CI=1` | **none** |
-  | 3 | pipe | same | **none** |
+  | 1 | pipe | yours, untouched | yes — the healthy path, one `devin` call |
+  | 2 | pipe | `PAGER=cat`, `GIT_PAGER=cat`, `TERM=dumb`, `NO_COLOR=1`, `CI=1` | **none** |
+  | 3 | scratch file | same | **none** |
 
   Spawned in its own session, `devin` cannot open `/dev/tty`: a pager or a TUI
   that paints a "click to show more" view onto the terminal has nowhere to
   draw, so the document has to come out of stdout. Nothing lands on the screen
   you are typing in, and Ctrl-C there no longer kills the lookup. The first
   attempt that parses wins, so the healthy path is unchanged.
+- **The scratch file (attempt 3) walks candidate directories** — `DEVINP_TMP`,
+  `os.tmpdir()`, `~/.devinp`, then the current directory — and uses the first
+  one it can actually write, removing the file afterwards. Set `DEVINP_TMP` to
+  pin it somewhere you control.
 - Noise around the document is tolerated: ANSI colours, an update banner in
   front, or the `pass a slug to --model` hint behind are stripped before the
   JSON is parsed.

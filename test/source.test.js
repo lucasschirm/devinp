@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import {chmod, mkdir, readFile, readdir, writeFile} from 'node:fs/promises'
+import {chmod, mkdir, readFile, readdir, rm, writeFile} from 'node:fs/promises'
 import {tmpdir} from 'node:os'
 import {join} from 'node:path'
 import {describe, it} from 'node:test'
@@ -41,14 +41,33 @@ async function devinTempFiles() {
   return new Set(entries.filter((e) => e.startsWith('devinp-models-')))
 }
 
+/** Run `fn` with `vars` applied to process.env, restoring them afterwards. */
+async function withEnv(vars, fn) {
+  const saved = {}
+  for (const [key, value] of Object.entries(vars)) {
+    saved[key] = process.env[key]
+    if (value === undefined) delete process.env[key]
+    else process.env[key] = value
+  }
+  try {
+    return await fn()
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  }
+}
+
 describe('runDevinJson', () => {
-  it('captures the command output from the temp file', async () => {
+  it('captures the command output through a pipe, with no scratch file', async () => {
     const fake = await makeFakeDevin('devin-ok.sh', {stdout: '{"families": []}'})
-    const {raw, parsed, attempts} = await runDevinJson({command: fake})
+    const {raw, parsed, attempts, via} = await runDevinJson({command: fake})
     assert.equal(raw, '{"families": []}')
     assert.deepEqual(parsed, {families: []})
     assert.equal(attempts.length, 1)
     assert.equal(attempts[0].bytes, '{"families": []}'.length)
+    assert.equal(via, 'pipe')
   })
 
   it('throws with the stderr detail when the command fails', async () => {
@@ -78,10 +97,10 @@ describe('runDevinJson', () => {
     const {parsed, attempts} = await runDevinJson({command: fake})
     assert.deepEqual(parsed, JSON.parse(OK_DOC))
     assert.equal(attempts.length, 3)
-    assert.match(attempts[0].label, /^temp file$/)
-    assert.match(attempts[1].label, /paging disabled/)
-    // The third attempt captures over a pipe instead of a temp file.
-    assert.match(attempts[2].label, /^pipe/)
+    assert.match(attempts[0].label, /^pipe$/)
+    assert.match(attempts[1].label, /^pipe, paging disabled/)
+    // The last resort captures to a scratch file instead of a pipe.
+    assert.match(attempts[2].label, /^temp file/)
 
     const lines = (await readFile(`${fake}.log`, 'utf8')).trim().split('\n')
     assert.equal(lines.length, 3)
@@ -107,7 +126,7 @@ describe('runDevinJson', () => {
     assert.deepEqual(parsed, JSON.parse(OK_DOC))
   })
 
-  it('removes its temp file on success and on failure', async () => {
+  it('removes its scratch file on success and on failure', async () => {
     const before = await devinTempFiles()
     const ok = await makeFakeDevin('devin-c1.sh', {stdout: '{}'})
     await runDevinJson({command: ok})
@@ -199,7 +218,7 @@ describe('loadModelData (live path)', () => {
       (error) => {
         assert.match(error.message, /exited without writing the JSON to stdout \(0 bytes\)/)
         assert.match(error.message, /click to show more/)
-        assert.match(error.message, /Tried: temp file: 0 bytes, exit 0/)
+        assert.match(error.message, /Tried: pipe: 0 bytes, exit 0/)
         assert.match(error.message, /devinp --source=-/)
         return true
       },
@@ -226,6 +245,79 @@ describe('loadModelData (live path)', () => {
   it('rejects an empty families array instead of succeeding', async () => {
     const fake = await makeFakeDevin('devin-live-empty.sh', {stdout: '{"families": []}'})
     await assert.rejects(() => loadModelData({command: fake}), /contains no model families/)
+  })
+})
+
+describe('scratch directory (TMPDIR) problems', () => {
+  // The old code wrote devin's output to os.tmpdir() first, so a read-only,
+  // missing or sandboxed TMPDIR broke the lookup (and, worse, a missing
+  // TMPDIR reported "`devin` CLI not found in PATH"). A pipe needs no
+  // scratch file at all, and the file strategy now walks candidates.
+  async function readOnlyDir() {
+    const dir = await mkdir(join(tmpdir(), `devinp-ro-${Date.now()}-${Math.random().toString(36).slice(2)}`), {recursive: true})
+    await chmod(dir, 0o555)
+    return dir
+  }
+
+  it('is not on the happy path: an unwritable TMPDIR still works in one attempt', async () => {
+    const dir = await readOnlyDir()
+    const fake = await makeFakeDevin('devin-ro.sh', {stdout: OK_DOC})
+    try {
+      const {data, retries, via} = await withEnv({TMPDIR: dir}, () => loadModelData({command: fake}))
+      assert.equal(data.families.length, 1)
+      assert.equal(retries, 0)
+      assert.equal(via, 'pipe')
+    } finally {
+      await chmod(dir, 0o755)
+      await rm(dir, {recursive: true})
+    }
+  })
+
+  it('works when TMPDIR points at a directory that does not exist', async () => {
+    const fake = await makeFakeDevin('devin-missing-tmp.sh', {stdout: OK_DOC})
+    const {data, retries} = await withEnv({TMPDIR: join(tmpdir(), `devinp-absent-${Date.now()}`)}, () => loadModelData({command: fake}))
+    assert.equal(data.families.length, 1)
+    assert.equal(retries, 0)
+  })
+
+  it('still blames a missing devin when TMPDIR is broken', async () => {
+    await assert.rejects(
+      () =>
+        withEnv({TMPDIR: join(tmpdir(), `devinp-absent-${Date.now()}`)}, () =>
+          loadModelData({command: '/nonexistent/devin-not-installed'}),
+        ),
+      /`devin` CLI not found in PATH/,
+    )
+  })
+
+  // A CLI that refuses to write to anything but a real file. Note that
+  // `[ -p /dev/stdout ]` is the wrong probe here: libuv wires stdio:'pipe'
+  // with a socketpair, so the child's fd 1 reads back as `socket:`, not
+  // `pipe:` — the probe below accepts either. Needs /proc, so Linux only.
+  const silentWhenNotAFile = `case "$(readlink /proc/$$/fd/1 2>/dev/null)" in pipe:*|socket:*) exit 0;; esac`
+
+  it('falls back to a scratch file when the CLI writes nothing to a pipe', async (t) => {
+    if (process.platform !== 'linux') return t.skip('the fake inspects /proc to detect a non-file stdout')
+    const fake = await makeFakeDevin('devin-pipe-averse.sh', {stdout: OK_DOC, before: [silentWhenNotAFile]})
+    const {data, retries, via} = await loadModelData({command: fake})
+    assert.equal(data.families.length, 1)
+    assert.equal(retries, 2)
+    assert.match(via, /temp file/)
+  })
+
+  it('walks down the candidate directories when DEVINP_TMP and TMPDIR are unwritable', async (t) => {
+    if (process.platform !== 'linux') return t.skip('the fake inspects /proc to detect a non-file stdout')
+    const dir = await readOnlyDir()
+    const fake = await makeFakeDevin('devin-pipe-averse2.sh', {stdout: OK_DOC, before: [silentWhenNotAFile]})
+    try {
+      const {data, retries, via} = await withEnv({DEVINP_TMP: dir, TMPDIR: dir}, () => loadModelData({command: fake}))
+      assert.equal(data.families.length, 1)
+      assert.equal(retries, 2)
+      assert.match(via, /temp file/)
+    } finally {
+      await chmod(dir, 0o755)
+      await rm(dir, {recursive: true})
+    }
   })
 })
 
