@@ -4808,3 +4808,88 @@ def test_wp6b_round19_dry_run_reflects_live_predicate(
                    "--import-run", "src",
                    "--import-workdir", str(src)])
     assert rc3 == lp.EXIT_CONFIG, rc3
+
+
+def test_wp6b_round20_rederivation_traversal_fail_closed(
+        tmp_path, live):
+    """The round-20 Medium fix (issue #22, 4450828209): the
+    checkpoint re-derivation rebuilt ``imported`` without the
+    load_imported validation (the round-15 ref traversal guard,
+    the ts contract) — a checkpoint line carrying
+    meta.imported_from plus a ``..`` / absolute artifacts_dir
+    would reach _copy_imported_artifacts (the value joins into
+    the copy's destination paths — a write outside the workdir),
+    while the identical value is a fail-closed config error on
+    the --import-run path. The re-derivation now applies the
+    SHARED validation: such a line is a PilotConfigError (exit 2)
+    before any session."""
+    repos, inst = _two_pilot_b_repos(tmp_path)
+    i0, i1, i2 = [e["instance_id"] for e in repos]
+    wd = tmp_path / "wd"
+    wd.mkdir()
+    src = tmp_path / "src"
+    src.mkdir()
+    cfg1 = _cfg(tmp_path, inst, run_id="src", workdir=str(src),
+               host_check=False)
+    modes = {i0: "no_patch", i1: "no_patch", i2: "ok"}
+    assert _run(cfg1, _mock_make_session(modes)) == lp.EXIT_OK
+    # a window-1 import (state persists the bookkeeping)
+    cfg2 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
+               resume=True, host_check=False, pilot="b",
+               import_run="src", import_workdir=str(src))
+    assert _run(cfg2, _mock_make_session(modes)) == lp.EXIT_OK
+    # CORRUPT the seeded checkpoint line: a traversal
+    # artifacts_dir (the state still carries the clean
+    # bookkeeping, but the checkpoint fallback line is corrupt —
+    # exercise the checkpoint branch; also corrupt the state's
+    # import_source copy to exercise both branches)
+    p = wd / "run-pilotB.jsonl"
+    lines = p.read_text().splitlines()
+    out = []
+    for l in lines:
+        r = json.loads(l)
+        if r.get("instance_id") == i0:
+            r["meta"]["artifacts_dir"] = "../../evil"
+            r["meta"]["imported_from"] = "src"
+        out.append(json.dumps(r))
+    p.write_text("\n".join(out) + "\n")
+    st = json.loads((wd / "pilot-pilotB.state.json").read_text())
+    st["import_source"][i0]["meta"]["artifacts_dir"] = "../../evil"
+    (wd / "pilot-pilotB.state.json").write_text(json.dumps(st))
+    # the resume: the re-derivation (both branches now feed the
+    # shared validation) must be a config error (exit 2)
+    cfg3 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
+               resume=True, host_check=False, pilot="b")
+    try:
+        _run(cfg3, _mock_make_session({r["instance_id"]: "ok"
+                                      for r in repos}))
+    except lp.PilotConfigError:
+        pass
+    else:
+        raise AssertionError("a traversal reference in the "
+                           "re-derivation was accepted")
+
+
+def test_wp6b_round20_pin_fetch_error_body(tmp_path):
+    """The round-20 Minor fix (issue #22): a 200 error-shaped
+    API body ({"error": ...} — no "rows") would raise an
+    uncaught KeyError (fetch_all_rows accessed data["rows"]
+    without a guard; _get retries fetch exceptions but not a
+    parsed error body). Fail closed with a SystemExit before
+    the access."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "pin_pilot_b", str(Path(__file__).parent.parent
+                          / "scripts" /
+                          "pin_pilot_b_instances.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    mod._get = lambda url: {"error": "rate limited",
+                           "message": "slow down"}
+    try:
+        mod.fetch_all_rows()
+    except SystemExit as e:
+        assert "error-shaped" in str(e)
+    else:
+        raise AssertionError("a 200 error-shaped body was "
+                           "accepted")

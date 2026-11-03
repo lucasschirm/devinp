@@ -68,6 +68,15 @@ def fetch_all_rows() -> list:
     seen_first = set()
     while True:
         data = _get(API.format(offset=offset))
+        # the round-20 Minor fix (issue #22): a 200 error-shaped
+        # body ({"error": ...} — no "rows") would raise an
+        # uncaught KeyError; _get retries fetch EXCEPTIONS but not
+        # a parsed error body — fail closed before the access
+        if (not isinstance(data, dict)
+                or not isinstance(data.get("rows"), list)):
+            raise SystemExit(
+                "the HF API returned an error-shaped 200 body "
+                f"(no 'rows' list): {str(data)[:200]}")
         page = data["rows"]
         rows.extend(page)
         if not page:

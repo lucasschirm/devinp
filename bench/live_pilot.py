@@ -464,6 +464,59 @@ def load_instances_meta(path: str) -> dict:
     return {}
 
 
+def _validate_imported_line(rec: dict, iid: str,
+                           origin: str) -> None:
+    """The fail-closed reference validation shared by the
+    ``--import-run`` path (:func:`load_imported`) and the
+    state / checkpoint re-derivation (the round-20 Medium fix,
+    issue #22, 4450828209): the re-derivation rebuilds
+    ``imported`` from our own state / checkpoint lines and
+    bypasses ``load_imported`` — a checkpoint line carrying
+    ``meta.imported_from`` plus a ``..`` / absolute
+    ``artifacts_dir`` would otherwise reach
+    ``_copy_imported_artifacts`` (the value joins into the
+    copy's destination paths — a write outside the workdir),
+    while the identical value is a fail-closed config error on
+    the ``--import-run`` path. The WP5 ``_parse_ts`` contract
+    (the round-8 Medium fix) is re-checked too (a re-derived
+    line is written back by the seeding; a non-conforming ts
+    would wedge every later ``--resume`` in ``report_failed``).
+    ``origin`` is the error-message label (the source-line vs.
+    re-derivation phrasing).
+    """
+    meta = _meta_of(rec)
+    ts = rec.get("ts")
+    if "ts" in rec:
+        if (ts is None
+                or isinstance(ts, bool)
+                or not isinstance(ts, (int, float))
+                or not math.isfinite(ts) or ts <= 0):
+            raise PilotConfigError(
+                f"{origin} for {iid!r} carries a ts the WP5 "
+                f"_parse_ts contract rejects ({ts!r}) — fail-closed "
+                f"(a seeded non-finite / non-positive / bool / null "
+                f"ts would wedge every later --resume in "
+                f"report_failed)")
+    for k in ("artifacts_dir", "patch_diff", "trajectory",
+              "eval_log"):
+        v = meta.get(k)
+        if v is not None and not (isinstance(v, str) and v):
+            raise PilotConfigError(
+                f"{origin} for {iid!r} carries a {k} the WP5 "
+                f"_ref_path contract rejects ({v!r}) — fail-closed "
+                f"(a seeded non-string reference would wedge every "
+                f"later --resume in report_failed)")
+        if isinstance(v, str) and v and (
+                os.path.isabs(v) or ".." in v.split("/")):
+            raise PilotConfigError(
+                f"{origin} for {iid!r} carries a {k} with a "
+                f"path traversal or an absolute reference "
+                f"({v!r}) — fail-closed: the value joins into "
+                f"the artifact copy's paths (a '../../x' "
+                f"reference would write outside this run's "
+                f"workdir)")
+
+
 def load_imported(config: PilotConfig, workdir: str,
                   insts: list) -> "tuple[dict, dict]":
     """The WP6b checkpoint import (issue #22 AC2 — the 2-run overlap
@@ -557,70 +610,13 @@ def load_imported(config: PilotConfig, workdir: str,
         # class the meta / ts / ref guards were added to close
         if meta is None:
             meta = {}
-        ts = rec.get("ts")
-        # the WP5 ``date_range`` / ``_parse_ts`` contract (the
-        # round-8 Medium fix, issue #22): a seeded line's ``ts`` is
-        # written verbatim (``rec.get("ts", ...)`` returns the
-        # literal value when the key is PRESENT — an explicit
-        # ``null`` too, not the default), so a present ts must be a
-        # finite, positive, non-bool number (the WP5 contract);
-        # absent is fine (the seeding default, a fresh ts, applies).
-        # A non-conforming present value (None / bool / non-finite /
-        # non-positive) would be seeded verbatim and fail
-        # ``rep.generate`` as ``report_failed``, wedging every
-        # later --resume on the same durable line — fail-closed
-        # instead
-        if "ts" in rec:
-            if (ts is None
-                    or isinstance(ts, bool)
-                    or not isinstance(ts, (int, float))
-                    or not math.isfinite(ts) or ts <= 0):
-                raise PilotConfigError(
-                    f"--import-run source line for {iid!r} carries "
-                    f"a ts the WP5 _parse_ts contract rejects "
-                    f"({ts!r}) — a corrupt source (fail-closed "
-                    "before any session; a seeded non-finite / "
-                    "non-positive / bool / null ts would wedge "
-                    "every later --resume in report_failed)")
-        # the WP5 ``_ref_path`` schema (the round-11 Medium fix,
-        # issue #22 AC2): a non-string non-null reference (or a
-        # non-string non-null artifacts_dir) seeds verbatim and
-        # crosscheck raises ReportProtocolError → report_failed —
-        # the same durable-line wedge class the meta / ts guards
-        # close. Fail-closed: every reference key must be a
-        # non-empty string or null (the _ref_path contract)
-        for k in ("artifacts_dir", "patch_diff", "trajectory",
-                  "eval_log"):
-            v = meta.get(k)
-            if v is not None and not (isinstance(v, str) and v):
-                raise PilotConfigError(
-                    f"--import-run source line for {iid!r} carries "
-                    f"a {k} the WP5 _ref_path contract rejects "
-                    f"({v!r}) — a corrupt source (fail-closed "
-                    "before any session; a seeded non-string "
-                    "reference would wedge every later --resume "
-                    "in report_failed)")
-            # the round-15 Medium fix (issue #22): the reference
-            # values join into the artifact copy's source /
-            # destination paths (os.path.join(base, ref)) — reject
-            # the traversal class (a ``..`` path element) and
-            # absolute paths (os.path.join(base, abs) IS abs — it
-            # escapes the workdir entirely; the WP5 _ref_path
-            # contract: a relative reference resolves against the
-            # JSONL's directory) — the same traversal class the
-            # run-id / instance-id charsets exist to prevent (a
-            # source line with e.g. artifacts_dir: "../../x"
-            # would make the copy's makedirs/replace write
-            # outside this run's workdir)
-            if isinstance(v, str) and v and (
-                    os.path.isabs(v) or ".." in v.split("/")):
-                raise PilotConfigError(
-                    f"--import-run source line for {iid!r} "
-                    f"carries a {k} with a path traversal or an "
-                    f"absolute reference ({v!r}) — fail-closed: "
-                    f"the value joins into the artifact copy's "
-                    f"paths (a '../../x' reference would write "
-                    f"outside this run's workdir)")
+        # the round-20 Medium fix (issue #22): the ts / reference
+        # schema / traversal validation is the SHARED helper
+        # (also applied to the state / checkpoint re-derivation —
+        # the identical fail-closed contract on both import
+        # paths)
+        _validate_imported_line(
+            rec, iid, "--import-run source line")
         # the SOURCE-ARTIFACT LAYOUT normalization (the round-11
         # Blocker fix, issue #22 AC2): the pre-commit Pilot-A run
         # (2026-10-28 20:46–20:56 UTC — before commit 4259460)
@@ -3664,6 +3660,21 @@ def run_pilot(config: PilotConfig,
         # (the completing record can GO with no AC2 evidence — the
         # same under-evidenced-verdict class the flag-path
         # zero-overlap guard made a config error)
+        # the round-20 Medium fix (issue #22, 4450828209): the
+        # re-derivation rebuilds ``imported`` from our own state
+        # / checkpoint lines and bypasses load_imported — apply
+        # the SHARED fail-closed validation (the ts contract +
+        # the reference schema + the round-15 ref traversal
+        # guard) so a checkpoint line carrying meta.imported_from
+        # plus a .. / absolute reference is a config error here
+        # too (instead of reaching _copy_imported_artifacts and
+        # writing outside the workdir — the identical value is
+        # fail-closed on the --import-run path)
+        for _iid, _rec in imported.items():
+            _validate_imported_line(
+                _rec, _iid,
+                "the import re-derivation (state / checkpoint "
+                "line)")
         state_retry = {k for k in
                       (state.get("import_retry_class") or {})
                       if k in known}
