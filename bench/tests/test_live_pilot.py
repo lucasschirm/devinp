@@ -5171,6 +5171,17 @@ def test_wp6b_round24_checkpoint_provenance_not_laundered(
           if l.startswith("| 16 |")][0]
     assert "faithfulness n/a (self-derived" in i16, i16
     assert "FAIL" not in i16, i16
+    # the round-29 Minor fix (issue #22, 4451583337): the
+    # per-row PASS/FAIL cells of the overlap table are a
+    # self-comparison under the checkpoint fallback — the
+    # cells now render the explicit n/a (the round-24 fix
+    # neutralized only the summary label)
+    overlap_rows = [l for l in gng.splitlines()
+                   if l.startswith("| test__repo")
+                   and "→" in l and "|" in l]
+    assert overlap_rows, gng
+    assert all("n/a (self-derived)" in l
+               for l in overlap_rows), overlap_rows
 
 
 def test_wp6b_round25_out_of_range_ts_rejected(
@@ -5368,3 +5379,97 @@ def test_wp6b_round28_stratify_rule(tmp_path):
         pass
     else:
         raise AssertionError("an 11-repo split was accepted")
+
+
+def test_wp6b_round29_pilot_a_resume_does_not_rederive(
+        tmp_path, live):
+    """The round-29 Major fix (issue #22, 4451583330): the
+    re-derivation + seeding ran on ANY --resume with no
+    config.pilot check — a --pilot a --resume on a pilot-B
+    workdir re-derived imported from the state / checkpoint
+    bookkeeping, seeded imported_from lines, and rendered the
+    WP6a 14-item record with the import unverified (items
+    15–17 do not render under --pilot a) — the exact hazard
+    PilotConfig.__post_init__ fail-closes on for the
+    --import-run flag. The re-derivation (live + dry run) is
+    now gated to --pilot b. The test: a pilot-B import window
+    (2 imported + 1 fresh), the checkpoint removed (the
+    bookkeeping-only state survives), then a --pilot a
+    resume: NO re-derivation, NO seeding (the pre-fix code
+    would seed the imported_from lines and render the 14-item
+    record with the import unverified) — the 3 instances run
+    as pilot A, and no line carries the imported_from meta."""
+    repos, inst = _pilot_b_repos(tmp_path)
+    i0, i1, i2 = [e["instance_id"] for e in repos]
+    src = tmp_path / "src"
+    src.mkdir()
+    wd = tmp_path / "wd"
+    wd.mkdir()
+    modes = {i0: "no_patch", i1: "no_patch", i2: "ok"}
+    cfg1 = _cfg(tmp_path, inst, run_id="src", workdir=str(src),
+               host_check=False)
+    assert _run(cfg1, _mock_make_session(modes)) == lp.EXIT_OK
+    cfg2 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
+               resume=True, host_check=False, pilot="b",
+               import_run="src", import_workdir=str(src))
+    assert _run(cfg2, _mock_make_session(
+        {r["instance_id"]: "ok" for r in repos})) == lp.EXIT_OK
+    # the checkpoint is lost (the bookkeeping-only state
+    # survives — the re-derivation trigger condition)
+    (wd / "run-pilotB.jsonl").unlink()
+    cfg3 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
+               resume=True, host_check=False, pilot="a")
+    assert _run(cfg3, _mock_make_session(
+        {r["instance_id"]: "ok" for r in repos})) == lp.EXIT_OK
+    # NO seeding: no line carries the imported_from meta (the
+    # pre-fix code would seed the 2 no_patch instances with
+    # the marker and render the 14-item record with the import
+    # unverified)
+    lines = _read_jsonl(wd / "run-pilotB.jsonl")
+    session_lines = [l for l in lines
+                    if l.get("instance_id") is not None]
+    assert all("imported_from" not in (l.get("meta") or {})
+           for l in session_lines), session_lines
+    # all 3 ran as pilot A (3 session lines, no imported rows)
+    assert len(session_lines) == 3, len(session_lines)
+    # the 14-item WP6a record (no pilot-B sections)
+    gng = (wd / "wp6a-go-no-go.md").read_text()
+    assert "## 2-run overlap/variance" not in gng
+    # the state's bookkeeping survives untouched (the pilot-A
+    # run must not clobber it — a later --pilot b resume is
+    # still on the checkpoint fallback)
+    st = json.loads((wd / "pilot-pilotB.state.json").read_text())
+    assert st.get("import_source"), st
+
+
+def test_wp6b_round29_resume_hint_carries_pilot_flag(
+        tmp_path, live, capsys):
+    """The round-29 Major fix (issue #22, 4451583330, the
+    resume-hint half): the interrupt resume hint used to omit
+    the pilot flag — on a pilot-B workdir that steered the
+    operator into a --pilot a --resume (the pre-fix hazard). The
+    hint now carries --pilot <kind> explicitly."""
+    repos, inst = _pilot_b_repos(tmp_path)
+    wd = tmp_path / "wh"
+    wd.mkdir()
+    src = tmp_path / "src"
+    src.mkdir()
+    i0, i1, i2 = [e["instance_id"] for e in repos]
+    # 1 never-rerun (imported — never re-run) + 2 fresh (the
+    # interrupt_after=1 check is on the per-invocation session
+    # count: after fresh session 1, before fresh session 2)
+    modes = {i0: "no_patch", i1: "ok", i2: "ok"}
+    cfg1 = _cfg(tmp_path, inst, run_id="src", workdir=str(src),
+               host_check=False)
+    assert _run(cfg1, _mock_make_session(modes)) == lp.EXIT_OK
+    cfg = _cfg(tmp_path, inst, run_id="hint", workdir=str(wd),
+              resume=True, host_check=False, pilot="b",
+              import_run="src", import_workdir=str(src),
+              interrupt_after=1)
+    assert _run(cfg, _mock_make_session(
+        {r["instance_id"]: "ok" for r in repos})) == lp.EXIT_INTERRUPT
+    out = capsys.readouterr().out
+    hint = [l for l in out.splitlines()
+           if l.startswith("[pilot] resume with:")]
+    assert hint, out
+    assert "--pilot b" in hint[0], hint[0]

@@ -3010,13 +3010,24 @@ def _render_pilot_b_sections(wp6b: dict) -> list:
                   "| tokens | patch bytes | match |",
                   "|---|---|---|---|---|---|---|"]
         for r in rows:
+            # the round-29 Minor fix (issue #22, 4451583337): a
+            # checkpoint-provenance import's per-row match is a
+            # self-comparison (the source lines ARE this run's
+            # seeded lines) — the round-24 fix neutralized only
+            # the summary label; the per-row PASS/FAIL cells
+            # still asserted a per-instance faithfulness that was
+            # never verified against the true source. Render the
+            # explicit n/a on the checkpoint fallback.
+            row_match = ("n/a (self-derived)"
+                        if imp.get("provenance") == "checkpoint"
+                        else ("PASS" if r["match"] else "FAIL"))
             lines.append(
                 f"| {r['instance_id']} | {r['src_status']} | "
                 f"{r['final_status']} | {r['src_wall']} → "
                 f"{r['final_wall']} | {r['src_tokens']} → "
                 f"{r['final_tokens']} | {r['src_patch']} → "
                 f"{r['final_patch']} | "
-                f"{'PASS' if r['match'] else 'FAIL'} |")
+                f"{row_match} |")
         match_label = ("PASS" if imp.get("all_match")
                       else ("FAIL" if imp.get("rows")
                            else ("n/a (import attempted — zero "
@@ -3731,7 +3742,8 @@ def run_pilot(config: PilotConfig,
         # too)
         dry_state = _load_state(workdir, run_id)
         dry_imported = None
-        if (config.resume and not imported):
+        if (config.resume and not imported
+                and config.pilot == "b"):
             dry_imported, _, _ = _rederive_import(
                 dry_state, workdir, run_id, insts)
         # the round-19 Minor fix (issue #22, 4450720403): the dry
@@ -3881,7 +3893,17 @@ def run_pilot(config: PilotConfig,
     # import window (the seeding is idempotent; the state is
     # rewritten).
     import_provenance = ""
-    if (not imported and config.resume):
+    # the round-29 Major fix (issue #22, 4451583330): the import
+    # is a PILOT-B concept (the --import-run flag is a config
+    # error under --pilot a) — the re-derivation must be gated
+    # the same way: a --pilot a --resume on a pilot-B workdir
+    # used to re-derive imported from the state / checkpoint
+    # bookkeeping, seed imported_from lines, and render the WP6a
+    # 14-item record with the import unverified (items 15–17 do
+    # not render under --pilot a) — the exact hazard
+    # __post_init__ fail-closes on for the flag
+    if (not imported and config.resume
+            and config.pilot == "b"):
         imported, label, import_provenance = _rederive_import(
             state, workdir, run_id, insts)
         if label:
@@ -4320,8 +4342,16 @@ def run_pilot(config: PilotConfig,
     print(f"[pilot] artifacts: {jsonl} · {rep_dir} · {gng}")
 
     if interrupted:
+        # the round-29 Major fix (issue #22, 4451583330): the
+        # resume hint used to omit the pilot flag — on a
+        # pilot-B workdir that steered the operator into a
+        # --pilot a --resume (the pre-fix hazard: the import
+        # re-derivation / seeding ran without items 15–17). The
+        # state carries the run's pilot kind in the record name
+        # context; the hint now carries the flag explicitly
         print(f"[pilot] resume with: {os.path.basename(sys.argv[0])} "
-              f"--resume --run-id {run_id} … (the finished instance(s) "
+              f"--pilot {config.pilot} --resume --run-id {run_id} "
+              f"… (the finished instance(s) "
               "are skipped — never re-run)")
         return EXIT_INTERRUPT
     if run_failed:
