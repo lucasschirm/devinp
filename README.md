@@ -137,10 +137,24 @@ so `npm publish`, git-URL installs, and `npm link` always ship a fresh bundle.
 
 ## Publishing
 
-`.github/workflows/publish.yml` bumps the patch version and publishes with
-[npm trusted publishing](https://docs.npmjs.com/trusted-publishers) (OIDC —
+`.github/workflows/publish.yml` publishes a patch release on every push to main
+with [npm trusted publishing](https://docs.npmjs.org/trusted-publishers) (OIDC —
 no `NPM_TOKEN`). Requires the trusted publisher to be configured on npmjs.com:
 repository `lucasschirm/devinp`, workflow `publish.yml`.
+
+It **never commits to main** — the branch ruleset requires every change to
+arrive through a pull request, and a rejected release commit used to strand the
+publish step that ran after it (GH013, then `npm publish` skipped). The released
+version therefore lives in the npm registry and in the git tag, not in main's
+`package.json`:
+
+```sh
+git ls-remote --tags origin                 # released versions
+npm view @lucasschirm/devinp version       # latest published
+```
+
+The workflow takes the first patch number that is free in both places, so a tag
+left behind by an older run cannot wedge it.
 
 ## License
 
