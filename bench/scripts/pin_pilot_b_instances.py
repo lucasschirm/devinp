@@ -78,6 +78,17 @@ def fetch_all_rows() -> list:
                 "the HF API returned an error-shaped 200 body "
                 f"(no 'rows' list): {str(data)[:200]}")
         page = data["rows"]
+        # the round-24 Minor fix (issue #22): a row missing
+        # row_idx (schema drift) would raise an uncaught KeyError
+        # in the sort / de-dupe below (_get retries fetch
+        # exceptions, not a per-row key) — fail closed
+        for r in page:
+            if (not isinstance(r, dict)
+                    or not isinstance(r.get("row_idx"), int)
+                    or isinstance(r.get("row_idx"), bool)):
+                raise SystemExit(
+                    "an API row is missing its row_idx "
+                    f"(schema drift): {json.dumps(r)[:200]}")
         rows.extend(page)
         if not page:
             break

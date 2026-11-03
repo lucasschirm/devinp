@@ -2430,6 +2430,7 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
                    stratified_repos: "Optional[list]" = None,
                    imported: "Optional[dict]" = None,
                    import_attempted: bool = False,
+                   import_provenance: str = "",
                    repo_by_iid: "Optional[dict]" = None,
                    arithmetic_total: int = 3,
                    window_buckets: "Optional[dict]" = None) -> list:
@@ -2815,29 +2816,47 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
         if imported:
             ok16 = True
             frag = []
-            for iid in sorted(imported):
-                src = imported[iid]
-                fin = next((r for r in records
-                           if r.get("instance_id") == iid), None)
-                sm = _meta_of(src)
-                fm = _meta_of(fin) if fin else {}
-                s_wall = (sm.get("wall") or {}).get("session_s")
-                f_wall = (fm.get("wall") or {}).get("session_s")
-                s_tok = _usage_total(sm.get("usage"))
-                f_tok = _usage_total(fm.get("usage"))
-                s_pb = sm.get("patch_bytes")
-                f_pb = fm.get("patch_bytes")
-                m = (fin is not None
-                    and src.get("status") == fin.get("status")
-                    and s_wall == f_wall and s_tok == f_tok
-                    and s_pb == f_pb)
-                ok16 = ok16 and m
-                frag.append(f"{iid}: "
-                          + ("match" if m else "MISMATCH")
-                          + f" ({src.get('status')}/"
-                             f"{fin.get('status') if fin else '-'}, "
-                             f"wall {s_wall}/{f_wall}, tokens "
-                             f"{s_tok}/{f_tok}, patch {s_pb}/{f_pb})")
+            # the round-24 Major fix (issue #22, 4451121577): a
+            # CHECKPOINT-provenance imported set is the
+            # checkpoint's own seeded lines (marker stripped) —
+            # comparing them to their own final lines is a
+            # self-comparison (it can never fail; the same
+            # self-referential comparison the self-import guard
+            # rejects). The faithfulness half renders an explicit
+            # n/a (the fidelity to the true source was verified at
+            # seeding time — the verbatim copy + the flag path's
+            # validation + the artifact copy — and cannot be re-
+            # verified once the state is lost); the arithmetic
+            # half (the count) still gates
+            if import_provenance == "checkpoint":
+                frag.append("faithfulness n/a (self-derived "
+                           "checkpoint fallback — the source "
+                           "lines ARE this run's seeded lines; "
+                           "the fidelity was verified at seeding)")
+            else:
+                for iid in sorted(imported):
+                    src = imported[iid]
+                    fin = next((r for r in records
+                               if r.get("instance_id") == iid), None)
+                    sm = _meta_of(src)
+                    fm = _meta_of(fin) if fin else {}
+                    s_wall = (sm.get("wall") or {}).get("session_s")
+                    f_wall = (fm.get("wall") or {}).get("session_s")
+                    s_tok = _usage_total(sm.get("usage"))
+                    f_tok = _usage_total(fm.get("usage"))
+                    s_pb = sm.get("patch_bytes")
+                    f_pb = fm.get("patch_bytes")
+                    m = (fin is not None
+                        and src.get("status") == fin.get("status")
+                        and s_wall == f_wall and s_tok == f_tok
+                        and s_pb == f_pb)
+                    ok16 = ok16 and m
+                    frag.append(f"{iid}: "
+                              + ("match" if m else "MISMATCH")
+                              + f" ({src.get('status')}/"
+                                 f"{fin.get('status') if fin else '-'}, "
+                                 f"wall {s_wall}/{f_wall}, tokens "
+                                 f"{s_tok}/{f_tok}, patch {s_pb}/{f_pb})")
             # the session arithmetic (the unique-instance basis):
             # imported + the unique NEW instances == unique — a legal
             # pass@1 retry (several attempt lines for one instance)
@@ -2982,7 +3001,21 @@ def _render_pilot_b_sections(wp6b: dict) -> list:
                 f"{'PASS' if r['match'] else 'FAIL'} |")
         match_label = ("PASS" if imp.get("all_match")
                       else ("FAIL" if imp.get("rows")
-                           else "n/a (no import)"))
+                           else ("n/a (import attempted — zero "
+                                "imported instances; the AC2 "
+                                "overlap check is vacuous)"
+                             if imp.get("attempted")
+                             else "n/a (no import)")))
+        # the round-24 Major fix (issue #22, 4451121577): a
+        # checkpoint-provenance match is a self-comparison —
+        # render its explicit n/a (the fidelity was verified at
+        # seeding) instead of a vacuous PASS
+        if (imp.get("provenance") == "checkpoint"
+                and match_label == "PASS"):
+            match_label = ("n/a (self-derived checkpoint fallback "
+                          "— the source lines ARE this run's "
+                          "seeded lines; the fidelity was "
+                          "verified at seeding)")
         lines += ["",
                   f"Session arithmetic: {imp.get('imported')} imported "
                   f"+ {imp.get('new_instances')} new = "
@@ -3284,7 +3317,8 @@ def _pilot_gating(config: PilotConfig) -> frozenset:
 
 def _pilot_b_sections(config: PilotConfig, insts: list, records: list,
                      inst_records: list, imported: dict,
-                     buckets: dict) -> dict:
+                     buckets: dict, import_attempted: bool = False,
+                     import_provenance: str = "") -> dict:
     """The pilot-B record-section data (issue #22) — the
     ``meta['wp6b']`` the renderer turns into markdown tables.
 
@@ -3366,6 +3400,17 @@ def _pilot_b_sections(config: PilotConfig, insts: list, records: list,
         "new_sessions": len(new_lines),
         "unique": unique,
         "arithmetic_holds": (len(imported) + len(new_iids) == unique),
+        # the round-24 Minor fix (issue #22, 4451121581): the
+        # section's overlap-match label must distinguish the
+        # import-attempted-but-zero-imported case (the round-12
+        # fix) from a legitimate non-import run — the renderer's
+        # match_label collapsed both into "n/a (no import)"
+        "attempted": import_attempted,
+        # the round-24 Major fix (issue #22, 4451121577): the
+        # provenance — a checkpoint-derived set's match is a
+        # self-comparison (the renderer renders its explicit n/a
+        # instead of PASS)
+        "provenance": import_provenance,
         # the overlap match is only defined for a run that has an
         # import (zero rows is not a FAIL — item 16 renders n/a on
         # a non-import run, and the record must not contradict
@@ -3443,9 +3488,24 @@ def _rederive_import(state: dict, workdir: str, run_id: str,
     state / checkpoint-derived lines bypassed the validation).
     Returns ``(derived imported set filtered to the current
     instance file, the print label — empty when nothing was
-    derived)``; raises :class:`PilotConfigError` on a
-    validation / zero-overlap failure. The caller prints the
-    label (the live path prints it; the dry run does not).
+    derived, the provenance — "state" / "checkpoint" / "")``;
+    raises :class:`PilotConfigError` on a validation /
+    zero-overlap failure. The caller prints the label (the live
+    path prints it; the dry run does not).
+
+    The provenance matters (the round-24 Major fix, issue #22,
+    4451121577): a ``checkpoint``-derived set is the checkpoint's
+    OWN seeded lines (marker stripped) — a self-comparison for
+    item 16's faithfulness half (the source lines ARE this run's
+    seeded lines; the fidelity to the true source was verified at
+    seeding time and cannot be re-verified once the state is
+    lost), and it must not be laundered into ``state.
+    import_source`` by the end-of-run write (that would make the
+    self-referential comparison durable on every later resume —
+    the same self-comparison the self-import guard in
+    ``load_imported`` rejects). A ``state``-derived set came
+    from the early import record (the flag path's full source
+    set) and is a legitimate comparison source.
     """
     known = {i["instance_id"] for i in insts}
     imported: dict = {}
@@ -3518,7 +3578,11 @@ def _rederive_import(state: dict, workdir: str, run_id: str,
             "(fail-closed: a zero-overlap re-derivation "
             "would let the record GO with item 16 n/a and "
             "zero AC2 evidence)")
-    return imported, label
+    provenance = ("state" if imported and
+                 isinstance(state.get("import_source"), dict)
+                 and state["import_source"]
+                 else ("checkpoint" if imported else ""))
+    return imported, label, provenance
 
 
 def _check_pilot_b_requirements(config: PilotConfig, state: dict,
@@ -3619,7 +3683,7 @@ def run_pilot(config: PilotConfig,
         dry_state = _load_state(workdir, run_id)
         dry_imported = None
         if (config.resume and not imported):
-            dry_imported, _ = _rederive_import(
+            dry_imported, _, _ = _rederive_import(
                 dry_state, workdir, run_id, insts)
         # the round-19 Minor fix (issue #22, 4450720403): the dry
         # run reproduces the LIVE guard's exact predicate — the
@@ -3767,9 +3831,10 @@ def run_pilot(config: PilotConfig,
     # the visible anomaly the operator resolves by re-invoking the
     # import window (the seeding is idempotent; the state is
     # rewritten).
+    import_provenance = ""
     if (not imported and config.resume):
-        imported, label = _rederive_import(state, workdir, run_id,
-                                          insts)
+        imported, label, import_provenance = _rederive_import(
+            state, workdir, run_id, insts)
         if label:
             print(f"[pilot] import re-derived from "
                   f"{label}")
@@ -4000,9 +4065,21 @@ def run_pilot(config: PilotConfig,
         "imported_run": (config.import_run
                         if config.import_run
                         else state.get("imported_run")),
-        "imported": sorted(imported) or state.get("imported", []),
+        "imported": (sorted(imported)
+                    if import_provenance != "checkpoint"
+                    else []) or state.get("imported", []),
+        # the round-24 Major fix (issue #22, 4451121577): a
+        # checkpoint-derived imported set must NOT be persisted
+        # as import_source — that would make item 16's
+        # self-comparison durable on every later resume (the
+        # same self-referential comparison the self-import
+        # guard rejects); the state stays bookkeeping-less so
+        # the later resumes stay on the checkpoint fallback
+        # (provenance stays "checkpoint")
         "import_source": (imported
-                         or state.get("import_source", {})),
+                         if import_provenance != "checkpoint"
+                         else {})
+                         or state.get("import_source", {}),
         # the round-17 Medium fix (issue #22 AC2): persist the
         # import workdir ABSOLUTE here too (the same contract as
         # the early import record — a relative flag value must
@@ -4100,9 +4177,17 @@ def run_pilot(config: PilotConfig,
             "imported_run": (config.import_run
                             if config.import_run
                             else state.get("imported_run")),
-            "imported": sorted(imported) or state.get("imported", []),
+            "imported": (sorted(imported)
+                        if import_provenance != "checkpoint"
+                        else []) or state.get("imported", []),
+            # the round-24 Major fix (issue #22, 4451121577):
+            # the same no-laundering contract as the end-of-run
+            # write (a checkpoint-derived set must not become
+            # the durable import_source)
             "import_source": (imported
-                             or state.get("import_source", {})),
+                             if import_provenance != "checkpoint"
+                             else {})
+                             or state.get("import_source", {}),
             "import_workdir": (os.path.abspath(
                 config.import_workdir or workdir)
                 if config.import_workdir
@@ -4156,6 +4241,7 @@ def run_pilot(config: PilotConfig,
         import_attempted=(bool(config.import_run)
                          or bool(state.get("imported_run")
                                 or state.get("import_source"))),
+        import_provenance=import_provenance,
         repo_by_iid=_repo_by_iid(insts),
         arithmetic_total=len(insts),
         window_buckets=buckets)
@@ -4165,7 +4251,11 @@ def run_pilot(config: PilotConfig,
     # table
     if config.pilot == "b":
         meta["wp6b"] = _pilot_b_sections(
-            config, insts, records, inst_records, imported, buckets)
+            config, insts, records, inst_records, imported, buckets,
+            import_attempted=(bool(config.import_run)
+                             or bool(state.get("imported_run")
+                                    or state.get("import_source"))),
+            import_provenance=import_provenance)
     with open(os.path.join(workdir, record_name), "w",
               encoding="utf-8", newline="") as f:
         f.write(render_checklist_md(items, config, cal, meta,

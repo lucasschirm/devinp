@@ -2899,13 +2899,18 @@ def test_wp6b_round2_import_rederives_from_checkpoint_after_graceful_exit(
     assert sum(1 for l in lines3 if l["instance_id"] == i0) == 1
     assert sum(1 for l in lines3 if l["instance_id"] == i1) == 1
     # item 16 gates on the completing record (2 imported + 1 new =
-    # 3 unique — not n/a)
+    # 3 unique). The round-24 Major fix (issue #22, 4451121577):
+    # the state was removed, so this is the CHECKPOINT fallback —
+    # the faithfulness half renders its explicit self-derived n/a
+    # (a self-comparison would never fail — the fidelity was
+    # verified at seeding) while the arithmetic half still gates
     gng = (wd2 / "wp6b-pilot-b.md").read_text()
     i16 = [l for l in gng.splitlines()
           if l.startswith("| 16 |")][0]
-    assert "n/a" not in i16, i16
+    assert "faithfulness n/a (self-derived" in i16, i16
     assert "FAIL" not in i16, i16
     assert "2 + 1 = 3" in i16, i16
+    assert i16.rstrip().endswith("| PASS |"), i16
     # the overlap section rendered the per-instance row (i0's line
     # matches the source's — the faithful, non-re-run overlap)
     assert "## 2-run overlap/variance (issue #22 AC2)" in gng
@@ -5113,3 +5118,54 @@ def test_wp6b_round23_dry_run_full_rederivation(tmp_path, live):
                    "--instances", inst,
                    "--workdir", str(wd), "--run-id", "pilotB"])
     assert rc2 == lp.EXIT_CONFIG, rc2
+
+
+def test_wp6b_round24_checkpoint_provenance_not_laundered(
+        tmp_path, live):
+    """The round-24 Major fix (issue #22, 4451121577): the
+    end-of-run state write persisted the checkpoint-derived
+    imported set as import_source, making item 16's
+    self-comparison durable on every later resume (the same
+    self-referential comparison the self-import guard rejects).
+    A checkpoint-provenance run must not launder: the state
+    stays bookkeeping-less (the later resumes stay on the
+    checkpoint fallback — the honest rendering), while a
+    state-provenance (or flag) run persists as before."""
+    repos, inst = _two_pilot_b_repos(tmp_path)
+    i0, i1, i2 = [e["instance_id"] for e in repos]
+    wd = tmp_path / "wd"
+    wd.mkdir()
+    src = tmp_path / "src"
+    src.mkdir()
+    modes = {i0: "no_patch", i1: "no_patch", i2: "ok"}
+    cfg1 = _cfg(tmp_path, inst, run_id="src", workdir=str(src),
+               host_check=False)
+    assert _run(cfg1, _mock_make_session(modes)) == lp.EXIT_OK
+    cfg2 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
+               resume=True, host_check=False, pilot="b",
+               import_run="src", import_workdir=str(src))
+    assert _run(cfg2, _mock_make_session(modes)) == lp.EXIT_OK
+    # the state is removed (a pre-seed process death) — the next
+    # resume is the pure checkpoint fallback
+    (wd / "pilot-pilotB.state.json").unlink()
+    cfg3 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
+               resume=True, host_check=False, pilot="b")
+    assert _run(cfg3, _mock_make_session(
+        {r["instance_id"]: "ok" for r in repos})) == lp.EXIT_OK
+    st = json.loads((wd / "pilot-pilotB.state.json").read_text())
+    # NO laundering: the checkpoint-derived set did not become
+    # the durable import_source / imported set
+    assert not st.get("import_source"), st
+    assert not st.get("imported"), st
+    # the next resume: still the checkpoint fallback (the
+    # bookkeeping-less state) — the record renders the honest
+    # self-derived n/a, not a vacuous PASS from a self-comparison
+    cfg4 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
+               resume=True, host_check=False, pilot="b")
+    assert _run(cfg4, _mock_make_session(
+        {r["instance_id"]: "ok" for r in repos})) == lp.EXIT_OK
+    gng = (wd / "wp6b-pilot-b.md").read_text()
+    i16 = [l for l in gng.splitlines()
+          if l.startswith("| 16 |")][0]
+    assert "faithfulness n/a (self-derived" in i16, i16
+    assert "FAIL" not in i16, i16
