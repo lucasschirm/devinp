@@ -1,6 +1,6 @@
 import {spawn} from 'node:child_process'
-import {open, readFile, unlink} from 'node:fs/promises'
-import {tmpdir} from 'node:os'
+import {mkdir, open, readFile, unlink} from 'node:fs/promises'
+import {homedir, tmpdir} from 'node:os'
 import {join} from 'node:path'
 
 import {recoverTruncatedJson} from './repair-json.js'
@@ -44,11 +44,21 @@ const DETACHED_SPAWN = {detached: true, windowsHide: true}
  * the previous attempt produced nothing usable, and progressively strip
  * the interactive terminal away from `devin`: first the conventions that
  * disable paging/colour, then the controlling terminal itself.
+ *
+ * A pipe comes first: it needs no scratch file, so an unwritable or
+ * sandboxed `TMPDIR` cannot break the lookup (it used to, and cost two
+ * extra `devin` runs before a later strategy rescued it). Measured
+ * against the real CLI, a piped capture is byte-identical to a file
+ * capture — 471 855 bytes, 46 families — so the old "pipes truncate"
+ * worry does not apply here; the file strategy stays as the fallback for
+ * a CLI that really will not write to a pipe. (For anyone probing this at
+ * home: libuv wires `stdio: 'pipe'` with a **socketpair**, so the child's
+ * stdout is neither a tty nor a pipe — `[ -p /dev/stdout ]` is false.)
  */
 const STRATEGIES = [
-  {label: 'temp file', file: true, env: null},
-  {label: 'temp file, paging disabled, no controlling terminal', file: true, env: NON_INTERACTIVE_ENV, detached: true},
+  {label: 'pipe', file: false, env: null},
   {label: 'pipe, paging disabled, no controlling terminal', file: false, env: NON_INTERACTIVE_ENV, detached: true},
+  {label: 'temp file, paging disabled, no controlling terminal', file: true, env: NON_INTERACTIVE_ENV, detached: true},
 ]
 
 // CSI colour/cursor sequences plus OSC hyperlinks — some wrappers dress
@@ -110,6 +120,10 @@ function spawnDevin({command, env, stdout, timeoutMs, detached = false}) {
       stderr += chunk
     })
     child.on('error', (error) => {
+      // Tag spawn failures: ENOENT from here means "no devin binary", while
+      // the same code raised by the scratch-file path means "cannot write
+      // there" — the two need different advice.
+      error.devinSpawn = true
       clearTimeout(timer)
       reject(error)
     })
@@ -121,17 +135,56 @@ function spawnDevin({command, env, stdout, timeoutMs, detached = false}) {
 }
 
 /**
- * Run `devin models list --format json` with stdout wired to a temp file
- * in `os.tmpdir()`.
+ * First directory we can actually write a scratch file in.
  *
- * `devin` is an interactive CLI: captured over a pipe, its JSON stream
- * can be truncated mid-write, so the preferred capture target is a real
- * file (a file write persists in full). The temp file is always removed
- * in `finally`, on the success and failure paths alike.
+ * `TMPDIR` is often not a good bet: read-only in sandboxes, redirected to
+ * OneDrive or a roaming profile on Windows, missing entirely. Candidates:
+ * `DEVINP_TMP`, `os.tmpdir()`, `~/.devinp`, then the current directory.
+ * null means no scratch file is possible. Not cached: a caller (or a test)
+ * may fix TMPDIR between attempts.
+ */
+async function writableScratchDir() {
+  const candidates = []
+  if (process.env.DEVINP_TMP) candidates.push(process.env.DEVINP_TMP)
+  candidates.push(tmpdir(), join(homedir(), '.devinp'), process.cwd())
+  for (const dir of candidates) {
+    try {
+      await mkdir(dir, {recursive: true})
+      const probe = join(dir, `.devinp-probe-${process.pid}`)
+      const handle = await open(probe, 'w')
+      await handle.close()
+      await unlink(probe)
+      return dir
+    } catch {
+      // try the next candidate
+    }
+  }
+  return null
+}
+
+/**
+ * Run `devin models list --format json` with stdout wired to a scratch
+ * file the child inherits as an fd (a file write persists in full, which
+ * is what a pipe cannot promise on every platform). The file is always
+ * removed in `finally`, on the success and failure paths alike, and a
+ * directory that refuses the write is reported with its path.
  */
 async function captureToFile({command, env, timeoutMs, detached}) {
-  const file = join(tmpdir(), `devinp-models-${process.pid}-${Date.now()}.json`)
-  const handle = await open(file, 'w')
+  const dir = await writableScratchDir()
+  if (!dir) {
+    const error = new Error(`cannot write a scratch file — DEVINP_TMP, os.tmpdir() ("${tmpdir()}"), ~/.devinp and "${process.cwd()}" all refused`)
+    error.scratchPath = dir
+    throw error
+  }
+  const file = join(dir, `devinp-models-${process.pid}-${Date.now()}.json`)
+  let handle
+  try {
+    handle = await open(file, 'w')
+  } catch (error) {
+    error.message = `cannot write scratch file "${file}" (${error.code ?? error.message})`
+    error.scratchPath = file
+    throw error
+  }
   try {
     const result = await spawnDevin({command, env, stdout: handle.fd, timeoutMs, detached})
     // A killed run still leaves whatever it managed to write, which is
@@ -166,7 +219,9 @@ export async function runDevinJson({command = 'devin', timeoutMs = DEVIN_TIMEOUT
         ? await captureToFile({command, env: strategy.env, timeoutMs, detached: strategy.detached})
         : await spawnDevin({command, env: strategy.env, stdout: 'pipe', timeoutMs, detached: strategy.detached})
     } catch (error) {
-      if (error.code === 'ENOENT') throw error
+      // Only a missing executable is fatal; a scratch-directory problem is
+      // just one more failed attempt, recorded with its reason.
+      if (error.code === 'ENOENT' && error.devinSpawn) throw error
       attempts.push({label: strategy.label, bytes: 0, code: null, stderr: '', timedOut: false, note: error.message})
       continue
     }
@@ -180,7 +235,7 @@ export async function runDevinJson({command = 'devin', timeoutMs = DEVIN_TIMEOUT
       timedOut: result.timedOut,
       raw,
     })
-    if (parsed != null) return {raw, parsed, attempts, timeoutMs}
+    if (parsed != null) return {raw, parsed, attempts, timeoutMs, via: strategy.label}
     // A non-zero exit that came with an explanation on the very first try
     // is a real CLI failure (not signed in, network down), not a capture
     // problem — say so instead of retrying. Later attempts only run
@@ -194,8 +249,8 @@ export async function runDevinJson({command = 'devin', timeoutMs = DEVIN_TIMEOUT
   if (explained && attempts.every((a) => a.timedOut || a.code !== 0)) {
     throw new Error(`\`devin models list\` failed — ${explained.stderr}`)
   }
-  const longest = attempts.reduce((acc, a) => ((a.raw?.length ?? 0) > acc.length ? a.raw : acc), '')
-  return {raw: longest || '', parsed: null, attempts, timeoutMs}
+  const longest = attempts.reduce((acc, a) => ((a.raw?.length ?? 0) >= acc.length ? a.raw : acc), '')
+  return {raw: longest || '', parsed: null, attempts, timeoutMs, via: null}
 }
 
 /**
@@ -258,6 +313,9 @@ function describeFailure(attempts, timeoutMs) {
     )
   }
   lines.push(`Tried: ${attempts.map((a) => describeAttempt(a, timeoutMs)).join('; ')}.`)
+  if (attempts.some((a) => a.note?.includes('scratch'))) {
+    lines.push('devinp could not write its scratch file — point it somewhere writable with `DEVINP_TMP=/tmp devinp`.')
+  }
   lines.push('Capture the JSON yourself and hand it to devinp — piping or redirecting makes `devin` write the whole document in one go:')
   lines.push('  devin models list --format json > models.json && devinp --source models.json')
   lines.push('  devin models list --format json | devinp --source=-')
@@ -275,9 +333,10 @@ async function readStdin() {
  * Load raw model data ({families: [...]}) either from a saved JSON
  * snapshot (`--source <path>`, or `--source=-` to read it from stdin) or
  * by running `devin models list --format json`. Throws a user-friendly
- * error when prices cannot be obtained. Returns {data, truncated, retries} —
- * `truncated` is true when the devin output was cut off mid-stream and the
- * document was repaired, `retries` is how many extra `devin` runs it took.
+ * error when prices cannot be obtained. Returns {data, truncated, retries,
+ * via} — `truncated` is true when the devin output was cut off mid-stream
+ * and the document was repaired, `retries` is how many extra `devin` runs
+ * it took, `via` names the capture strategy that finally worked.
  */
 export async function loadModelData({
   source,
@@ -294,7 +353,7 @@ export async function loadModelData({
       throw new Error(`Unable to get model prices: cannot read ${source === '-' ? 'stdin' : `source file "${source}"`} (${error.code ?? error.message})`)
     }
     try {
-      return {data: assertFamilies(JSON.parse(raw), label), retries: 0}
+      return {data: assertFamilies(JSON.parse(raw), label), retries: 0, via: source === '-' ? 'stdin' : 'file'}
     } catch (error) {
       if (error.message.startsWith('Unable to get model prices')) throw error
       throw new Error(`Unable to get model prices: ${label} is not valid JSON (expected \`devin models list --format json\` output)`)
@@ -305,21 +364,21 @@ export async function loadModelData({
   try {
     outcome = await runDevinJson({command, timeoutMs})
   } catch (error) {
-    if (error.code === 'ENOENT') {
+    if (error.code === 'ENOENT' && error.devinSpawn) {
       throw new Error('Unable to get model prices: `devin` CLI not found in PATH. Install it, or pass --source <file> / --source=- to supply the JSON yourself.')
     }
     throw new Error(`Unable to get model prices: ${error.message}`)
   }
 
   if (outcome.parsed != null) {
-    // `retries` lets the CLI be honest about a machine that needed the
-    // hardening — surprising output is easier to trust when it is named.
-    return {data: assertFamilies(outcome.parsed, 'devin models list'), retries: outcome.attempts.length - 1}
+    // `retries` and `via` let the CLI be honest about a machine that needed
+    // the hardening — surprising output is easier to trust when it is named.
+    return {data: assertFamilies(outcome.parsed, 'devin models list'), retries: outcome.attempts.length - 1, via: outcome.via}
   }
 
   const recovered = recoverTruncatedJson(outcome.raw)
   if (recovered != null) {
-    return {data: assertFamilies(recovered, 'devin models list (recovered)'), truncated: true, retries: outcome.attempts.length - 1}
+    return {data: assertFamilies(recovered, 'devin models list (recovered)'), truncated: true, retries: outcome.attempts.length - 1, via: outcome.via ?? 'repaired'}
   }
 
   throw new Error(describeFailure(outcome.attempts, outcome.timeoutMs))

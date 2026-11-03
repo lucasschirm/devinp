@@ -66,7 +66,9 @@ export default class Devinp extends Command {
         this.warn('devin output was truncated mid-stream — showing partial data, re-run for the full list')
       }
       if (loaded.retries > 0) {
-        this.warn(`devin needed ${loaded.retries + 1} attempts to hand over the model list — something on this machine (pager, paged "show more" view, wrapper) interferes with \`devin models list\``)
+        // Naming the capture that worked keeps an unwritable TMPDIR from
+        // looking like a pager, and vice versa.
+        this.warn(`devin needed ${loaded.retries + 1} attempts to hand over the model list — the data arrived via ${loaded.via ?? 'a fallback'} (something on this machine interferes with \`devin models list\`; DEVINP_TMP sets the scratch directory)`)
       }
       data = loaded.data
     } catch (error) {
