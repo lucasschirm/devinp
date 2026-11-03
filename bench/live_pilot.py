@@ -1,4 +1,7 @@
-"""WP6a (issue #21) — the ``BENCH_LIVE=1`` Pilot-A smoke harness.
+"""WP6a (issue #21) / WP6b (issue #22) — the ``BENCH_LIVE=1``
+pilot smoke harness (Pilot A: 3 real instances; Pilot B: the 25
+stratified instances across all 12 repos, reusing Pilot A via the
+checkpoint import).
 
 Runs **3 small-repo SWE-bench Verified instances sequentially** through
 the full WP1–WP5 stack (``AcpSession`` + ``SwebenchPolicy``, the WP3
@@ -35,13 +38,45 @@ budget math, checklist skeleton, no devin spawn.
   over the pinned ``FAIL_TO_PASS`` / ``PASS_TO_PASS`` ids; the
   repo-specific ``log_parser``s are image-leg-only).
 
-**Intentional interrupt (issue #21 AC3).** ``--interrupt-after N``: after
-the N-th instance's checkpoint line is flushed, the session factory for
-the next instance raises :class:`IntentionalInterrupt` (a host-crash-class
-abort — the remaining instances have **no** checkpoint line; the WP3b
-resume class). The follow-up ``--resume`` invocation goes through
+**Intentional interrupt (issue #21 AC3 / issue #22 AC4).**
+``--interrupt-after N``: after the N-th instance's checkpoint line is
+flushed, the session factory for the next instance raises
+:class:`IntentionalInterrupt` (a host-crash-class abort — the
+remaining instances have **no** checkpoint line; the WP3b resume
+class). The follow-up ``--resume`` invocation goes through
 ``resume_queue``: finished instances are **skipped** (never re-run, no
-session spent on them), the rest run. Exit code 42 marks the interrupt.
+session spent on them), the rest run. Exit code 42 marks the
+interrupt.
+
+**Pilot B (issue #22).** ``--pilot b`` selects the pilot-B record
+(naming, the 17-item checklist, the record sections) over a 25-
+instance, 12-repo stratified file (``pilot_b_instances.json``). The
+3 Pilot A instances are **reused inside** the 25 through the
+checkpoint **import**: ``--import-run <run-id>`` [+ ``--import-
+workdir <path>``] reads the source run's ``run-<id>.jsonl`` and, per
+shared instance, the **never-rerun** statuses (``resolved`` /
+``failed_test`` / ``timeout`` / ``no_patch`` / ``agent_error``) are
+imported — the line is copied into this run's checkpoint **with its
+original ``ts``** (the source window — it never counts toward this
+run's daily budget) + ``meta.imported_from``, and the instance is
+skipped (never re-run, no session spent); the **retry-class**
+statuses (``quota_limited`` / ``eval_error`` / ``preflight_failed``)
+are **not** imported — the instance runs (the only pass@1 retry
+class, PLAN §2.5). The import is fail-closed (a missing / corrupt
+source is a config error before the pre-flight) and idempotent (a
+repeat ``--resume`` never re-seeds). Checklist item 16 (gating) is
+the 2-run overlap/variance check: for each imported instance the
+source line and this run's final line must agree on status / session
+wall / total tokens / patch bytes (the import is faithful **and**
+the reused instance was not re-run) + the session arithmetic
+(imported + new == unique). Item 15 (gating) is the stratification
+(every repo in the instance file's ``stratified_repos`` meta has a
+final line); item 17 (gating) is the root-caused ``eval_error``
+(every ``eval_error`` line carries ``meta.eval_error_root_cause`` ∈
+{``env``, ``parser``, ``patch``} — the mapping is in
+PLAN-WP6B.md). Item 12 gates **per window** (the checkpoint lines
+bucketed by their ``ts``'s UTC day — a multi-window run never fails
+by construction; a single-window run renders the verbatim WP6a text).
 
 **Exit codes:** 0 = complete (incl. a finished resume) · 2 = config
 error · 3 = ``BENCH_LIVE`` refused · 4 = pre-flight / runner / other
@@ -52,6 +87,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import shutil
@@ -60,6 +96,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -88,7 +125,19 @@ DEFAULT_LARGEST_CHECKOUT_BYTES = 1 * 10**9
 #: PLAN §4 patch guard: the size cap.
 PATCH_SIZE_CAP_BYTES = 1024 * 1024
 DEFAULT_INSTANCES_FILE = str(_BENCH_DIR / "pilot_instances.json")
+DEFAULT_B_INSTANCES_FILE = str(_BENCH_DIR / "pilot_b_instances.json")
 BUDGET_FILE = str(_BENCH_DIR / "live_pilot_budget.json")
+#: The go/no-go record names per pilot kind (the early-exit invariant
+#: removes BOTH — a stale verdict from a previous kind in the same
+#: workdir is never kept).
+RECORD_NAMES = {"a": "wp6a-go-no-go.md", "b": "wp6b-pilot-b.md"}
+# The ``--import-run`` id is interpolated into ``run-<id>.jsonl`` —
+# the same charset contract as the SWE-bench instance id (the WP5
+# ``_IID_CHARSET`` / container-name charset, no ``..``): a run id
+# outside it could point the import outside the workdir (path
+# traversal) — the codebase charset-restricts ids for exactly this
+# reason.
+_RUN_ID_CHARSET = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 EXIT_OK = 0
 EXIT_CONFIG = 2
@@ -185,7 +234,15 @@ class IntentionalInterrupt(PilotError):
 
 
 class _HostCheckInfra(Exception):
-    """A host-check infrastructure failure (the ``eval_error`` class)."""
+    """A host-check infrastructure failure (the ``eval_error``
+    class). Carries the AC3 root-cause class (issue #22):
+    ``env`` (the default — the host / venv / install leg), ``patch``
+    (the model patch does not apply), or ``parser`` (the test run
+    happened but no parseable results came back)."""
+
+    def __init__(self, msg: str, root_cause: str = "env") -> None:
+        super().__init__(msg)
+        self.root_cause = root_cause
 
 
 # ---------------------------------------------------------------------------
@@ -208,11 +265,66 @@ class PilotConfig:
     resume: bool = False
     dry_run: bool = False
     host_check: Optional[bool] = None  # None -> the mode default (sandbox: on)
+    pilot: str = "a"  # "a" (the WP6a 3-instance gate) | "b" (issue #22)
+    import_run: Optional[str] = None  # the source run id (issue #22 AC2)
+    import_workdir: Optional[str] = None  # its workdir (default: this run's)
 
     def __post_init__(self) -> None:
         if self.mode not in ("container", "sandbox"):
             raise PilotConfigError(
                 f"mode must be 'container' or 'sandbox' (got {self.mode!r})")
+        if self.pilot not in ("a", "b"):
+            raise PilotConfigError(
+                f"pilot must be 'a' or 'b' (got {self.pilot!r})")
+        if self.import_run is not None and not isinstance(
+                self.import_run, str):
+            raise PilotConfigError(
+                f"import_run must be a string (got "
+                f"{type(self.import_run).__name__})")
+        if self.import_workdir is not None and not isinstance(
+                self.import_workdir, str):
+            raise PilotConfigError(
+                f"import_workdir must be a string (got "
+                f"{type(self.import_workdir).__name__})")
+        if self.import_run is not None:
+            if (".." in self.import_run
+                    or _RUN_ID_CHARSET.fullmatch(self.import_run)
+                    is None):
+                raise PilotConfigError(
+                    "--import-run must be a run id of the SWE-bench "
+                    "id charset [A-Za-z0-9][A-Za-z0-9._-]* without "
+                    f"'..' (got {self.import_run!r})")
+        if self.run_id is not None and not isinstance(
+                self.run_id, str):
+            raise PilotConfigError(
+                f"run_id must be a string (got "
+                f"{type(self.run_id).__name__})")
+        # the run id (the --run-id flag) is joined into the checkpoint
+        # / state filenames (run-<id>.jsonl / pilot-<id>.state.json)
+        # and reaches ev.evaluate (a non-conforming id would degrade
+        # to a per-instance eval_error instead of a fail-closed
+        # config error) — the same charset as --import-run
+        if self.run_id is not None:
+            if (".." in self.run_id
+                    or _RUN_ID_CHARSET.fullmatch(self.run_id)
+                    is None):
+                raise PilotConfigError(
+                    "--run-id must be a run id of the SWE-bench id "
+                    "charset [A-Za-z0-9][A-Za-z0-9._-]* without "
+                    f"'..' (got {self.run_id!r})")
+        # the pairing (fail-closed): --import-workdir is meaningless
+        # without --import-run; --import-run is the pilot-B import
+        # (checklist items 15–17 verify it — they never render
+        # under --pilot a, where a seeded import would go
+        # unverified)
+        if (self.import_workdir is not None
+                and self.import_run is None):
+            raise PilotConfigError(
+                "--import-workdir requires --import-run")
+        if (self.import_run is not None and self.pilot != "b"):
+            raise PilotConfigError(
+                "--import-run is the pilot-B import (items 15–17 "
+                "verify it — they do not render under --pilot a)")
         # ``--host-check`` is a sandbox-mode flag (the documented no-
         # container fallback) — in container mode the eval leg is the
         # official WP4 harness, and the flag would be accepted but
@@ -344,6 +456,465 @@ def load_instances(path: str) -> list:
 
 def prompt_for(inst: dict) -> str:
     return PROMPT_TEMPLATE.format(problem_statement=inst["problem_statement"])
+
+
+def load_instances_meta(path: str) -> dict:
+    """The instance file's ``_meta`` (the WP6b ``stratified_repos``
+    provenance; ``{}`` for a bare list / a meta-less file)."""
+    data = _load_json_file(path)
+    if isinstance(data, dict):
+        meta = data.get("_meta")
+        return meta if isinstance(meta, dict) else {}
+    return {}
+
+
+def _validate_imported_line(rec: dict, iid: str,
+                           origin: str) -> None:
+    """The fail-closed reference validation shared by the
+    ``--import-run`` path (:func:`load_imported`) and the
+    state / checkpoint re-derivation (the round-20 Medium fix,
+    issue #22, 4450828209): the re-derivation rebuilds
+    ``imported`` from our own state / checkpoint lines and
+    bypasses ``load_imported`` — a checkpoint line carrying
+    ``meta.imported_from`` plus a ``..`` / absolute
+    ``artifacts_dir`` would otherwise reach
+    ``_copy_imported_artifacts`` (the value joins into the
+    copy's destination paths — a write outside the workdir),
+    while the identical value is a fail-closed config error on
+    the ``--import-run`` path. The WP5 ``_parse_ts`` contract
+    (the round-8 Medium fix) is re-checked too (a re-derived
+    line is written back by the seeding; a non-conforming ts
+    would wedge every later ``--resume`` in ``report_failed``).
+    ``origin`` is the error-message label (the source-line vs.
+    the re-derivation phrasing).
+    """
+    # the round-21 Medium fix (issue #22, 4450889550): the
+    # helper must reproduce the FULL load_imported contract it
+    # mirrors — a non-dict ``meta`` is REJECTED as a corrupt
+    # line (the round-7 contract on the --import-run path; the
+    # _meta_of normalization the first draft used would have
+    # silently accepted it), and a non-terminal ``status`` is
+    # rejected too (load_imported fail-closes on an unknown
+    # status; a seeded non-terminal status would poison the
+    # checkpoint — every later load_checkpoint raises
+    # RunnerProtocolError, a permanent resume wedge)
+    meta = rec.get("meta")
+    if meta is not None and not isinstance(meta, dict):
+        raise PilotConfigError(
+            f"{origin} for {iid!r} carries a non-dict meta "
+            f"({type(meta).__name__}) — a corrupt line "
+            f"(fail-closed before any session; the seeding "
+            f"would crash or seed a meta the WP5 report "
+            f"rejects)")
+    if meta is None:
+        meta = {}
+    status = rec.get("status")
+    if status not in rr.TERMINAL_STATUSES:
+        raise PilotConfigError(
+            f"{origin} for {iid!r} carries a non-terminal "
+            f"status ({status!r}) — a corrupt line (fail-closed "
+            f"before any session; a seeded non-terminal status "
+            f"would wedge every later load_checkpoint in "
+            f"RunnerProtocolError)")
+    if "ts" not in rec:
+        # the round-22 Minor fix (issue #22, 4450983658): an
+        # ABSENT ts is rejected too (the first draft only
+        # checked a present ts — an absent one skipped the
+        # check and the seeding stamped it with time.time():
+        # silently re-stamped into this run's window — and
+        # the WP5 date range — instead of preserving the
+        # source ts the import contract promises). The source
+        # line's ts is its timestamp; a line without one is
+        # corrupt for the import (fail-closed; the WP3 runner
+        # always writes a ts, so a missing one is an
+        # anomalous / hand-crafted line)
+        raise PilotConfigError(
+            f"{origin} for {iid!r} carries no ts — the import "
+            f"preserves the source timestamp (a seed without "
+            f"one would be re-stamped into this run's window "
+            f"— and the WP5 date range — instead); fail-closed")
+    ts = rec.get("ts")
+    if (ts is None
+            or isinstance(ts, bool)
+            or not isinstance(ts, (int, float))
+            or not math.isfinite(ts) or ts <= 0):
+        raise PilotConfigError(
+            f"{origin} for {iid!r} carries a ts the WP5 "
+            f"_parse_ts contract rejects ({ts!r}) — fail-closed "
+            f"(a seeded non-finite / non-positive / bool / null "
+            f"ts would wedge every later --resume in "
+            f"report_failed)")
+    # the round-25 Minor fix (issue #22, 4451208198): a FINITE
+    # but out-of-range ts (e.g. 1e18) passes the _parse_ts
+    # contract but crashes the WP5 date_range consumer's
+    # datetime.fromtimestamp (OSError / ValueError) — such a
+    # line would seed durably and crash rep.generate with an
+    # error outside the ReportError handler on every later
+    # --resume (the permanent-wedge class this guard exists to
+    # close). Range-check with the consumer's own function:
+    # whatever fromtimestamp accepts is the contract
+    try:
+        datetime.fromtimestamp(ts)
+    except (OSError, ValueError, OverflowError):
+        raise PilotConfigError(
+            f"{origin} for {iid!r} carries a ts outside the "
+            f"datetime.fromtimestamp range ({ts!r}) — fail-closed "
+            f"(a seeded out-of-range ts would crash the WP5 "
+            f"date_range on every later --resume)")
+    for k in ("artifacts_dir", "patch_diff", "trajectory",
+              "eval_log"):
+        v = meta.get(k)
+        if v is not None and not (isinstance(v, str) and v):
+            raise PilotConfigError(
+                f"{origin} for {iid!r} carries a {k} the WP5 "
+                f"_ref_path contract rejects ({v!r}) — fail-closed "
+                f"(a seeded non-string reference would wedge every "
+                f"later --resume in report_failed)")
+        if isinstance(v, str) and v and (
+                os.path.isabs(v) or ".." in v.split("/")):
+            raise PilotConfigError(
+                f"{origin} for {iid!r} carries a {k} with a "
+                f"path traversal or an absolute reference "
+                f"({v!r}) — fail-closed: the value joins into "
+                f"the artifact copy's paths (a '../../x' "
+                f"reference would write outside this run's "
+                f"workdir)")
+
+
+def load_imported(config: PilotConfig, workdir: str,
+                  insts: list) -> "tuple[dict, dict]":
+    """The WP6b checkpoint import (issue #22 AC2 — the 2-run overlap
+    reuse). Reads the source run's checkpoint, dedupes (last line per
+    instance, the WP3 contract), and classifies each shared instance:
+
+    * a **never-rerun** status → ``imported[iid]`` = the source line
+      (it is seeded into this run's checkpoint with its original
+      ``ts`` + ``meta.imported_from`` and skipped by ``resume_queue``
+      — never re-run, no session spent);
+    * a **retry-class** status → ``retry_class[iid]`` = the status
+      (NOT imported — the instance runs in this run, the only
+      pass@1 retry class, PLAN §2.5);
+    * a source line whose ``instance_id`` is not in the current
+      file → ignored (stale).
+
+    Fail-closed: a missing source file, or a corrupt one, is a
+    ``PilotConfigError`` (exit 2) — the validation happens before the
+    pre-flight, so no session is ever spent against an import that
+    did not validate.
+    """
+    src = os.path.join(config.import_workdir or workdir,
+                      f"run-{config.import_run}.jsonl")
+    # fail-closed: a SELF-IMPORT is rejected — with the default
+    # import-workdir (this run's workdir) and --import-run equal to
+    # this run's id, the source IS this run's own checkpoint: a
+    # later-window --resume would re-derive ``imported`` from the
+    # run's own seeded lines, overwrite ``state.import_source`` /
+    # ``imported_run``, and item 16 would pass on a self-comparison
+    # (the real 2-run overlap evidence clobbered)
+    if (config.import_run == config.run_id
+            and (config.import_workdir is None
+                 or os.path.realpath(config.import_workdir)
+                 == os.path.realpath(workdir))):
+        raise PilotConfigError(
+            f"--import-run {config.import_run!r} is this run's own "
+            "run id with this run's workdir — a self-import is "
+            "rejected (it would re-derive the import from the run's "
+            "own seeded lines; item 16 would pass on a "
+            "self-comparison)")
+    if not os.path.isfile(src):
+        raise PilotConfigError(
+            f"--import-run source not found: {src!r} (the import is "
+            "fail-closed — a missing / corrupt source is a config "
+            "error before the pre-flight)")
+    try:
+        src_records, _ = rr.load_checkpoint(src)
+    except rr.RunnerProtocolError as exc:
+        raise PilotConfigError(
+            f"--import-run source {src!r} is corrupt: {exc}") from exc
+    try:
+        finals, _ = rep.dedupe([r for r in src_records
+                              if isinstance(r, dict)])
+    except rep.ReportProtocolError as exc:
+        # a charset-invalid instance_id in the source (the WP5
+        # dedupe is fail-loud on it) is a corrupt source — the
+        # documented exit-2 config error, not an exit-4 run failure
+        raise PilotConfigError(
+            f"--import-run source {src!r} is corrupt: {exc}") from exc
+    known = {i["instance_id"] for i in insts}
+    imported: dict = {}
+    retry_class: dict = {}
+    for iid, rec in finals.items():
+        if iid not in known:
+            continue  # stale — not in this run's instance file
+        # the fail-closed source-line validation (the round-7
+        # Medium fix, issue #22): a non-dict ``meta`` (or a
+        # non-numeric ``ts``) passes the load_checkpoint / dedupe
+        # validation (they only check instance_id / status) and
+        # would crash the seeding loop MID-SEED (exit 4) instead
+        # of the documented fail-closed config error (exit 2,
+        # before any session) — and the persisted early import
+        # record would make every later --resume hit the same
+        # crash. Validate here, before any session.
+        meta = rec.get("meta")
+        if meta is not None and not isinstance(meta, dict):
+            raise PilotConfigError(
+                f"--import-run source line for {iid!r} carries a "
+                f"non-dict meta ({type(meta).__name__}) — a "
+                "corrupt source (fail-closed before any session)")
+        # the round-12 Major fix (issue #22 AC2): a missing / null
+        # meta is schema-conformant (all references absent) —
+        # normalize it to {} for the guards below. The old code let
+        # None reach the _ref_path schema loop — meta.get(k)
+        # crashed with an uncaught AttributeError that escaped
+        # run_pilot to main's generic handler (exit 4),
+        # contradicting this function's documented fail-closed
+        # contract (a corrupt source is a config error, exit 2,
+        # before any session) — and every --resume re-invoked
+        # load_imported and re-hit the same crash, the exact wedge
+        # class the meta / ts / ref guards were added to close
+        if meta is None:
+            meta = {}
+        # the round-20 Medium fix (issue #22): the ts / reference
+        # schema / traversal validation is the SHARED helper
+        # (also applied to the state / checkpoint re-derivation —
+        # the identical fail-closed contract on both import
+        # paths)
+        _validate_imported_line(
+            rec, iid, "--import-run source line")
+        # the SOURCE-ARTIFACT LAYOUT normalization (the round-11
+        # Blocker fix, issue #22 AC2): the pre-commit Pilot-A run
+        # (2026-10-28 20:46–20:56 UTC — before commit 4259460)
+        # wrote ``meta.artifacts_dir = <iid>`` while its artifacts
+        # lived under ``runs/<iid>/`` — the import resolution
+        # (``<src>/<iid>/...``) finds nothing, the copy no-ops,
+        # and the seeded durable lines reference paths that can
+        # NEVER exist: the completing invocation's ``rep.generate``
+        # raises ArtifactCheckError (report_failed, exit 4) and
+        # every --resume re-hits the same wedge (the self-heal
+        # can never find the sources — the AC2 claim "the
+        # referenced artifacts are copied so this run's WP5
+        # cross-check holds" was false on the real pair). The
+        # normalization: if the line's references resolve MISSING
+        # under its own (relative) artifacts_dir but ALL exist
+        # under ``runs/<artifacts_dir>/`` in the source workdir
+        # (the current harness' ``_artifact_dir`` layout), rewrite
+        # the imported line's meta to the current layout. Item 16's
+        # faithfulness is unaffected (it reads status / wall /
+        # tokens / patch_bytes from the meta — all preserved).
+        refs = [meta.get(k) for k in ("patch_diff", "trajectory",
+                                     "eval_log")
+                if isinstance(meta.get(k), str) and meta.get(k)
+                and not os.path.isabs(meta.get(k))]
+        ad = meta.get("artifacts_dir")
+        if (isinstance(ad, str) and ad and not os.path.isabs(ad)
+                and refs):
+            base = os.path.join(os.path.dirname(src) or ".", ad)
+            if any(not os.path.isfile(os.path.join(base, r))
+                   for r in refs):
+                alt_base = os.path.join(
+                    os.path.dirname(src) or ".", "runs", ad)
+                if all(os.path.isfile(os.path.join(alt_base, r))
+                       for r in refs):
+                    meta["artifacts_dir"] = "runs/" + ad
+        status = rec.get("status")
+        if status in rr.NEVER_RERUN_STATUSES:
+            imported[iid] = rec
+        elif status in rr.RETRY_STATUSES:
+            retry_class[iid] = status
+        else:
+            # a non-terminal status on a source line (impossible after
+            # the load_checkpoint validation, but fail loud anyway)
+            raise PilotConfigError(
+                f"--import-run source line for {iid!r} carries "
+                f"unknown status {status!r}")
+    # the zero-overlap fail-closed guard (the round-12 Medium fix,
+    # issue #22 AC2): a --import-run source that shares NO instance
+    # ids with this run's instance file (an existing but unrelated
+    # run id — it passes every other fail-closed check: the source
+    # exists, is readable, well-formed) previously produced an empty
+    # import: item 16 rendered n/a (non-gating) and the verdict-
+    # bearing record could GO with zero AC2 overlap evidence, with
+    # nothing in the record distinguishing it from a legitimate
+    # non-import run. Fail-closed: a config error before any
+    # session (a source / instance mismatch is an operator error —
+    # the wrong --import-run or the wrong --instances)
+    if (config.import_run and not imported
+            and not retry_class):
+        raise PilotConfigError(
+            f"--import-run {config.import_run!r} shared no "
+            "instance ids with this run's instance file — a "
+            "source / instance mismatch (fail-closed: a "
+            "zero-overlap import has no AC2 evidence and would "
+            "let the record GO with item 16 n/a)")
+    return imported, retry_class
+
+
+def _copy_imported_artifacts(rec: dict, src_workdir: str,
+                             dst_workdir: str) -> None:
+    """The imported line's referenced artifacts (the WP5 reference
+    contract: ``patch_diff`` / ``trajectory`` / ``eval_log`` resolve
+    against ``artifacts_dir`` → the run JSONL's directory) are copied
+    from the source run's workdir into this run's — the imported
+    line is part of THIS run's record, and the WP5 cross-check
+    (``report.crosscheck``) resolves every reference against the JSONL's
+    own directory: a ``resolved`` / ``failed_test`` final must
+    reference an existing ``patch.diff`` *here* (the leaderboard
+    artifact's ``all_preds.jsonl`` patch content is cross-checked
+    against this run's copy). A source file that is missing is left
+    as-is (the cross-check flags it — fail loud, the WP5
+    semantics)."""
+    meta = rec.get("meta") or {}
+    ad = meta.get("artifacts_dir")
+    if isinstance(ad, str) and ad:
+        src_base = (ad if os.path.isabs(ad)
+                    else os.path.join(src_workdir, ad))
+        dst_base = (ad if os.path.isabs(ad)
+                    else os.path.join(dst_workdir, ad))
+    else:
+        # the WP5 ``_ref_path`` contract: a reference without an
+        # ``artifacts_dir`` resolves against the run JSONL's
+        # directory (the workdir) — the copy must land there too
+        # (a None base would make the same-path guard a trivial
+        # no-op and the artifact would never be copied — the
+        # cross-check then reports it missing at report time)
+        src_base, dst_base = src_workdir, dst_workdir
+    for key in ("patch_diff", "trajectory", "eval_log"):
+        val = meta.get(key)
+        if not isinstance(val, str) or not val:
+            continue
+        if os.path.isabs(val):
+            continue  # an absolute reference is not a workdir-relative
+            # artifact — not an import-time concern
+        src = os.path.join(src_base, val) if src_base else val
+        dst = os.path.join(dst_base, val) if dst_base else val
+        if os.path.abspath(src) == os.path.abspath(dst):
+            continue  # a same-workdir import (the --import-workdir
+            # default is this run's workdir): the artifact is
+            # already in place (shutil.copyfile onto itself would
+            # raise SameFileError)
+        if os.path.isfile(dst):
+            # the idempotent fast path — with a size check: a
+            # PARTIALLY-COPIED dst (shutil.copyfile is not atomic —
+            # a mid-copy crash leaves a truncated file) must not be
+            # treated as complete: the WP5 check_artifacts R2
+            # byte-compare then fails the cross-check at report
+            # time (a permanent report_failed wedge — the same
+            # class rounds 3–4 were fixing). The source file is
+            # immutable (a completed run's artifact), so size
+            # equality IS completeness; a size-mismatched (or
+            # pre-fix truncated) dst is re-copied below (the
+            # atomic copy — a new mid-copy crash leaves no
+            # partial dst at all, only an orphan .part that the
+            # next copy overwrites)
+            if not (os.path.isfile(src)
+                   and os.path.getsize(src) == os.path.getsize(dst)):
+                pass  # fall through to the (atomic) copy
+            else:
+                continue
+        if os.path.isfile(src):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            # the atomic copy: <dst>.part + os.replace (the rename
+            # is atomic on POSIX) — see the fast-path note above
+            shutil.copyfile(src, dst + ".part")
+            os.replace(dst + ".part", dst)
+
+
+def seed_import_lines(jsonl_path: str, imported: dict,
+                      import_run: str,
+                      src_workdir: "Optional[str]" = None) -> list:
+    """Idempotently seeds the imported lines into this run's
+    checkpoint (issue #22 AC2). The lines are raw-written (the source
+    ``ts`` is **preserved** — the imported session counts toward the
+    source run's window, never this run's daily budget) and are
+    skipped when the file already carries a line for the instance (a
+    repeat ``--resume`` never re-seeds — no duplicate import lines).
+    The write-side repair (the ``JsonlCheckpoint`` open — the
+    torn-tail truncation) runs **before** the seeding, so a crash-
+    resume never glues an import line onto a torn tail (which the
+    next open would drop — a silent re-run of a never-rerun
+    instance); the post-repair idempotency read then sees the clean
+    file. The referenced artifacts are copied from ``src_workdir``
+    for **every** imported id on every invocation (the WP5
+    cross-check — see :func:`_copy_imported_artifacts` — idempotent
+    per file: a crash between a line's fsync and its artifact copy
+    self-heals on the next invocation). A mid-file corruption is a
+    :class:`PilotConfigError` (exit 2, before any session). Returns
+    the instance ids actually seeded."""
+    if not imported:
+        return []
+    # the write-side repair FIRST (the WP3a torn-tail contract):
+    # if this file carries a torn tail (the host-crash class), it
+    # is truncated to the last clean boundary BEFORE the import
+    # lines are appended — otherwise the import lines glue onto the
+    # fragment and the next checkpoint open drops them, and the
+    # never-rerun instance silently re-runs (a pass@1 violation).
+    # The idempotency read happens AFTER the repair: a pre-repair
+    # read of a torn file would fail and empty the ``existing``
+    # set, and already-seeded lines would be duplicated
+    try:
+        with rr.JsonlCheckpoint(jsonl_path):
+            pass  # the __init__ IS the repair
+    except rr.RunnerProtocolError as exc:
+        raise PilotConfigError(
+            f"checkpoint {jsonl_path!r} is corrupt before the "
+            f"import seeding: {exc}") from exc
+    existing = set()
+    if os.path.isfile(jsonl_path):
+        # post-repair: the file ends on a clean boundary, so the
+        # read is well-defined (a mid-file corruption is still
+        # fail-loud — the config error class, before any session:
+        # the tail repair covers only the tail, so a mid-file
+        # corrupt line still makes load_checkpoint raise
+        # RunnerProtocolError — the round-9 fix: catch it here and
+        # fail closed (exit 2) as the comment promises, instead of
+        # letting it propagate to the exit-4 runner-error path)
+        try:
+            recs, _ = rr.load_checkpoint(jsonl_path)
+        except rr.RunnerProtocolError as exc:
+            raise PilotConfigError(
+                f"checkpoint {jsonl_path!r} is corrupt (a "
+                f"mid-file corruption — the tail repair covers "
+                f"only the tail; the config error class, before "
+                f"any session): {exc}") from exc
+        existing = {r.get("instance_id") for r in recs
+                   if isinstance(r, dict) and r.get("instance_id")}
+    seeded = []
+    dst_workdir = os.path.dirname(jsonl_path) or "."
+    for iid in sorted(imported):
+        if iid in existing:
+            continue
+        rec = imported[iid]
+        m = dict(rec.get("meta") or {})
+        m["imported_from"] = import_run or "imported"
+        line = {"instance_id": iid, "status": rec.get("status"),
+                # the round-23 Minor fix (issue #22, 4451051308):
+                # the time.time() default is unreachable — an
+                # absent ts is now a fail-closed PilotConfigError
+                # in _validate_imported_line on both import
+                # paths, so the seeding receives only validated
+                # lines (the import preserves the source
+                # timestamp — the exact anomaly the check
+                # exists to prevent); the bare subscript fails
+                # loud (not a silent re-stamp) if the contract
+                # is ever broken
+                "meta": m, "ts": rec["ts"]}
+        with open(jsonl_path, "a", encoding="utf-8", newline="") as f:
+            f.write(json.dumps(line) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        seeded.append(iid)
+    # the referenced-artifact copy for EVERY imported id (not just
+    # the newly seeded ones — a crash between a line's fsync and
+    # its artifact copy leaves a durable line with missing
+    # artifacts that every later resume skips; the idempotent
+    # per-file copy self-heals that on this invocation instead of
+    # leaving the WP5 cross-check to fail report_failed with no
+    # automated recovery)
+    if src_workdir:
+        for iid in sorted(imported):
+            _copy_imported_artifacts(imported[iid], src_workdir,
+                                    dst_workdir)
+    return seeded
 
 
 def prompt_template_hash() -> str:
@@ -680,6 +1251,19 @@ class SessionSpec:
     host_check: bool
     workdir: str
     container: "Optional[str]" = None
+    # the run's label for the eval-leg artifact names (issue #22 —
+    # the WP4 artifacts are per-run; a pilot-B run must not label its
+    # artifacts ``pilotA-...``). The default is a neutral label for a
+    # direct spec construction — run_pilot always passes
+    # run_id=config.run_id (the pilot's default run id is
+    # pilot-<timestamp>), so a pilot run's WP4 artifact / container
+    # labels are run_id-labelled by construction. The round-18
+    # Minor fix (issue #22): the old "pilotA" default was a stale
+    # literal — any direct (non-run_pilot) SessionSpec construction,
+    # including a pilot-B one, silently labelled its WP4 eval
+    # artifacts / container names ``pilotA``; the neutral "run"
+    # label makes the direct-construction case visible instead
+    run_id: str = "run"
 
 
 class PilotSession(rr.AgentSession):
@@ -784,6 +1368,11 @@ class PilotSession(rr.AgentSession):
             ext = extract_patch(self._extract_repo_dir())
         except PilotPatchTooLarge as exc:
             self.meta["eval_skip_reason"] = str(exc)[:200]
+            # the AC3 root cause (issue #22): an oversize patch is
+            # unusable by definition — the ``patch`` class (the
+            # agent's output, not the env / not the parser)
+            self.meta["eval_error_root_cause"] = "patch"
+            self.meta["eval_error_root_cause_detail"] = str(exc)[:200]
             self._write_eval_log(f"eval skipped: {exc}")
             self._write_trajectory()
             return "eval_error"
@@ -812,6 +1401,11 @@ class PilotSession(rr.AgentSession):
         # environment — the documented skip (the retry class; the gate
         # does not depend on the eval verdict)
         self.meta["eval_skip_reason"] = "no_container_runtime"
+        # the AC3 root cause (issue #22): the documented skip is the
+        # ``env`` class (no eval leg available in this environment)
+        self.meta["eval_error_root_cause"] = "env"
+        self.meta["eval_error_root_cause_detail"] = (
+            "no container runtime (sandbox mode, host check off)")
         self._write_eval_log(
             "eval skipped: no container runtime "
             "(sandbox mode, host check off)")
@@ -972,11 +1566,23 @@ class PilotSession(rr.AgentSession):
                 iid, patch,
                 model_name_or_path="devin-acp-benchmark",
                 workdir=workdir,
-                run_id="pilotA",
+                run_id=self._spec.run_id,
             )
         except ev.EvaluationError as exc:
             self.meta["wall"]["eval_s"] = round(
                 time.monotonic() - t0, 3)
+            # the AC3 root cause (issue #22): the WP4 typed errors
+            # classify cleanly — the harness's own git-apply chain
+            # wrote its APPLY_PATCH_FAIL marker (the patch is
+            # corrupt/truncated) is the ``patch`` class; every other
+            # harness failure (spawn / watchdog / non-zero exit /
+            # input validation / a timeout) is ``env`` (the harness
+            # container / the harness itself)
+            self.meta["eval_error_root_cause"] = (
+                "patch" if isinstance(exc, ev.PatchCorruptionError)
+                else "env")
+            self.meta["eval_error_root_cause_detail"] = (
+                f"{type(exc).__name__}: {exc}"[:200])
             self._write_eval_log(
                 f"eval_error: {type(exc).__name__}: {exc}")
             return "eval_error"
@@ -999,7 +1605,8 @@ class PilotSession(rr.AgentSession):
         inst = self._spec.instance
         iid = inst["instance_id"]
         t0 = time.monotonic()
-        base = os.path.join(self._spec.workdir, "host-check", iid)
+        base = os.path.abspath(os.path.join(self._spec.workdir,
+                                           "host-check", iid))
         os.makedirs(base, exist_ok=True)
         repo_url = inst.get("repo_url",
                            "https://github.com/" + inst["repo"] + ".git")
@@ -1056,9 +1663,27 @@ class PilotSession(rr.AgentSession):
                     ["git", "-C", clone, "apply", pf],
                     capture_output=True, timeout=300, check=False)
                 if p.returncode != 0:
+                    # the AC3 root cause (issue #22): the MODEL patch
+                    # not applying to the fresh checkout is the
+                    # ``patch`` class; the TEST patch not applying is
+                    # the ``env`` class (the harness test fixture /
+                    # the pinned base — not the agent's patch). A
+                    # "can't open patch"-class failure is a HARNESS
+                    # path failure (the file is missing — e.g. the
+                    # workdir-relative path resolved against the
+                    # clone by ``git -C``): the ``env`` class — the
+                    # model patch content never got a chance, and
+                    # classifying it ``patch`` would misgate the AC3
+                    # taxonomy
+                    err = p.stderr.decode("utf-8", "replace").strip()
+                    if "can't open" in err.lower():
+                        cause = "env"
+                    else:
+                        cause = ("patch" if name == "model_patch"
+                                else "env")
                     raise _HostCheckInfra(
-                        f"git apply {name}: "
-                        + p.stderr.decode("utf-8", "replace").strip()[:500])
+                        f"git apply {name}: {err}",
+                        root_cause=cause)
             # 3. a venv with a minimal install (never the host python)
             venv = os.path.join(base, "venv")
             py = _find_python()
@@ -1104,9 +1729,12 @@ class PilotSession(rr.AgentSession):
             log_lines.append(out[-4000:])
             results = _parse_pytest_ra(out, ids)
             if results is None:
+                # the AC3 root cause (issue #22): the tests ran but
+                # the log-parser leg produced no parseable results —
+                # the ``parser`` class
                 raise _HostCheckInfra(
                     f"pytest exited {p.returncode} with no parseable "
-                    "-rA results")
+                    "-rA results", root_cause="parser")
             f2p = set(inst["FAIL_TO_PASS"])
             p2p = set(inst["PASS_TO_PASS"])
             failed_f2p = sorted(t for t in f2p
@@ -1139,6 +1767,11 @@ class PilotSession(rr.AgentSession):
             log_lines.append(f"  infra failure: {exc}")
             self._write_eval_log("\n".join(log_lines))
             self.meta["eval_skip_reason"] = str(exc)[:200]
+            # the AC3 root cause (issue #22) — the class the failed
+            # phase maps to (the PLAN-WP6B.md table)
+            self.meta["eval_error_root_cause"] = getattr(
+                exc, "root_cause", "env")
+            self.meta["eval_error_root_cause_detail"] = str(exc)[:200]
             return "eval_error"
         except (OSError, subprocess.SubprocessError) as exc:
             # a spawned-tool failure that is not a returncode — a
@@ -1146,13 +1779,17 @@ class PilotSession(rr.AgentSession):
             # ``subprocess.TimeoutExpired`` (a hung pip/pytest) — is
             # likewise the ``eval_error`` infra class, not a
             # run-killing fatal (it would otherwise escape the
-            # documented ``eval_error`` handling)
+            # documented ``eval_error`` handling); the root cause is
+            # ``env`` (the host infra — a missing tool / a hang)
             self.meta["wall"]["eval_s"] = round(
                 time.monotonic() - t0, 3)
             log_lines.append(
                 f"  infra failure: {type(exc).__name__}: {exc}")
             self._write_eval_log("\n".join(log_lines))
             self.meta["eval_skip_reason"] = (
+                f"{type(exc).__name__}: {exc}"[:200])
+            self.meta["eval_error_root_cause"] = "env"
+            self.meta["eval_error_root_cause_detail"] = (
                 f"{type(exc).__name__}: {exc}"[:200])
             return "eval_error"
         finally:
@@ -1752,7 +2389,7 @@ def calibrate(records: list, config: PilotConfig) -> dict:
     tokens = 0
     usage_seen = False
     for rec in records:
-        meta = rec.get("meta") or {}
+        meta = _meta_of(rec)
         w = (meta.get("wall") or {}).get("session_s")
         if isinstance(w, (int, float)) and not isinstance(w, bool):
             walls.append(float(w))
@@ -1809,10 +2446,31 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
                    devin_ok: "Optional[bool]",
                    sessions_used: int,
                    wall_budget_s: float,
-                   wall_used_s: float) -> list:
-    """The 14-item go/no-go checklist (PLAN-WP6A.md). ``pass`` is None
-    in a dry run (the skeleton). Item 13 (the eval leg) is
-    deviation-tolerant, **non-gating**."""
+                   wall_used_s: float,
+                   pilot_b: bool = False,
+                   stratified_repos: "Optional[list]" = None,
+                   imported: "Optional[dict]" = None,
+                   import_attempted: bool = False,
+                   import_provenance: str = "",
+                   repo_by_iid: "Optional[dict]" = None,
+                   arithmetic_total: int = 3,
+                   window_buckets: "Optional[dict]" = None) -> list:
+    """The go/no-go checklist (PLAN-WP6A.md — 14 items; PLAN-WP6B.md
+    — 17 for a ``--pilot b`` run: 15 stratification (AC1), 16 the
+    2-run overlap/variance (AC2), 17 the root-caused ``eval_error``
+    (AC3)). ``pass`` is None in a dry run (the skeleton). Item 13
+    (the eval leg) is deviation-tolerant, **non-gating**.
+
+    Items 15/16 render ``n/a`` (non-gating) when their data is
+    absent (a pilot-B run over a non-stratified file / without an
+    import — the import re-derives from the state file on the
+    continuation windows, so a multi-window run still gates item 16
+    on the completing record); item 17 is always evaluable (zero
+    ``eval_error`` lines pass vacuously). Item 12 gates **per
+    window** when ``window_buckets`` is given (the quota window is
+    the next UTC midnight — a multi-window run never fails the
+    per-day cap by construction); a run that spans one window
+    renders the verbatim WP6a text."""
     items: list = []
 
     def add(item: str, expected: str, observed: str,
@@ -1821,7 +2479,7 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
                      "observed": observed, "pass": passed})
 
     if dry_run:
-        for i in range(1, 15):
+        for i in range(1, 15 + (3 if pilot_b else 0)):
             add(f"{i} (dry run)", "see PLAN-WP6A.md", "n/a (dry run)",
                 None)
         return items
@@ -1838,6 +2496,14 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
     leak_ok = True
     leak_obs: list = []
     eval_legs: list = []
+    # the round-17 Minor fix (issue #22 AC2): the item-4 / item-7
+    # observations count THIS RUN'S sessions only — imported
+    # (never-rerun) lines were never initialized / closed by this
+    # run (the source run's sessions), so the gating record must
+    # not claim "ok on 25 instance(s)" for 2 it never exercised
+    n_own = sum(1 for r in records
+                if not _meta_of(r).get("imported_from"))
+    n_imp = len(records) - n_own
     # the session-level stats (item 8's token totals, item 9's wall,
     # the calibration) count **ATTEMPTS** — every line with an
     # instance id: a superseded ``eval_error``→rerun attempt's wall
@@ -1849,7 +2515,7 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
     attempt_tokens = 0
     attempt_usage_seen = False
     for r in att:
-        m = r.get("meta") or {}
+        m = _meta_of(r)
         w = (m.get("wall") or {}).get("session_s")
         if isinstance(w, (int, float)) and not isinstance(w, bool):
             attempt_wall.append((r.get("status"), w))
@@ -1862,46 +2528,72 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
                     attempt_tokens += int(v)
                     break
     for rec in records:
-        m = rec.get("meta") or {}
-        p = m.get("permissions") or {}
-        perms_req += int(p.get("requests", 0))
-        if int(p.get("requests", 0)) != int(p.get("allowed", 0)) + int(
-                p.get("denied", 0)):
-            perms_all_answered = False
-        perms_send_failures += int(
-            m.get("permission_send_failures", 0))
-        vendor_seen += int(m.get("vendor_notifications", 0))
-        # item 7: a check that did not run (a close() failure —
-        # ``orphan_check`` stays None) is a FAIL, not a pass
-        oc = m.get("orphan_check")
-        if oc is None:
-            orphan_unchecked = True
-        elif oc is False:
-            orphan_checked = False
-        # item 10: the pruning record must be present in the line and
-        # free of failures (written before the line is persisted)
-        pr = m.get("pruning")
-        if not isinstance(pr, dict) or pr.get("failed"):
-            pruning_ok = False
-        pruning_obs.append(
-            f"{rec.get('instance_id')}: "
-            + (f"removed {pr.get('removed')}" if isinstance(pr, dict)
-               else "no record in the checkpoint line")
-            + (f"; FAILED {pr.get('failed')}" if isinstance(pr, dict)
-               and pr.get("failed") else ""))
-        # item 14: the recorded guard + post-session verification
-        lg = m.get("leak_guard") or {}
-        lv = m.get("leak_verify") or {}
-        if lv.get("clean") is not True or lg.get("remotes_after"):
-            leak_ok = False
-        leak_obs.append(
-            f"{rec.get('instance_id')}: verify="
-            + (f"clean={lv.get('clean')} remotes={lv.get('remotes')} "
-               f"tags={lv.get('tags')}" if lv else "no record")
-            + (f"; guard remotes_after={lg.get('remotes_after')} "
-               f"warnings={lg.get('warnings')}" if lg else ""))
-        if m.get("suspected_untrusted_cwd"):
-            untrusted = True
+        m = _meta_of(rec)
+        # the per-instance session-derived gating checks (items 5,
+        # 6, 7, 10, 14) apply to THIS RUN'S sessions only (the
+        # round-15 Major fix, issue #22 AC2 — extending the
+        # round-13 item-10 exclusion): imported (never-rerun) lines
+        # carry the source run's meta verbatim — a source whose
+        # lines lack these keys (or carry a send failure / a
+        # permissions mismatch / a non-clean leak verify / the
+        # pre-harness missing pruning record) would fail the
+        # gating items on evidence from the source run's sessions —
+        # a permanent NO-GO on this run's record for sessions it
+        # never ran. The source run's own record gates its own
+        # sessions. Items 8/9 (the attempt stats) and 12/16 (the
+        # budget / overlap arithmetic) exclude the imported lines by
+        # their own filters; item 13 (the eval leg verdict) is
+        # non-gating and renders every final line
+        if m.get("imported_from"):
+            pruning_obs.append(
+                f"{rec.get('instance_id')}: imported (the source "
+                f"run's record gates the pruning)")
+            leak_obs.append(
+                f"{rec.get('instance_id')}: imported (the source "
+                f"run's record gates the leak guard)")
+        else:
+            p = m.get("permissions") or {}
+            perms_req += int(p.get("requests", 0))
+            if (int(p.get("requests", 0)) != int(p.get("allowed", 0))
+                    + int(p.get("denied", 0))):
+                perms_all_answered = False
+            perms_send_failures += int(
+                m.get("permission_send_failures", 0))
+            vendor_seen += int(m.get("vendor_notifications", 0))
+            # item 7: a check that did not run (a close() failure —
+            # ``orphan_check`` stays None) is a FAIL, not a pass
+            oc = m.get("orphan_check")
+            if oc is None:
+                orphan_unchecked = True
+            elif oc is False:
+                orphan_checked = False
+            # item 10: the pruning record must be present in the
+            # line and free of failures (written before the line
+            # is persisted)
+            pr = m.get("pruning")
+            if not isinstance(pr, dict) or pr.get("failed"):
+                pruning_ok = False
+            pruning_obs.append(
+                f"{rec.get('instance_id')}: "
+                + (f"removed {pr.get('removed')}" if isinstance(pr, dict)
+                   else "no record in the checkpoint line")
+                + (f"; FAILED {pr.get('failed')}" if isinstance(pr, dict)
+                   and pr.get("failed") else ""))
+            # item 14: the recorded guard + post-session
+            # verification
+            lg = m.get("leak_guard") or {}
+            lv = m.get("leak_verify") or {}
+            if (lv.get("clean") is not True
+                    or lg.get("remotes_after")):
+                leak_ok = False
+            leak_obs.append(
+                f"{rec.get('instance_id')}: verify="
+                + (f"clean={lv.get('clean')} remotes={lv.get('remotes')} "
+                   f"tags={lv.get('tags')}" if lv else "no record")
+                + (f"; guard remotes_after={lg.get('remotes_after')} "
+                   f"warnings={lg.get('warnings')}" if lg else ""))
+            if m.get("suspected_untrusted_cwd"):
+                untrusted = True
         gb = m.get("graded_by")
         s = rec.get("status")
         eval_legs.append(
@@ -1931,8 +2623,10 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
     add("4 NDJSON framing + vendor notifications (WP0 §1)",
         "the initialize result is received; vendor notifications are "
         "logged, never errors",
-        f"initialize ok on {len(records)} instance(s); vendor "
-        f"notifications observed: {vendor_seen}",
+        f"initialize ok on {n_own} instance(s)"
+        + (f" (+ {n_imp} imported — not initialized this run)"
+           if n_imp else "")
+        + f"; vendor notifications observed: {vendor_seen}",
         devin_ok)
     add("5 wire method names (WP0 §1)",
         "initialize / session/new / session/prompt / "
@@ -1956,11 +2650,13 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
         "close sent best-effort; the process group killed; no orphan "
         "devin survives",
         (f"orphan check: "
-         + ("PASS on all " + str(len(records)) + " instance(s)"
+         + ("PASS on all " + str(n_own) + " instance(s)"
             if orphan_checked and not orphan_unchecked
             else ("FAILED (an orphan survived)" if not orphan_checked
                  else "NOT PERFORMED (a close() failure — recorded in "
                       "the checkpoint meta close_error)")))
+        + (f" (+ {n_imp} imported — not closed this run)"
+           if n_imp else "")
         if records else "no instances",
         (orphan_checked and not orphan_unchecked)
         if records else devin_ok)
@@ -2003,6 +2699,25 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
             f"{k} skipped ({v})" for k, v in sorted(
                 skipped_on_resume.items()))
         p = True
+    # an interrupted invocation IS the interrupt leg of the
+    # pair — whether or not it is ALSO a resume with skipped
+    # instances (the pilot-B window-1 flow: --resume + the
+    # import + the interrupt): the pair's AC3 evidence
+    # completes on the FOLLOWING resume invocation (the
+    # first branch). Ordered BEFORE the plain
+    # resume-with-skip branch (the round-9 fix): a
+    # pilot-B window-1 interrupted record previously
+    # rendered "the pair was not the intentional
+    # interrupt (AC3 not exercised)" + FAIL on the very
+    # invocation that just performed the interrupt (its
+    # skipped_on_resume was non-empty — the seeded import /
+    # prior lines — while resume_after_interrupt was still
+    # False)
+    elif interrupted_this_run:
+        obs = (f"interrupted after "
+               f"{interrupted_this_run.get('completed')} instance(s); "
+               "the resume invocation must follow")
+        p = None
     elif config.resume and skipped_on_resume:
         # a resume with skipped instances, but the pair was not the
         # intentional interrupt (a crash/abort resume — the AC3 path
@@ -2013,11 +2728,6 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
                + ") — but the pair was not the intentional interrupt "
                  "(AC3 not exercised)")
         p = False
-    elif interrupted_this_run:
-        obs = (f"interrupted after "
-               f"{interrupted_this_run.get('completed')} instance(s); "
-               "the resume invocation must follow")
-        p = None
     elif records:
         obs = ("not exercised (run the pilot with --interrupt-after "
                "1 + --resume to exercise it)")
@@ -2028,15 +2738,67 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
     add("11 resume after the intentional interrupt (WP3b)",
         "the finished instance is skipped (never re-run); no "
         "duplicate checkpoint lines; the session arithmetic holds "
-        "(3 total across the run pair)",
+        f"({arithmetic_total} total across the run pair)",
         obs, p)
+    # the AC4 per-window budget gate (issue #22): a multi-window run
+    # (the WP3 runner sleeps to the next UTC-midnight window at the
+    # local daily cap) is gated PER WINDOW — the total would exceed
+    # the per-day cap by construction; a single-window run renders
+    # the verbatim WP6a text (the WP6a contract holds)
+    if window_buckets is not None and len(window_buckets) > 1:
+        over_s = [d for d, w in window_buckets.items()
+                 if w["sessions"] > config.max_sessions_per_day]
+        over_w = [d for d, w in window_buckets.items()
+                 if w["wall_s"] > wall_budget_s]
+        obs12 = (f"windows: " + "; ".join(
+            f"{_window_day_str(d)}: {w['sessions']} sessions / "
+            f"{w['wall_s']:.1f}s" for d, w in
+            sorted(window_buckets.items()))
+            + f"; max per window: "
+            f"{max(w['sessions'] for w in window_buckets.values())} "
+            f"sessions, "
+            f"{max(w['wall_s'] for w in window_buckets.values()):.1f}s"
+            + (f" — the WP5 report's sessions-used also counts "
+               f"the {len(imported or {})} imported line(s) (the "
+               f"source run's sessions — the WP5 record-level "
+               f"methodology); this run's per-window budget "
+               f"arithmetic (item 12 / the calibrate basis) "
+               f"excludes them (the round-14 Minor fix: the "
+               f"annotation was missing on the multi-window "
+               f"branch, so the record no longer stated why its "
+               f"session count differs from the WP5 report's)"
+               if imported else ""))
+        p12 = not over_s and not over_w
+    else:
+        # an EMPTY bucket view (a host crash before any line — no
+        # ``ts`` to bucket) falls back to the legacy totals (0 / 0)
+        if window_buckets:
+            only = next(iter(window_buckets.values()))
+            n12 = only["sessions"]
+            w12 = only["wall_s"]
+        else:
+            n12 = sessions_used
+            w12 = wall_used_s
+        obs12 = (f"sessions (attempts, incl. reruns): {n12}; "
+                f"wall used: {w12:.1f}s"
+                + (f" — the WP5 report's sessions-used also "
+                   f"counts the {len(imported or {})} imported "
+                   f"line(s) (the source run's sessions — the "
+                   f"WP5 record-level methodology); this run's "
+                   f"budget arithmetic (item 12 / the calibrate "
+                   f"basis) excludes them"
+                   if imported else ""))
+        p12 = (n12 <= config.max_sessions_per_day
+              and w12 <= wall_budget_s)
     add("12 within the calibrated budget",
-        f"sessions ≤ {config.max_sessions_per_day}; wall ≤ "
-        f"{wall_budget_s:.0f}s",
-        f"sessions (attempts, incl. reruns): {sessions_used}; "
-        f"wall used: {wall_used_s:.1f}s",
-        sessions_used <= config.max_sessions_per_day
-        and wall_used_s <= wall_budget_s)
+        (f"every window: sessions ≤ {config.max_sessions_per_day}; "
+         f"wall ≤ {wall_budget_s:.0f}s")
+        if (window_buckets is not None
+            and len(window_buckets) > 1)
+        else (f"sessions ≤ {config.max_sessions_per_day}; wall ≤ "
+              f"{wall_budget_s:.0f}s"),
+        obs12,
+        p12)
     add("13 eval leg verdict (deviation-tolerant, NON-gating)",
         "container: the official harness; sandbox: the host check or "
         "the documented no-runtime skip",
@@ -2047,25 +2809,176 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
         "post-session)",
         "; ".join(leak_obs) or "no instances",
         (leak_ok and bool(records)) if records else devin_ok)
+
+    # the WP6b items (issue #22 — appended for a ``--pilot b`` run
+    # only; the WP6a 14-item contract + the
+    # test_checklist_verdict_gating invariants hold). Each is ``n/a``
+    # (non-gating — ``pass=None``) when its data is absent.
+    if pilot_b:
+        # 15 — the stratification (AC1)
+        if stratified_repos:
+            repo_by_iid = repo_by_iid or {}
+            covered = {repo_by_iid.get(r.get("instance_id"))
+                      for r in records}
+            covered.discard(None)
+            n_cov = sum(1 for repo in stratified_repos
+                       if repo in covered)
+            add("15 stratification (WP6b AC1)",
+                f"all {len(stratified_repos)} Verified repos covered "
+                "by a final line (the instance file's meta)",
+                f"{n_cov}/{len(stratified_repos)} repos covered",
+                n_cov == len(stratified_repos))
+        else:
+            add("15 stratification (WP6b AC1)",
+                "the instance file's ``stratified_repos`` meta",
+                "n/a (no stratification meta — non-gating)",
+                None)
+        # 16 — the 2-run overlap/variance (AC2)
+        if imported:
+            ok16 = True
+            frag = []
+            # the round-24 Major fix (issue #22, 4451121577): a
+            # CHECKPOINT-provenance imported set is the
+            # checkpoint's own seeded lines (marker stripped) —
+            # comparing them to their own final lines is a
+            # self-comparison (it can never fail; the same
+            # self-referential comparison the self-import guard
+            # rejects). The faithfulness half renders an explicit
+            # n/a (the fidelity to the true source was verified at
+            # seeding time — the verbatim copy + the flag path's
+            # validation + the artifact copy — and cannot be re-
+            # verified once the state is lost); the arithmetic
+            # half (the count) still gates
+            if import_provenance == "checkpoint":
+                frag.append("faithfulness n/a (self-derived "
+                           "checkpoint fallback — the source "
+                           "lines ARE this run's seeded lines; "
+                           "the fidelity was verified at seeding)")
+            else:
+                for iid in sorted(imported):
+                    src = imported[iid]
+                    fin = next((r for r in records
+                               if r.get("instance_id") == iid), None)
+                    sm = _meta_of(src)
+                    fm = _meta_of(fin) if fin else {}
+                    s_wall = (sm.get("wall") or {}).get("session_s")
+                    f_wall = (fm.get("wall") or {}).get("session_s")
+                    s_tok = _usage_total(sm.get("usage"))
+                    f_tok = _usage_total(fm.get("usage"))
+                    s_pb = sm.get("patch_bytes")
+                    f_pb = fm.get("patch_bytes")
+                    m = (fin is not None
+                        and src.get("status") == fin.get("status")
+                        and s_wall == f_wall and s_tok == f_tok
+                        and s_pb == f_pb)
+                    ok16 = ok16 and m
+                    frag.append(f"{iid}: "
+                              + ("match" if m else "MISMATCH")
+                              + f" ({src.get('status')}/"
+                                 f"{fin.get('status') if fin else '-'}, "
+                                 f"wall {s_wall}/{f_wall}, tokens "
+                                 f"{s_tok}/{f_tok}, patch {s_pb}/{f_pb})")
+            # the session arithmetic (the unique-instance basis):
+            # imported + the unique NEW instances == unique — a legal
+            # pass@1 retry (several attempt lines for one instance)
+            # is the item-12 budget basis, not an arithmetic break
+            new_iids = {r.get("instance_id") for r in records
+                       if r.get("instance_id")
+                       and not _meta_of(r).get(
+                           "imported_from")
+                       and r.get("status") != "preflight_failed"}
+            unique = len({r.get("instance_id") for r in records
+                         if r.get("instance_id")})
+            arith_holds = (len(imported) + len(new_iids) == unique)
+            ok16 = ok16 and arith_holds
+            frag.append(f"arithmetic {len(imported)} + "
+                        f"{len(new_iids)} = {unique} "
+                        + ("holds" if arith_holds else "BROKEN"))
+            add("16 2-run overlap/variance (WP6b AC2)",
+                "each imported (reused) instance: the source line == "
+                "this run's final line (status / session wall / "
+                "tokens / patch bytes) — never re-run, no extra "
+                "session spent; the session arithmetic holds "
+                "(imported + new == unique)",
+                "; ".join(frag) or "no imported instances",
+                ok16)
+        else:
+            if import_attempted:
+                # the round-12 Medium fix (issue #22 AC2): an
+                # --import-run (this or an earlier window — the
+                # state re-derivation) was attempted but zero
+                # never-rerun instances were imported (the shared
+                # ids were all retry-class — the zero-id case is a
+                # fail-closed config error in load_imported). Item
+                # 16 renders the explicit vacuous state (the AC2
+                # overlap check is vacuous for an empty imported
+                # set; the retry-class re-runs are recorded
+                # separately) instead of a bare "n/a (no import)"
+                # indistinguishable from a legitimate non-import
+                # run
+                add("16 2-run overlap/variance (WP6b AC2)",
+                    "an ``--import-run`` source (the 3 Pilot A "
+                    "instances)",
+                    "n/a (import attempted — zero imported "
+                    "instances; the AC2 overlap check is vacuous; "
+                    "the retry-class re-runs are recorded)",
+                    None)
+            else:
+                add("16 2-run overlap/variance (WP6b AC2)",
+                    "an ``--import-run`` source (the 3 Pilot A "
+                    "instances)",
+                    "n/a (no import — non-gating)",
+                    None)
+        # 17 — the root-caused eval_error (AC3)
+        ee = [r for r in records if r.get("status") == "eval_error"]
+        unclassed = [r.get("instance_id") for r in ee
+                    if _meta_of(r).get(
+                        "eval_error_root_cause")
+                    not in ("env", "parser", "patch")]
+        unclassified_obs = (
+            f" — UNCLASSIFIED: "
+            + ", ".join(sorted(str(u) for u in unclassed))
+            if unclassed else "")
+        obs17 = (f"{len(ee)} eval_error line(s), "
+                f"{len(ee) - len(unclassed)} classified"
+                + unclassified_obs)
+        if ee:
+            by_class: dict = {}
+            for r in ee:
+                c = _meta_of(r).get(
+                    "eval_error_root_cause")
+                if c in ("env", "parser", "patch"):
+                    by_class[c] = by_class.get(c, 0) + 1
+            obs17 += " (" + ", ".join(f"{c}={n}"
+                                     for c, n in sorted(by_class.items())) + ")"
+        add("17 eval_error root-caused (WP6b AC3)",
+            "every eval_error line carries a root cause (env / "
+            "parser / patch — the PLAN-WP6B.md mapping)",
+            obs17,
+            not unclassed)
     return items
 
 
-def _verdict(items: list, interrupted: bool = False) -> "tuple[str, list]":
-    """GO ⟺ items 1–12 + 14 all pass (item 13 is deviation-tolerant,
-    non-gating — PLAN-WP6A.md). A rendering with no decided items at
-    all (the dry-run skeleton — every item ``pass=None``) is ``n/a``,
-    not NO-GO (a dry run decides nothing). An **interrupted** run
-    decides nothing either: it is a PARTIAL record (e.g. 1/3
-    instances) — no gating item requires all pinned instances to have
-    a completed line, so without this guard the partial record would
-    render a GO the resume invocation would silently supersede. The
-    pair's verdict is the resume invocation's."""
+def _verdict(items: list, interrupted: bool = False,
+             gating: "Optional[frozenset]" = None) -> "tuple[str, list]":
+    """GO ⟺ all gating items pass (the WP6a 14-item set by default —
+    1–12 + 14, item 13 non-gating; the ``gating`` parameter extends
+    it for a pilot-B run: + 15/16/17, 13 still non-gating). A
+    rendering with no decided items at all (the dry-run skeleton —
+    every item ``pass=None``) is ``n/a``, not NO-GO (a dry run
+    decides nothing). An **interrupted** run decides nothing either:
+    it is a PARTIAL record (e.g. 1/3 instances) — no gating item
+    requires all pinned instances to have a completed line, so
+    without this guard the partial record would render a GO the
+    resume invocation would silently supersede. The pair's verdict
+    is the resume invocation's."""
     if interrupted:
         return ("n/a (interrupted — resume to complete)", [])
-    gating_numbers = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "10",
-                     "11", "12", "14"}  # 13 excluded (non-gating)
+    if gating is None:
+        gating = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "10",
+                 "11", "12", "14"}  # 13 excluded (non-gating)
     decided = [i for i in items
-              if i["item"].split(" ", 1)[0] in gating_numbers
+              if i["item"].split(" ", 1)[0] in gating
               and i["pass"] is not None]
     if not decided:
         return ("n/a", [])
@@ -2073,12 +2986,124 @@ def _verdict(items: list, interrupted: bool = False) -> "tuple[str, list]":
     return ("NO-GO" if failed else "GO", failed)
 
 
+def _render_pilot_b_sections(wp6b: dict) -> list:
+    """The pilot-B record sections (issue #22) — the per-repo
+    stratification table, the 2-run overlap/variance table, the
+    failure taxonomy + root-cause table, the per-window budget
+    table."""
+    lines: list = []
+    pr = wp6b.get("per_repo") or {}
+    expected = wp6b.get("expected_repos") or sorted(pr)
+    if pr:
+        lines += ["## Stratification (issue #22 AC1)", "",
+                  "| repo | observed | status |",
+                  "|---|---|---|"]
+        for repo in expected:
+            d = pr.get(repo, {"count": 0, "statuses": {}})
+            st = ", ".join(f"{k} {v}" for k, v in
+                          sorted(d["statuses"].items())) or "-"
+            lines.append(f"| {repo} | {d['count']} | {st} |")
+        lines += [f"\n**{sum(1 for r in pr.values() if r['count'] >= 1)}/"
+                  f"{len(expected)} repos covered.**", ""]
+    imp = wp6b.get("import") or {}
+    rows = imp.get("rows")
+    if rows is not None:
+        lines += ["## 2-run overlap/variance (issue #22 AC2)", "",
+                  "| instance | source | final | session wall (s) "
+                  "| tokens | patch bytes | match |",
+                  "|---|---|---|---|---|---|---|"]
+        for r in rows:
+            # the round-29 Minor fix (issue #22, 4451583337): a
+            # checkpoint-provenance import's per-row match is a
+            # self-comparison (the source lines ARE this run's
+            # seeded lines) — the round-24 fix neutralized only
+            # the summary label; the per-row PASS/FAIL cells
+            # still asserted a per-instance faithfulness that was
+            # never verified against the true source. Render the
+            # explicit n/a on the checkpoint fallback.
+            row_match = ("n/a (self-derived)"
+                        if imp.get("provenance") == "checkpoint"
+                        else ("PASS" if r["match"] else "FAIL"))
+            lines.append(
+                f"| {r['instance_id']} | {r['src_status']} | "
+                f"{r['final_status']} | {r['src_wall']} → "
+                f"{r['final_wall']} | {r['src_tokens']} → "
+                f"{r['final_tokens']} | {r['src_patch']} → "
+                f"{r['final_patch']} | "
+                f"{row_match} |")
+        match_label = ("PASS" if imp.get("all_match")
+                      else ("FAIL" if imp.get("rows")
+                           else ("n/a (import attempted — zero "
+                                "imported instances; the AC2 "
+                                "overlap check is vacuous)"
+                             if imp.get("attempted")
+                             else "n/a (no import)")))
+        # the round-24 Major fix (issue #22, 4451121577): a
+        # checkpoint-provenance match is a self-comparison —
+        # render its explicit n/a (the fidelity was verified at
+        # seeding) instead of a vacuous PASS
+        if (imp.get("provenance") == "checkpoint"
+                and match_label == "PASS"):
+            match_label = ("n/a (self-derived checkpoint fallback "
+                          "— the source lines ARE this run's "
+                          "seeded lines; the fidelity was "
+                          "verified at seeding)")
+        lines += ["",
+                  f"Session arithmetic: {imp.get('imported')} imported "
+                  f"+ {imp.get('new_instances')} new = "
+                  f"{imp.get('unique')} unique — "
+                  f"{'holds' if imp.get('arithmetic_holds') else 'BROKEN'} "
+                  f"({imp.get('new_sessions')} attempt lines — the "
+                  f"budget basis, item 12). Overlap match: "
+                  f"{match_label}.", ""]
+    tax = wp6b.get("taxonomy") or {}
+    rc = wp6b.get("root_causes") or []
+    if tax or rc:
+        lines += ["## Failure taxonomy (issue #22 AC3)", "",
+                  "| status | count | instances |",
+                  "|---|---|---|"]
+        for s in sorted(tax):
+            t = tax[s]
+            lines.append(f"| {s} | {t['count']} | "
+                        f"{', '.join(t['instances']) or '-'} |")
+        if rc:
+            lines += ["",
+                     "**eval_error root causes (env / parser / patch):**",
+                     "",
+                     "| instance | class | detail |",
+                     "|---|---|---|"]
+            for r in rc:
+                # the detail is operator text (a root-cause detail
+                # — e.g. a git/pytest stderr line): a ``|`` or a
+                # newline in it would corrupt the markdown table
+                # (the checklist rows escape the same way)
+                detail = str(r["detail"] or "-")
+                detail = (detail.replace("|", "\\|")
+                         .replace("\n", " ")[:160])
+                lines.append(f"| {r['instance_id']} | "
+                            f"{r['root_cause'] or 'UNCLASSIFIED'} | "
+                            f"{detail} |")
+        lines.append("")
+    win = wp6b.get("windows") or []
+    if win:
+        lines += ["## Budget windows (issue #22 AC4)", "",
+                  "| window (UTC day) | sessions | wall (s) |",
+                  "|---|---|---|"]
+        for w in win:
+            lines.append(f"| {w['day']} | {w['sessions']} | "
+                        f"{w['wall_s']} |")
+        lines.append("")
+    return lines
+
+
 def render_checklist_md(items: list, config: PilotConfig,
                        calibration: "Optional[dict]",
-                       meta: dict,
-                       interrupted: bool = False) -> str:
-    verdict, failed = _verdict(items, interrupted=interrupted)
-    lines = ["# WP6a Pilot A — go/no-go record (auto-generated)", "",
+                       meta: dict, title: str,
+                       interrupted: bool = False,
+                       gating: "Optional[frozenset]" = None) -> str:
+    verdict, failed = _verdict(items, interrupted=interrupted,
+                              gating=gating)
+    lines = [f"# {title}", "",
              f"**Verdict: {verdict}**"
              + (f" — failed items: {', '.join(failed)}" if failed else ""),
              "",
@@ -2088,9 +3113,17 @@ def render_checklist_md(items: list, config: PilotConfig,
              f"- budget: max_sessions_per_day="
              f"{config.max_sessions_per_day} · max_wall_per_session="
              f"{config.max_wall_s:.0f}s", ""]
+    # the Calibration and Checklist sections are the INHERITED
+    # WP6a sections — #21's AC2 / AC4 (the round-19 Minor fix,
+    # issue #22): pilot-B's AC numbers (PLAN-WP6B) map AC2 to the
+    # 2-run overlap/variance and AC4 to the mid-batch interrupt,
+    # so labelling these sections with #22's numbers misattributes
+    # the record's own sections (the pilot-B-specific sections —
+    # 15/16/17 — carry the #22 labels)
     if calibration:
         lines += [
-            "## Calibration (issue #21 AC2)", "",
+            f"## Calibration (issue #21 AC2 — the inherited WP6a "
+            f"section)", "",
             f"- per-session wall (s): {calibration['per_session_wall_s']}",
             f"- median: {calibration['median_session_wall_s']} · mean: "
             f"{calibration['mean_session_wall_s']}",
@@ -2102,7 +3135,8 @@ def render_checklist_md(items: list, config: PilotConfig,
             f"chosen `max_sessions_per_day`: "
             f"{calibration['chosen_max_sessions_per_day']}",
             f"- basis: {calibration['basis']}", ""]
-    lines += ["## Checklist (issue #21 AC4)", "",
+    lines += [f"## Checklist (issue #21 AC4 — the inherited WP6a "
+              f"section)", "",
               "| # | item | expected | observed | pass |",
               "|---|---|---|---|---|"]
     for i in items:
@@ -2113,6 +3147,8 @@ def render_checklist_md(items: list, config: PilotConfig,
         observed = str(i["observed"]).replace("|", "\\|")[:200]
         lines.append(f"| {num} | {item} | {expected} | {observed} | {p} |")
     lines.append("")
+    if meta.get("wp6b"):
+        lines += _render_pilot_b_sections(meta["wp6b"])
     return "\n".join(lines)
 
 
@@ -2153,6 +3189,20 @@ def _state_path(workdir: str, run_id: str) -> str:
     return os.path.join(workdir, f"pilot-{run_id}.state.json")
 
 
+def _meta_of(rec: dict) -> dict:
+    """The record's meta as a dict (the round-10 fix, issue #22): a
+    corrupt (non-dict) meta is normalized to ``{}`` — a truthy
+    non-dict meta (the same corrupt-line class :func:`load_imported`
+    validates on the source side) must not crash the read-side
+    accounting (the checkpoint re-derivation, the window buckets,
+    the calibrate exclusion, the checklist math) with an uncaught
+    ``AttributeError`` (exit 4) — the dict guard keeps the read
+    side robust (the line simply lacks a meta for the accounting).
+    """
+    m = rec.get("meta")
+    return m if isinstance(m, dict) else {}
+
+
 def _load_state(workdir: str, run_id: str) -> dict:
     p = _state_path(workdir, run_id)
     if not os.path.isfile(p):
@@ -2165,22 +3215,479 @@ def _load_state(workdir: str, run_id: str) -> dict:
 
 
 def _write_state(workdir: str, run_id: str, state: dict) -> None:
+    """Crash-atomic (the round-7 Major fix, issue #22): the state
+    write is tmp + fsync + ``os.replace`` — a mid-write crash (a
+    process kill / power loss during the write) leaves the
+    previous state file intact (or NO file on a fresh workdir — a
+    visible anomaly the operator resolves by re-invoking the import
+    window; the seeding is idempotent), so the resume's import
+    re-derivation (the state's full source set — the round-3 early
+    record — + the checkpoint fallback, round 2) is never clobbered
+    by a torn write. The old ``open("w")`` truncated in place: a
+    mid-write crash left a torn JSON that :func:`_load_state`
+    swallowed to ``{}`` — the early import record (the round-3
+    recovery) could be destroyed by its own write path (zero seeds
+    + a torn state → the resume derives nothing, the never-rerun
+    instances run fresh, item 16 renders n/a — the same silent
+    under-derivation the round-3 early record was added to close).
+    """
     os.makedirs(workdir, exist_ok=True)
-    with open(_state_path(workdir, run_id), "w", encoding="utf-8",
-              newline="") as f:
+    p = _state_path(workdir, run_id)
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="") as f:
         json.dump(state, f, indent=2)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, p)  # atomic on POSIX (the same filesystem)
+    # best-effort directory fsync (the rename's durability — a
+    # power loss immediately after the rename can drop it without
+    # this; best-effort: not every platform exposes a directory fd)
+    try:
+        dfd = os.open(os.path.dirname(p) or ".", os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        pass
 
 
 def _remove_stale_record(workdir: str) -> None:
     """The record file is the last *completed* run's verdict — an early
     exit (dry-run skeleton, pre-flight / model-gate refusal, an abort)
     removes it so a stale verdict from a previous invocation is never
-    mistaken for this run's (consistent record handling across exits)."""
-    p = os.path.join(workdir, "wp6a-go-no-go.md")
+    mistaken for this run's (consistent record handling across exits).
+    Both pilot kinds' names are removed (a stale verdict from the
+    other kind in the same workdir is equally stale)."""
+    for name in RECORD_NAMES.values():
+        try:
+            os.remove(os.path.join(workdir, name))
+        except OSError:
+            pass
+
+
+def _pilot_title(config: PilotConfig) -> str:
+    return ("WP6b Pilot B (issue #22)" if config.pilot == "b"
+            else "WP6a Pilot A (issue #21)")
+
+
+def _stratified_repos(config: PilotConfig) -> "Optional[list]":
+    """The AC1 expected repo set: the instance file's
+    ``_meta.stratified_repos`` (None for a meta-less / bare-list file
+    — the item renders ``n/a`` and is non-gating)."""
     try:
-        os.remove(p)
-    except OSError:
-        pass
+        meta = load_instances_meta(config.instances_file)
+    except PilotConfigError:
+        return None
+    repos = meta.get("stratified_repos")
+    if isinstance(repos, list) and repos and all(
+            isinstance(r, str) for r in repos):
+        return list(repos)
+    return None
+
+
+def _repo_by_iid(insts: list) -> dict:
+    return {i["instance_id"]: i.get("repo", "?") for i in insts}
+
+
+def _window_buckets(records: list) -> dict:
+    """The AC4 per-window budget view (issue #22): the checkpoint
+    lines (instance id, non-``preflight_failed`` — the WP3 contract:
+    it consumed no session) bucketed by their ``ts``'s **UTC day**
+    (the quota window boundary, ``next_quota_window`` — the next UTC
+    midnight; the WP3 ``Runner`` — the pilot harness' queue engine,
+    default sleeper — sleeps there at the per-process daily cap,
+    resets the budget counters (a new window is a fresh budget), and
+    continues the remaining queue in the same process, the 500-run
+    model: one process spans days across windows). Imported lines
+    are EXCLUDED from this run's accounting — a never-rerun reuse
+    burned no session of this run's budget; the source run
+    accounted for it (bucketing them by their source ``ts`` — e.g.
+    a same-UTC-day source — would fold the source run's sessions
+    into this run's window and falsely fail the gate). A run that
+    spans one window renders the verbatim WP6a item-12 text."""
+    out: dict = {}
+    for r in records:
+        if not r.get("instance_id"):
+            continue
+        if _meta_of(r).get("imported_from"):
+            continue  # the import — the source run's accounting
+        ts = r.get("ts") or 0.0
+        day = int(ts // 86400)
+        w = out.setdefault(day, {"sessions": 0, "wall_s": 0.0})
+        # a preflight_failed line is not a SESSION (no session ran —
+        # the pre-flight leg failed), so it does not count toward
+        # the session count — but its REAL wall (a failed pre-flight
+        # leg — the image-pull class — can be minutes) counts
+        # toward the wall gate (the WP6a wall_used_s basis counted
+        # it; dropping the line dropped the wall — the round-8
+        # fix)
+        if r.get("status") != "preflight_failed":
+            w["sessions"] += 1
+        wall = _meta_of(r).get("wall_s", 0.0)
+        if isinstance(wall, (int, float)) and not isinstance(wall, bool):
+            w["wall_s"] += float(wall)
+    return out
+
+
+def _window_day_str(day: int) -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime(day * 86400))
+
+
+def _pilot_gating(config: PilotConfig) -> frozenset:
+    """The gating item set (the WP6a 14-item set; pilot B adds the
+    AC1–AC3 items 15/16/17 — item 13 stays non-gating in both)."""
+    base = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "10",
+            "11", "12", "14"}
+    if config.pilot == "b":
+        base |= {"15", "16", "17"}
+    return frozenset(base)
+
+
+def _pilot_b_sections(config: PilotConfig, insts: list, records: list,
+                     inst_records: list, imported: dict,
+                     buckets: dict, import_attempted: bool = False,
+                     import_provenance: str = "") -> dict:
+    """The pilot-B record-section data (issue #22) — the
+    ``meta['wp6b']`` the renderer turns into markdown tables.
+
+    * ``per_repo`` — the AC1 stratification table (the instance
+      file's ``stratified_repos`` meta vs the finals' repo counts);
+    * ``import`` — the AC2 2-run overlap/variance table (per shared
+      instance: the source line vs this run's final line) + the
+      session arithmetic;
+    * ``taxonomy`` — the AC3 full failure taxonomy (every terminal
+      status: count + instance ids) + the root-cause table (every
+      ``eval_error`` line: class + detail);
+    * ``windows`` — the per-window budget table (the item-12 view).
+    """
+    repo_by_iid = _repo_by_iid(insts)
+    final_by_iid = {r.get("instance_id"): r for r in inst_records}
+    strat = _stratified_repos(config) or sorted(
+        {i.get("repo", "?") for i in insts})
+    per_repo: dict = {}
+    for repo in strat:
+        ids = [iid for iid, r in final_by_iid.items()
+              if repo_by_iid.get(iid) == repo]
+        statuses: dict = {}
+        for iid in ids:
+            s = final_by_iid[iid].get("status")
+            statuses[s] = statuses.get(s, 0) + 1
+        per_repo[repo] = {"count": len(ids), "statuses": statuses,
+                         "instances": sorted(ids)}
+    # the AC2 overlap/variance: per imported instance, the source line
+    # vs the final line (status / session wall / total tokens / patch
+    # bytes). A re-run of an imported instance supersedes the seeded
+    # line with a divergent final → a mismatch → the item fails
+    import_rows: list = []
+    for iid in sorted(imported):
+        src = imported[iid]
+        fin = final_by_iid.get(iid)
+        sm = _meta_of(src)
+        fm = _meta_of(fin) if fin else {}
+        wall_s = (lambda m: (m.get("wall") or {}).get("session_s"))
+        toks = (lambda m: _usage_total(m.get("usage")))
+        s_wall, f_wall = wall_s(sm), wall_s(fm)
+        s_tok, f_tok = toks(sm), toks(fm)
+        s_pb, f_pb = sm.get("patch_bytes"), fm.get("patch_bytes")
+        match = (fin is not None
+                and src.get("status") == fin.get("status")
+                and s_wall == f_wall and s_tok == f_tok
+                and s_pb == f_pb)
+        import_rows.append({
+            "instance_id": iid, "repo": repo_by_iid.get(iid),
+            "src_status": src.get("status"), "src_wall": s_wall,
+            "src_tokens": s_tok, "src_patch": s_pb,
+            "final_status": fin.get("status") if fin else None,
+            "final_wall": f_wall, "final_tokens": f_tok,
+            "final_patch": f_pb, "match": match})
+    new_lines = [r for r in records if r.get("instance_id")
+                and not _meta_of(r).get("imported_from")
+                and r.get("status") != "preflight_failed"]
+    # the session arithmetic is on the DEDUPED-FINALS basis
+    # (the round-16 Medium fix, issue #22 AC2 — it must match
+    # item 16, which gates on the same equation over the deduped
+    # finals): an instance whose final line is preflight_failed
+    # (an eval_error attempt superseded by it) must not count as
+    # "new" here yet be excluded in item 16 — the record would
+    # render "holds" and "BROKEN" for the same run. new_sessions
+    # stays on the raw (attempt) basis — it is a session count
+    fin_new = [r for r in inst_records if r.get("instance_id")
+               and not _meta_of(r).get("imported_from")
+               and r.get("status") != "preflight_failed"]
+    # the session arithmetic counts UNIQUE new instances (a legal
+    # pass@1 retry of one instance is several attempt lines — the
+    # attempts are the item-12 budget basis, not the arithmetic
+    # basis)
+    new_iids = {r.get("instance_id") for r in fin_new}
+    unique = len({r.get("instance_id") for r in inst_records
+                 if r.get("instance_id")})
+    import_section = {
+        "rows": import_rows,
+        "imported": len(imported),
+        "new_instances": len(new_iids),
+        "new_sessions": len(new_lines),
+        "unique": unique,
+        "arithmetic_holds": (len(imported) + len(new_iids) == unique),
+        # the round-24 Minor fix (issue #22, 4451121581): the
+        # section's overlap-match label must distinguish the
+        # import-attempted-but-zero-imported case (the round-12
+        # fix) from a legitimate non-import run — the renderer's
+        # match_label collapsed both into "n/a (no import)"
+        "attempted": import_attempted,
+        # the round-24 Major fix (issue #22, 4451121577): the
+        # provenance — a checkpoint-derived set's match is a
+        # self-comparison (the renderer renders its explicit n/a
+        # instead of PASS)
+        "provenance": import_provenance,
+        # the overlap match is only defined for a run that has an
+        # import (zero rows is not a FAIL — item 16 renders n/a on
+        # a non-import run, and the record must not contradict
+        # itself)
+        "all_match": all(r["match"] for r in import_rows)
+        if import_rows else None,
+    }
+    # the AC3 taxonomy + the root-cause table (over the DEDUPED view
+    # — a superseded attempt's eval_error is not the instance's
+    # verdict; the attempts basis lives in the calibration + item 12)
+    taxonomy: dict = {}
+    for r in inst_records:
+        s = r.get("status")
+        t = taxonomy.setdefault(s, {"count": 0, "instances": []})
+        t["count"] += 1
+        t["instances"].append(r.get("instance_id"))
+    for t in taxonomy.values():
+        t["instances"].sort()
+    root_rows: list = []
+    for r in inst_records:
+        if r.get("status") != "eval_error":
+            continue
+        m = _meta_of(r)
+        rc = m.get("eval_error_root_cause")
+        root_rows.append({
+            "instance_id": r.get("instance_id"),
+            "root_cause": rc if rc in ("env", "parser", "patch")
+            else None,
+            "detail": (m.get("eval_error_root_cause_detail")
+                      or m.get("eval_skip_reason") or "")[:200]})
+    return {
+        # the round-16 Minor fix (issue #22): all_repos_covered /
+        # all_root_caused were computed here but never consumed by
+        # the renderer or the checklist (the gating items 15 / 17
+        # compute their own coverage / classification over the same
+        # data) — dead record keys, removed
+        "per_repo": per_repo,
+        "expected_repos": strat,
+        "import": import_section,
+        "taxonomy": taxonomy,
+        "root_causes": root_rows,
+        "windows": [{"day": _window_day_str(d), "sessions": w["sessions"],
+                    "wall_s": round(w["wall_s"], 1)}
+                   for d, w in sorted(buckets.items())],
+    }
+
+
+def _usage_total(usage: object) -> "Optional[int]":
+    """The verbatim visible-usage total (the WP0 §1
+    ``usage.totalTokens``; the ``total_tokens`` alias) — None when
+    the leg did not expose it (the comparison is still well-defined:
+    the import and the final line must agree, including on absence)."""
+    if not isinstance(usage, dict):
+        return None
+    for k in ("totalTokens", "total_tokens"):
+        v = usage.get(k)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return int(v)
+    return None
+
+
+def _rederive_import(state: dict, workdir: str, run_id: str,
+                    insts: list) -> "tuple[dict, str]":
+    """The SHARED import re-derivation (issue #22 AC2; the
+    round-23 Major fix, 4451051304): the state / checkpoint
+    re-derivation + the fail-closed checks (the shared line
+    validation — the round-20 fix — and the zero-overlap guard
+    — the round-18 fix) used by BOTH the live ``--resume`` path
+    and the dry run, so the dry run renders the identical
+    verdict for the identical invocation (the 'a dry run that
+    passes is an invocation that would actually work' contract —
+    the first draft's dry-run block only covered the checkpoint
+    fallback and skipped the state branch entirely, so the
+    zero-overlap guard never fired in a dry run and the
+    state / checkpoint-derived lines bypassed the validation).
+    Returns ``(derived imported set filtered to the current
+    instance file, the print label — empty when nothing was
+    derived, the provenance — "state" / "checkpoint" / "")``;
+    raises :class:`PilotConfigError` on a validation /
+    zero-overlap failure. The caller prints the label (the live
+    path prints it; the dry run does not).
+
+    The provenance matters (the round-24 Major fix, issue #22,
+    4451121577): a ``checkpoint``-derived set is the checkpoint's
+    OWN seeded lines (marker stripped) — a self-comparison for
+    item 16's faithfulness half (the source lines ARE this run's
+    seeded lines; the fidelity to the true source was verified at
+    seeding time and cannot be re-verified once the state is
+    lost), and it must not be laundered into ``state.
+    import_source`` by the end-of-run write (that would make the
+    self-referential comparison durable on every later resume —
+    the same self-comparison the self-import guard in
+    ``load_imported`` rejects). A ``state``-derived set came
+    from the early import record (the flag path's full source
+    set) and is a legitimate comparison source.
+    """
+    known = {i["instance_id"] for i in insts}
+    imported: dict = {}
+    label = ""
+    if (state.get("imported")
+            and isinstance(state.get("import_source"), dict)
+            and state["import_source"]):
+        imported = {iid: line for iid, line in
+                    state["import_source"].items()
+                    if iid in known}
+        if imported:
+            label = ("the state file "
+                    f"({len(imported)} line(s) from "
+                    f"{state.get('imported_run') or '?'})")
+    elif os.path.isfile(
+            os.path.join(workdir, f"run-{run_id}.jsonl")):
+        # the round-25 Minor fix (issue #22, 4451208201): the
+        # old comment mischaracterized the contract —
+        # load_checkpoint SILENTLY DROPS a torn tail (it never
+        # raises for one — the torn-tail drop is the issue #15
+        # AC1 contract); only a MID-FILE corruption (a
+        # non-record / non-JSON / non-UTF-8 line anywhere but
+        # the last) raises RunnerProtocolError. So a raised
+        # RunnerProtocolError here is NEVER a recoverable torn
+        # tail — it is a mid-file corruption, and silently
+        # treating it as an empty derivation (the old
+        # pre_recs = []) let a corrupt checkpoint with no state
+        # bookkeeping surface the misleading "--pilot b
+        # requires --import-run" config error instead of the
+        # corruption. Fail closed with the corruption itself:
+        try:
+            pre_recs, _ = rr.load_checkpoint(
+                os.path.join(workdir, f"run-{run_id}.jsonl"))
+        except rr.RunnerProtocolError as exc:
+            raise PilotConfigError(
+                f"this run's checkpoint is corrupt (a "
+                f"mid-file line — not a kill artifact: a torn "
+                f"tail would have been dropped silently, not "
+                f"raised): {exc} — repair or restore the "
+                f"checkpoint (a --resume on a corrupt "
+                f"checkpoint is a config error, exit 2, before "
+                f"any session)") from exc
+        for r in pre_recs:
+            m = _meta_of(r)
+            if m.get("imported_from"):
+                line = dict(r)
+                line["meta"] = m
+                m.pop("imported_from", None)
+                imported[r.get("instance_id")] = line
+        imported = {iid: line for iid, line in imported.items()
+                   if iid in known}
+        if imported:
+            label = ("the checkpoint's seeded lines "
+                    f"({len(imported)} line(s) from "
+                    f"{state.get('imported_run') or '?'})")
+    # the round-20 Medium fix (issue #22, 4450828209): the
+    # shared fail-closed validation of every re-derived line
+    # (the ts contract + the reference schema + the round-15
+    # ref traversal guard). The round-26 Medium fix (issue #22,
+    # 4451289798): a state["import_source"] value is fed to the
+    # validation unchecked — a corrupt (non-dict) value would
+    # crash on rec.get with an uncaught AttributeError (exit 4)
+    # instead of the documented fail-closed exit-2 contract
+    # (the checkpoint branch's lines are dicts by construction —
+    # load_checkpoint validates the record shape)
+    for _iid, _rec in imported.items():
+        if not isinstance(_rec, dict):
+            raise PilotConfigError(
+                f"the import re-derivation line for {_iid!r} "
+                f"is not a record ({type(_rec).__name__}) — a "
+                f"corrupt state line (fail-closed before any "
+                f"session)")
+        _validate_imported_line(
+            _rec, _iid,
+            "the import re-derivation (state / checkpoint "
+            "line)")
+    # the round-18 Medium fix (issue #22 AC2): the re-derivation
+    # must fail-closed on ZERO overlap with the current
+    # instance file — the state's import bookkeeping is truthy
+    # but the re-derived set (imported + the state's retry
+    # class, filtered to the current file) is empty: a
+    # --resume pointed at a different (still stratified)
+    # --instances file would otherwise proceed with zero
+    # overlap and item 16 renders the vacuous non-gating n/a
+    # (the completing record can GO with no AC2 evidence — the
+    # same under-evidenced-verdict class the flag-path
+    # zero-overlap guard made a config error)
+    state_retry = {k for k in
+                  (state.get("import_retry_class") or {})
+                  if k in known}
+    if (not imported and not state_retry
+            and (state.get("imported_run")
+                 or state.get("import_source"))
+            and (state.get("imported")
+                 or state.get("import_retry_class"))):
+        raise PilotConfigError(
+            f"the --resume import re-derivation "
+            f"({state.get('imported_run')!r}) shares no "
+            "instance ids with this invocation's instance "
+            "file — a source / instance mismatch "
+            "(fail-closed: a zero-overlap re-derivation "
+            "would let the record GO with item 16 n/a and "
+            "zero AC2 evidence)")
+    provenance = ("state" if imported and
+                 isinstance(state.get("import_source"), dict)
+                 and state["import_source"]
+                 else ("checkpoint" if imported else ""))
+    return imported, label, provenance
+
+
+def _check_pilot_b_requirements(config: PilotConfig, state: dict,
+                               imported: "Optional[dict]" = None) -> None:
+    """The round-13 Medium fix (issue #22 AC2): a pilot-B run
+    requires the 2-run overlap evidence (AC2) — the ``--import-run``
+    source (this or an earlier window — the state or checkpoint
+    re-derivation). A ``--pilot b`` invocation with no import at
+    all rendered item 16 ``n/a (no import — non-gating)`` and could
+    GO with zero AC2 overlap evidence — the same under-evidenced-
+    verdict hole the zero-overlap guard closed for a mismatched
+    source. Fail-closed: a config error before any session (pilot B
+    is defined as reusing the Pilot A checkpoint — a no-import
+    pilot-B run is not the documented pilot B; run it as a pilot
+    A). The round-14 Medium fix (issue #22 AC1): a pilot-B run
+    also requires the AC1 stratification evidence — the instance
+    file's ``_meta.stratified_repos``. Without it, item 15 renders
+    n/a (non-gating) and the record could GO with zero AC1
+    stratification evidence — the same under-evidenced-verdict
+    hole left open for item 15 (e.g. ``--instances
+    pilot_instances.json --import-run pilotA`` — a valid source
+    with a meta-less instance file). Fail-closed: a config error
+    before any session (pilot B is defined as the stratified
+    12-repo set — a non-stratified instance file is not the
+    documented pilot B; run it as a pilot A)."""
+    if (config.pilot == "b"
+            and not config.import_run
+            and not imported
+            and not state.get("imported_run")
+            and not state.get("import_source")):
+        raise PilotConfigError(
+            "--pilot b requires --import-run (AC2 — the 2-run "
+            "overlap/variance evidence is pilot B's definition; a "
+            "no-import pilot-B run would GO with item 16 n/a and "
+            "zero AC2 evidence) — or a --resume on a workdir whose "
+            "state carries the import bookkeeping")
+    if config.pilot == "b" and _stratified_repos(config) is None:
+        raise PilotConfigError(
+            "--pilot b requires the instance file's "
+            "_meta.stratified_repos (AC1 — the 12-repo "
+            "stratification is pilot B's definition; a "
+            "non-stratified instance file would GO with item 15 "
+            "n/a and zero AC1 evidence) — use --pilot a for a "
+            "non-stratified run")
 
 
 def run_pilot(config: PilotConfig,
@@ -2192,13 +3699,86 @@ def run_pilot(config: PilotConfig,
     insts = load_instances(config.instances_file)
     run_id = config.run_id or time.strftime("pilot-%Y%m%d-%H%M%S")
     config.run_id = run_id
-    workdir = config.workdir or os.path.join(os.getcwd(), "pilot-a")
+    workdir = config.workdir or os.path.join(
+        os.getcwd(), "pilot-b" if config.pilot == "b" else "pilot-a")
     config.workdir = workdir
     os.makedirs(workdir, exist_ok=True)
     jsonl = os.path.join(workdir, f"run-{run_id}.jsonl")
+    record_name = RECORD_NAMES[config.pilot]
+
+    # the WP6b import (issue #22 AC2) — fail-closed validation for
+    # BOTH the dry run and the live run: a missing / corrupt source
+    # is a config error before anything else (no session, no report)
+    imported: dict = {}
+    import_retry: dict = {}
+    if config.import_run:
+        imported, import_retry = load_imported(config, workdir, insts)
+        print(f"[pilot] import from {config.import_run}: reused "
+              f"{len(imported)} (never-rerun — skipped, no session "
+              "spent); retry-class (the pass@1 re-run): "
+              f"{sorted(import_retry)}")
 
     # -- dry run: the zero-quota validation ------------------------------
     if config.dry_run:
+        # the round-13 Medium fix (issue #22 AC2): the pilot-B
+        # import requirement in the dry run too — the dry run
+        # renders no verdict (all n/a), but fail-closed
+        # consistency: a dry run that passes must be an invocation
+        # that would actually work (the round-14 AC1 stratification
+        # requirement too — the same check). The round-16 Minor
+        # fix (issue #22 AC2) applied the checkpoint re-derivation;
+        # the round-23 Major fix (issue #22, 4451051304) extends
+        # it to the FULL shared re-derivation (the state branch —
+        # the first draft's truthy state bookkeeping skipped the
+        # derivation entirely, so the zero-overlap guard never
+        # fired in a dry run: a --dry-run --resume pointed at a
+        # different stratified --instances file exited 0 where
+        # the identical live invocation exits 2 — and the
+        # state / checkpoint-derived lines' fail-closed
+        # validation, which the checkpoint-only draft bypassed).
+        # The guard mirrors the live path's exact predicate
+        # (``not imported and config.resume`` — a flag invocation
+        # whose imported set is empty — the all-retry-class or
+        # all-stale case — re-derives live, so the dry run must
+        # too)
+        dry_state = _load_state(workdir, run_id)
+        dry_imported = None
+        if (config.resume and not imported
+                and config.pilot == "b"):
+            dry_imported, _, _ = _rederive_import(
+                dry_state, workdir, run_id, insts)
+        # the round-19 Minor fix (issue #22, 4450720403): the dry
+        # run reproduces the LIVE guard's exact predicate — the
+        # live path rejects a non-resume --import-run only when a
+        # checkpoint EXISTS after the import seeding (the
+        # existing-checkpoint guard), which never fires when the
+        # import seeds nothing (an all-retry-class source) and
+        # the workdir has no checkpoint yet (the repair
+        # early-returns on a missing file; an empty seeding
+        # creates no file) — the identical live invocation
+        # proceeds. Rejecting unconditionally let the dry run
+        # refuse an invocation the live path accepts (the 'a dry
+        # run that passes is an invocation that would actually
+        # work' contract, both directions)
+        if (config.import_run is not None
+                and not config.resume):
+            checkpoint_exists = os.path.isfile(
+                os.path.join(config.workdir,
+                             "run-" + config.run_id + ".jsonl"))
+            # a non-empty validated import would seed (and
+            # thereby create) the checkpoint — the live guard
+            # fires then
+            import_would_seed = bool(imported)
+            if checkpoint_exists or import_would_seed:
+                raise PilotConfigError(
+                    "--import-run seeds this run's checkpoint "
+                    "(existing checkpoint / a non-empty import "
+                    "would create one); pass --resume so the "
+                    "import is the first window of a resumable "
+                    "pilot (the live path's existing-checkpoint "
+                    "guard)")
+        _check_pilot_b_requirements(config, dry_state,
+                                   dry_imported)
         cal = calibrate([], config)
         items = build_checklist(
             config=config, dry_run=True, gate=None, preflight_ok=None,
@@ -2206,13 +3786,17 @@ def run_pilot(config: PilotConfig,
             interrupted_this_run=None, resume_after_interrupt=False,
             devin_ok=None, sessions_used=0,
             wall_budget_s=config.max_wall_s
-            * config.max_sessions_per_day, wall_used_s=0.0)
+            * config.max_sessions_per_day, wall_used_s=0.0,
+            pilot_b=config.pilot == "b",
+            stratified_repos=_stratified_repos(config),
+            imported=imported, repo_by_iid=_repo_by_iid(insts))
         _remove_stale_record(workdir)  # the skeleton replaces the last
         # completed run's verdict — a stale file is never kept
-        with open(os.path.join(workdir, "wp6a-go-no-go.md"), "w",
+        with open(os.path.join(workdir, record_name), "w",
                   encoding="utf-8", newline="") as f:
             f.write(render_checklist_md(items, config, cal, {
-                "run_id": run_id, "devin_cli_version": "dry-run"}))
+                "run_id": run_id, "devin_cli_version": "dry-run"},
+                title=_pilot_title(config)))
         print(f"[dry-run] config ok · mode={config.mode} · "
               f"model={config.model} · {len(insts)} instances: "
               + ", ".join(i["instance_id"] for i in insts))
@@ -2238,6 +3822,130 @@ def run_pilot(config: PilotConfig,
     interrupted_before = bool(state.get("interrupted"))
     aborted_before = bool(state.get("aborted"))
     resume_exercised_before = bool(state.get("resume_exercised"))
+    # the early import record (issue #22 AC2 — the mid-seed crash
+    # class): a host crash mid-seeding leaves only PART of the
+    # import in the checkpoint — a checkpoint re-derivation on the
+    # follow-up --resume would treat that subset as the complete
+    # import, and the unseeded never-rerun instances would re-run
+    # (a silent AC2 violation item 16 cannot see, its comparison
+    # set being the same truncated subset). Persisting the FULL
+    # import bookkeeping BEFORE the seeding makes the state source
+    # (the full set) take precedence on that resume — the missing
+    # lines re-seed (the idempotent seeding skips the present
+    # ones), and item 16's comparison set is the true source set
+    # the round-22 Medium fix (issue #22, 4450983654): the
+    # early import record is written for EVERY --import-run
+    # invocation — not only when ``imported`` is non-empty. An
+    # all-retry-class import (no never-rerun shared ids) seeds
+    # nothing and previously persisted no bookkeeping before the
+    # sessions: a crash — or a graceful pre-flight / model-gate
+    # early exit (which also writes no state) — then left the
+    # documented bare --resume failing the pilot-B import
+    # requirement (exit 2) with neither state nor seeded
+    # imported_from lines to re-derive from. Persisting the
+    # bookkeeping (an empty imported set + the retry class +
+    # the absolute workdir) on every --import-run makes the
+    # resume re-derive from the state (the requirements check
+    # accepts state bookkeeping; the retry-class ids stay in
+    # the queue — they were never seeded and run in this run,
+    # the pass@1 contract)
+    if config.import_run:
+        state["imported"] = sorted(imported)
+        state["import_source"] = imported
+        state["imported_run"] = config.import_run
+        # the round-17 Medium fix (issue #22 AC2): persist the
+        # import workdir ABSOLUTE — a relative --import-workdir
+        # resolved against this invocation's cwd at import time;
+        # a continuation window (a different cwd — the operator
+        # re-invokes from wherever) must re-resolve it to the
+        # SAME source workdir, or the artifact self-heal copy
+        # finds missing sources and the WP5 cross-check fails —
+        # a report_failed wedge every subsequent resume re-hits
+        # (when the flag's workdir is absent the source is this
+        # run's workdir — persist that, absolute)
+        state["import_workdir"] = os.path.abspath(
+            config.import_workdir or workdir)
+        state["import_retry_class"] = {
+            k: v for k, v in sorted(import_retry.items())}
+        _write_state(workdir, run_id, state)
+    # the WP6b import re-derivation (issue #22 AC2): the documented
+    # multi-window flow drops --import-run on the continuation
+    # windows — but item 16 must still gate on the completing
+    # (verdict-producing) record. Two sources: the state file's
+    # ``import_source`` (persisted by the early import record —
+    # BEFORE the seeding — so a mid-seed crash resume sees the FULL
+    # set; the end-of-run write repeats it), or — when a graceful
+    # early exit (the pre-flight failure, the model-gate refusal, a
+    # load_checkpoint protocol error) left no state — the
+    # checkpoint's own seeded lines (they carry
+    # ``meta.imported_from`` + the original ``ts``; the source line
+    # is the line minus the marker). Both filtered to the current
+    # instance file (a stale id is ignored — the load_imported
+    # semantics). Crash-atomic contract (the round-7 Major fix,
+    # issue #22): the state write is tmp + fsync + os.replace
+    # (:func:`_write_state`) — a mid-write crash leaves the
+    # previous state intact (or NO file on a fresh workdir — a
+    # VISIBLE anomaly, never a torn JSON swallowed to {} by
+    # :func:`_load_state`): the fallback trusts the seeded lines
+    # as the complete import BECAUSE a torn state can no longer
+    # destroy the recovery info — and a completely lost state (a
+    # fresh-workdir crash before the first state write lands) is
+    # the visible anomaly the operator resolves by re-invoking the
+    # import window (the seeding is idempotent; the state is
+    # rewritten).
+    import_provenance = ""
+    # the round-29 Major fix (issue #22, 4451583330): the import
+    # is a PILOT-B concept (the --import-run flag is a config
+    # error under --pilot a) — the re-derivation must be gated
+    # the same way: a --pilot a --resume on a pilot-B workdir
+    # used to re-derive imported from the state / checkpoint
+    # bookkeeping, seed imported_from lines, and render the WP6a
+    # 14-item record with the import unverified (items 15–17 do
+    # not render under --pilot a) — the exact hazard
+    # __post_init__ fail-closes on for the flag
+    if (not imported and config.resume
+            and config.pilot == "b"):
+        imported, label, import_provenance = _rederive_import(
+            state, workdir, run_id, insts)
+        if label:
+            print(f"[pilot] import re-derived from "
+                  f"{label}")
+    # the round-13 Medium fix (issue #22 AC2): the pilot-B import
+    # requirement (this or an earlier window — the re-derivation
+    # above satisfies it; a no-import pilot-B run is a config
+    # error before any session) + the round-14 Medium fix
+    # (issue #22 AC1): the stratification requirement
+    _check_pilot_b_requirements(config, state, imported)
+    # the WP6b import seeding (issue #22 AC2) — BEFORE the resume
+    # read: the imported (never-rerun) lines must be in the
+    # checkpoint when ``resume_queue`` decides what to skip. The
+    # referenced-artifact copy runs for EVERY imported id (not just
+    # the newly seeded ones — a crash between a line's fsync and
+    # its artifact copy leaves a durable line with missing
+    # artifacts; the idempotent per-file copy self-heals that on
+    # the next invocation). The source workdir is the flag's, or
+    # the state file's on the continuation windows (the flag is
+    # dropped there; the state record persists it)
+    if imported:
+        # the import marker: the flag's source run id, or the state
+        # record's on the continuation windows (the flag is dropped
+        # there) — a None marker would break the re-derivation +
+        # the window/calibration exclusion (they key on it)
+        marker = (config.import_run
+                 or state.get("imported_run")
+                 or "imported")
+        seeded = seed_import_lines(
+            jsonl, imported, marker,
+            src_workdir=(config.import_workdir
+                        or state.get("import_workdir")
+                        or workdir))
+        if seeded:
+            label = (config.import_run
+                    or state.get("imported_run")
+                    or "state/checkpoint")
+            print(f"[pilot] imported {len(seeded)} instance "
+                  f"line(s) from {label} (skipped — never re-run, "
+                  "no session spent)")
     skipped_on_resume: dict = {}
     to_run = [i["instance_id"] for i in insts]
     if os.path.isfile(jsonl):
@@ -2339,7 +4047,8 @@ def run_pilot(config: PilotConfig,
                 devin_bin=config.devin_bin, model=config.model,
                 cwd=prep["cwd"], env=prep["env"],
                 wall_s=config.max_wall_s,
-                host_check=bool(config.host_check), workdir=workdir)
+                host_check=bool(config.host_check), workdir=workdir,
+                run_id=config.run_id)
         else:
             # a crashed attempt's agent container may still be up on a
             # crash-resume — ``docker run --name`` would fail with
@@ -2355,7 +4064,8 @@ def run_pilot(config: PilotConfig,
                 cwd="/testbed", env=cprep["env"],
                 wall_s=config.max_wall_s,
                 host_check=bool(config.host_check), workdir=workdir,
-                container=cprep["container"])
+                container=cprep["container"],
+                run_id=config.run_id)
         s = PilotSession(spec, make_session=make_session)
         # the pre-session guard record (the checklist item 14 evidence —
         # kept in the session meta so the line merger persists it)
@@ -2417,6 +4127,47 @@ def run_pilot(config: PilotConfig,
                            else ("run_failed" if run_failed
                                 else "done"))),
         "completed_this_invocation": rep_.done_count,
+        # the import bookkeeping: the current invocation's flag
+        # values, or — on a continuation window (the flag is
+        # dropped there; the source re-derived from this record) —
+        # the previous invocation's (without this, the end-of-run
+        # write nulls imported_run / import_workdir and the next
+        # window's seeding cannot self-heal the referenced
+        # artifacts from the source workdir)
+        "imported_run": (config.import_run
+                        if config.import_run
+                        else state.get("imported_run")),
+        "imported": (sorted(imported)
+                    if import_provenance != "checkpoint"
+                    else []) or state.get("imported", []),
+        # the round-24 Major fix (issue #22, 4451121577): a
+        # checkpoint-derived imported set must NOT be persisted
+        # as import_source — that would make item 16's
+        # self-comparison durable on every later resume (the
+        # same self-referential comparison the self-import
+        # guard rejects); the state stays bookkeeping-less so
+        # the later resumes stay on the checkpoint fallback
+        # (provenance stays "checkpoint")
+        "import_source": (imported
+                         if import_provenance != "checkpoint"
+                         else {})
+                         or state.get("import_source", {}),
+        # the round-17 Medium fix (issue #22 AC2): persist the
+        # import workdir ABSOLUTE here too (the same contract as
+        # the early import record — a relative flag value must
+        # not survive into the state: a continuation window with
+        # a different cwd would re-resolve it against the wrong
+        # cwd — missing sources → the cross-check fails → a
+        # report_failed wedge)
+        "import_workdir": (os.path.abspath(
+            config.import_workdir or workdir)
+            if config.import_workdir
+            else state.get("import_workdir")),
+        "import_retry_class": ({k: v
+                               for k, v in
+                               sorted(import_retry.items())}
+                              or state.get("import_retry_class",
+                                          {})),
         "ts": time.time(),
     })
     ckpt.close()
@@ -2437,8 +4188,13 @@ def run_pilot(config: PilotConfig,
     # the calibration + item 8/9 stats count ATTEMPTS (every line
     # with an instance id) — a superseded eval_error→rerun attempt
     # measured wall + tokens that must not drop out of the record
-    # (the same basis as the item-12 budget gate)
-    attempts = [r for r in records if r.get("instance_id")]
+    # (the same basis as the item-12 budget gate). Imported lines
+    # are EXCLUDED: they are the source run's sessions (never-rerun
+    # reuse — no session of this run spent), and folding their
+    # source-run wall/usage into this run's per-session stats would
+    # misstate the run the calibration measures
+    attempts = [r for r in records if r.get("instance_id")
+               and not _meta_of(r).get("imported_from")]
     cal = calibrate(attempts, config)
     meta = {
         "run_id": run_id,
@@ -2481,6 +4237,38 @@ def run_pilot(config: PilotConfig,
             "final_state": "report_failed",
             "report_error": "the WP5 report pipeline failed",
             "completed_this_invocation": rep_.done_count,
+            # the import bookkeeping: the same preserve-on-
+            # continuation fallback as the main write (a report
+            # failure on the documented no-flag continuation window
+            # must not null the import fields — the next resume's
+            # artifact self-heal resolves the source workdir from
+            # them; without the fallback a missing referenced
+            # artifact — a plausible cause of the report failure
+            # itself — could never be self-healed and every
+            # subsequent resume would stay wedged in report_failed)
+            "imported_run": (config.import_run
+                            if config.import_run
+                            else state.get("imported_run")),
+            "imported": (sorted(imported)
+                        if import_provenance != "checkpoint"
+                        else []) or state.get("imported", []),
+            # the round-24 Major fix (issue #22, 4451121577):
+            # the same no-laundering contract as the end-of-run
+            # write (a checkpoint-derived set must not become
+            # the durable import_source)
+            "import_source": (imported
+                             if import_provenance != "checkpoint"
+                             else {})
+                             or state.get("import_source", {}),
+            "import_workdir": (os.path.abspath(
+                config.import_workdir or workdir)
+                if config.import_workdir
+                else state.get("import_workdir")),
+            "import_retry_class": ({k: v
+                                   for k, v in
+                                   sorted(import_retry.items())}
+                                  or state.get("import_retry_class",
+                                              {})),
             "ts": time.time(),
         })
         _remove_stale_record(workdir)
@@ -2488,6 +4276,13 @@ def run_pilot(config: PilotConfig,
               "WP5 report pipeline failed — no verdict rendered; "
               "the run is the resume class")
         return EXIT_RUN_FAILED
+    # the AC4 per-window budget view (issue #22) — the item-12 gate
+    # buckets the checkpoint lines by their ts's UTC day; a
+    # multi-window run never fails the per-day cap by construction,
+    # and a single-window run renders the verbatim WP6a text
+    buckets = _window_buckets(records)
+    sessions_used = sum(w["sessions"] for w in buckets.values())
+    wall_used_s = sum(w["wall_s"] for w in buckets.values())
     items = build_checklist(
         config=config, dry_run=False, gate=gate,
         preflight_ok=preflight_ok, preflight_failures=preflight_failures,
@@ -2498,33 +4293,66 @@ def run_pilot(config: PilotConfig,
         resume_after_interrupt=(interrupted_before
                                or resume_exercised_before),
         devin_ok=bool(inst_records) and not run_failed,
-        # the budget gate counts ATTEMPTS (all checkpoint lines with
-        # an instance id — a superseded eval_error→rerun or a stale
-        # preflight_failed line burned a session / wall that the
-        # deduped view would silently drop), consistent with the
-        # wall sum and with WP5's session arithmetic
-        sessions_used=sum(
-            1 for r in records
-            if r.get("instance_id")
-            and r.get("status") != "preflight_failed"),
+        # the budget gate counts ATTEMPTS (every checkpoint line
+        # with an instance id, EXCEPT a preflight_failed line — the
+        # WP3 contract: the pre-flight failed before the session, so
+        # it burned nothing; _window_buckets skips those lines),
+        # consistent with the wall sum and with WP5's session
+        # arithmetic
+        sessions_used=sessions_used,
         wall_budget_s=config.max_wall_s * config.max_sessions_per_day,
-        wall_used_s=sum(
-            (r.get("meta") or {}).get("wall_s", 0.0)
-            for r in records if r.get("instance_id")))
-    with open(os.path.join(workdir, "wp6a-go-no-go.md"), "w",
+        wall_used_s=wall_used_s,
+        pilot_b=config.pilot == "b",
+        stratified_repos=_stratified_repos(config),
+        imported=imported,
+        # the round-12 Medium fix (issue #22 AC2): item 16 must
+        # distinguish an attempted-but-zero-import from a
+        # legitimate non-import run — the attempt is this
+        # invocation's --import-run or an earlier window's
+        # (the state re-derivation)
+        import_attempted=(bool(config.import_run)
+                         or bool(state.get("imported_run")
+                                or state.get("import_source"))),
+        import_provenance=import_provenance,
+        repo_by_iid=_repo_by_iid(insts),
+        arithmetic_total=len(insts),
+        window_buckets=buckets)
+    # the pilot-B record sections (issue #22) — the per-repo
+    # stratification table, the 2-run overlap/variance table, the
+    # failure taxonomy + root-cause table, the per-window budget
+    # table
+    if config.pilot == "b":
+        meta["wp6b"] = _pilot_b_sections(
+            config, insts, records, inst_records, imported, buckets,
+            import_attempted=(bool(config.import_run)
+                             or bool(state.get("imported_run")
+                                    or state.get("import_source"))),
+            import_provenance=import_provenance)
+    with open(os.path.join(workdir, record_name), "w",
               encoding="utf-8", newline="") as f:
         f.write(render_checklist_md(items, config, cal, meta,
-                                   interrupted=interrupted))
-    verdict, failed = _verdict(items, interrupted=interrupted)
+                                   interrupted=interrupted,
+                                   title=_pilot_title(config),
+                                   gating=_pilot_gating(config)))
+    verdict, failed = _verdict(items, interrupted=interrupted,
+                              gating=_pilot_gating(config))
     print(f"[pilot] go/no-go: {verdict}"
           + (f" (failed: {', '.join(failed)})" if failed else ""))
     rep_dir = os.path.join(workdir, "report")
-    gng = os.path.join(workdir, "wp6a-go-no-go.md")
+    gng = os.path.join(workdir, record_name)
     print(f"[pilot] artifacts: {jsonl} · {rep_dir} · {gng}")
 
     if interrupted:
+        # the round-29 Major fix (issue #22, 4451583330): the
+        # resume hint used to omit the pilot flag — on a
+        # pilot-B workdir that steered the operator into a
+        # --pilot a --resume (the pre-fix hazard: the import
+        # re-derivation / seeding ran without items 15–17). The
+        # state carries the run's pilot kind in the record name
+        # context; the hint now carries the flag explicitly
         print(f"[pilot] resume with: {os.path.basename(sys.argv[0])} "
-              f"--resume --run-id {run_id} … (the finished instance(s) "
+              f"--pilot {config.pilot} --resume --run-id {run_id} "
+              f"… (the finished instance(s) "
               "are skipped — never re-run)")
         return EXIT_INTERRUPT
     if run_failed:
@@ -2539,11 +4367,17 @@ def run_pilot(config: PilotConfig,
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="live_pilot",
-        description="the WP6a Pilot-A smoke harness (issue #21) — "
-                    "BENCH_LIVE=1 required for a real run")
+        description="the WP6a/WP6b pilot smoke harness "
+                    "(issues #21/#22) — BENCH_LIVE=1 required for a "
+                    "real run")
     p.add_argument("--mode", choices=("container", "sandbox"),
                    default="sandbox")
-    p.add_argument("--instances", default=DEFAULT_INSTANCES_FILE)
+    p.add_argument("--instances", default=None,
+                   help="the instances file (default: "
+                        f"{os.path.basename(DEFAULT_INSTANCES_FILE)} "
+                        "for --pilot a, "
+                        f"{os.path.basename(DEFAULT_B_INSTANCES_FILE)} "
+                        "for --pilot b)")
     p.add_argument("--devin-bin", default="devin")
     p.add_argument("--model", default=DEFAULT_MODEL)
     p.add_argument("--workdir", default=None)
@@ -2558,6 +4392,26 @@ def _build_parser() -> argparse.ArgumentParser:
                    action="store_false")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--largest-bytes", type=float, default=None)
+    p.add_argument("--pilot", choices=("a", "b"), default="a",
+                   help="the pilot kind (issue #22: 'b' = the 25-"
+                        "instance, 12-repo stratified pilot; the "
+                        "default workdir/record naming follows)")
+    p.add_argument("--import-run", default=None,
+               help="the WP6b checkpoint import: the source run's "
+                    "id (issue #22 AC2 — the 3 Pilot A instances "
+                    "are reused inside the 25, never re-run; "
+                    "a pilot-B flag, verified by items 15–17; "
+                    "the run id charset "
+                    "[A-Za-z0-9][A-Za-z0-9._-]*). The first "
+                    "import window must also pass --resume: the "
+                    "import seeds this run's checkpoint, and a "
+                    "non-resume invocation with an existing "
+                    "checkpoint is rejected (exit 2) — the "
+                    "imported lines are the expected contents, "
+                    "not a silent re-run")
+    p.add_argument("--import-workdir", default=None,
+                   help="the source run's workdir (default: this "
+                        "run's workdir; requires --import-run)")
     return p
 
 
@@ -2569,7 +4423,9 @@ def main(argv: "Optional[list]" = None) -> int:
         # workdir is resolved exactly as run_pilot does, and the
         # previous run's verdict is removed before the first thing
         # that can fail (a stale verdict is never kept)
-        wd = args.workdir or os.path.join(os.getcwd(), "pilot-a")
+        wd = args.workdir or os.path.join(
+            os.getcwd(),
+            "pilot-b" if args.pilot == "b" else "pilot-a")
         os.makedirs(wd, exist_ok=True)
         _remove_stale_record(wd)
         budget = load_budget_file()
@@ -2593,14 +4449,19 @@ def main(argv: "Optional[list]" = None) -> int:
             raise PilotConfigError("--largest-bytes must be > 0")
         config = PilotConfig(
             mode=args.mode, devin_bin=args.devin_bin, model=args.model,
-            instances_file=args.instances, workdir=args.workdir,
+            instances_file=args.instances
+            or (DEFAULT_B_INSTANCES_FILE if args.pilot == "b"
+                else DEFAULT_INSTANCES_FILE),
+            workdir=args.workdir,
             run_id=args.run_id, max_sessions_per_day=msp,
             max_wall_s=mw,
             largest_bytes=args.largest_bytes
             or (DEFAULT_LARGEST_IMAGE_BYTES if args.mode == "container"
                 else DEFAULT_LARGEST_CHECKOUT_BYTES),
             interrupt_after=args.interrupt_after, resume=args.resume,
-            dry_run=args.dry_run, host_check=args.host_check)
+            dry_run=args.dry_run, host_check=args.host_check,
+            pilot=args.pilot, import_run=args.import_run,
+            import_workdir=args.import_workdir)
         return run_pilot(config)
     except LiveRefused as exc:
         print(f"[pilot] REFUSED: {exc}")

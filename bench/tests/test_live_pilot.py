@@ -39,6 +39,30 @@ Acceptance mapping (issue #21, PLAN-WP6A.md):
   network)
 * the sandbox hygiene (the leak guard + the ephemeral XDG + the env
   hygiene, PLAN §3.2–§3.6) → :func:`test_prepare_sandbox_instance`
+* WP6b (issue #22, PLAN-WP6B.md) — the ``--import-run`` checkpoint
+  import: the never-rerun statuses are imported verbatim (the
+  original timestamp preserved, no session spent), the retry-class
+  status is re-run per pass@1, the idempotent seeding (a repeat
+  ``--resume`` never duplicates an import line), the referenced
+  artifacts are copied so this run's WP5 cross-check holds, the
+  fail-closed source validation (a missing / corrupt source is a
+  config error before the pre-flight) →
+  :func:`test_import_run_reuses_never_rerun_and_reruns_retry`,
+  :func:`test_import_run_source_missing_is_config_error`
+* the checklist items 15 (stratification, AC1), 16 (the 2-run
+  overlap/variance — the import's terminal vs the final — AC2), 17
+  (every ``eval_error`` root-caused to env / parser / patch — AC3),
+  12 (the per-UTC-window budget gate — AC4; a single-window run
+  renders the verbatim WP6a text) →
+  :func:`test_item15_stratification_gates`,
+  :func:`test_item16_overlap_variance_gates`,
+  :func:`test_item17_root_cause_gates`,
+  :func:`test_item12_per_window_budget`
+* the root-cause taxonomy (the host-check failure points →
+  env / parser / patch; the WP4 typed errors; the oversize-patch
+  cap) → :func:`test_host_check_root_cause_classes`,
+  :func:`test_container_eval_error_root_cause`,
+  :func:`test_oversize_patch_root_cause_is_patch`
 """
 
 from __future__ import annotations
@@ -47,6 +71,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -2063,3 +2088,3388 @@ def test_host_check_flag_rejected_in_container_mode(tmp_path):
     # the default (None) stays valid in both modes
     assert lp.PilotConfig(mode="container").host_check is False
     assert lp.PilotConfig(mode="sandbox").host_check is True
+
+
+# ---------------------------------------------------------------------------
+# WP6b (issue #22) — the import / reuse, the stratification, the
+# root-caused eval_error, the per-window budget (zero quota, mock-
+# driven + the checklist math direct)
+# ---------------------------------------------------------------------------
+
+def _rec(iid, status, **meta):
+    """A minimal deduped checkpoint record (the checklist input shape)."""
+    m = {"wall": {"session_s": 60.0},
+         "permissions": {"requests": 1, "allowed": 1, "denied": 0},
+         "vendor_notifications": 0, "orphan_check": True,
+         "pruning": {"removed": [], "failed": []},
+         "leak_guard": {"remotes_after": [], "warnings": []},
+         "leak_verify": {"remotes": [], "tags": [], "clean": True}}
+    m.update(meta)
+    return {"instance_id": iid, "status": status, "meta": m}
+
+
+def _cb(**over):
+    """A pilot-B checklist build (the WP6a setup + the pilot-B params)."""
+    base = dict(
+        config=lp.PilotConfig(pilot="b", max_wall_s=2700.0),
+        dry_run=False,
+        gate={"allowed": True, "cost_tier": "Free", "reason": None},
+        preflight_ok=True,
+        preflight_failures=[],
+        records=[
+            {"instance_id": "a", "status": "resolved", "meta": {
+                "wall": {"session_s": 60.0},
+                "usage": {"totalTokens": 100},
+                "permissions": {"requests": 1, "allowed": 1,
+                               "denied": 0},
+                "vendor_notifications": 2, "orphan_check": True,
+                "graded_by": "host_check(pytest -rA)",
+                "patch_diff": "patch.diff",
+                "pruning": {"removed": ["agent checkout"],
+                           "failed": []},
+                "leak_guard": {"remotes_after": [], "warnings": []},
+                "leak_verify": {"remotes": [], "tags": [],
+                               "clean": True}}},
+        ],
+        skipped_on_resume={},
+        interrupted_this_run=None,
+        resume_after_interrupt=False,
+        devin_ok=True,
+        sessions_used=1,
+        wall_budget_s=2700.0 * 10,
+        wall_used_s=60.0,
+        pilot_b=True,
+        stratified_repos=["test/repo0"],
+        imported=None,
+        repo_by_iid={"a": "test/repo0"},
+        arithmetic_total=1,
+    )
+    base.update(over)
+    return lp.build_checklist(**base)
+
+
+def _item(items, num):
+    return [i for i in items if i["item"].split(" ", 1)[0] == num][0]
+
+
+def test_item15_stratification_gates(tmp_path, monkeypatch):
+    """AC1 — every repo in the instance file's ``stratified_repos``
+    meta must have a final line."""
+    monkeypatch.setenv(lp.LIVE_ENV, "1")
+    repos = [f"test/repo{i}" for i in range(3)]
+    recs = [_rec(f"r{i}", "resolved") for i in range(3)]
+    items = _cb(records=recs, stratified_repos=repos,
+               repo_by_iid={f"r{i}": f"test/repo{i}" for i in range(3)},
+               sessions_used=3, wall_used_s=180.0)
+    assert _item(items, "15")["pass"] is True
+    # one repo missing from the finals -> NO-GO (15 gates for a
+    # pilot-B run)
+    items = _cb(records=recs[:2], stratified_repos=repos,
+               repo_by_iid={f"r{i}": f"test/repo{i}" for i in range(3)},
+               sessions_used=2, wall_used_s=120.0)
+    assert _item(items, "15")["pass"] is False
+    verdict, failed = lp._verdict(items,
+                                  gating=lp._pilot_gating(
+                                      lp.PilotConfig(pilot="b")))
+    assert verdict == "NO-GO"
+    assert any(f.split(" ", 1)[0] == "15" for f in failed)
+    # a meta-less file -> n/a (non-gating)
+    items = _cb(stratified_repos=None)
+    assert _item(items, "15")["pass"] is None
+
+
+def test_item16_overlap_variance_gates(tmp_path, monkeypatch):
+    """AC2 — the source line and the final line must agree (status /
+    session wall / tokens / patch bytes); a re-run of an imported
+    instance supersedes the seeded line with a divergent final."""
+    monkeypatch.setenv(lp.LIVE_ENV, "1")
+    src = {"instance_id": "a", "status": "resolved",
+           "meta": {"wall": {"session_s": 60.0},
+                   "usage": {"totalTokens": 100}}}
+    # the GO case needs item 11 to pass too (the resume pair); the
+    # final line of an imported instance carries imported_from (the
+    # seeded line) — the arithmetic excludes it from the new count
+    items = _cb(imported={"a": src},
+               config=lp.PilotConfig(pilot="b", max_wall_s=2700.0,
+                                   resume=True),
+               resume_after_interrupt=True,
+               skipped_on_resume={"a": "no_patch"},
+               records=[_rec("a", "resolved",
+                            usage={"totalTokens": 100},
+                            imported_from="x")])
+    assert _item(items, "16")["pass"] is True
+    verdict, failed = lp._verdict(items,
+                                 gating=lp._pilot_gating(
+                                     lp.PilotConfig(pilot="b")))
+    assert verdict == "GO"
+    # a divergent final (a re-run superseded the import — a pass@1
+    # violation) -> item 16 FAIL -> NO-GO
+    items = _cb(imported={"a": src}, records=[
+        _rec("a", "resolved", wall={"session_s": 99.0})])
+    assert _item(items, "16")["pass"] is False
+    verdict, failed = lp._verdict(items,
+                                 gating=lp._pilot_gating(
+                                     lp.PilotConfig(pilot="b")))
+    assert verdict == "NO-GO"
+    assert any(f.split(" ", 1)[0] == "16" for f in failed)
+    # a status divergence (the import's terminal was re-run into a
+    # different terminal) also fails
+    items = _cb(imported={"a": src}, records=[
+        _rec("a", "no_patch")])
+    assert _item(items, "16")["pass"] is False
+    # no import -> n/a (non-gating)
+    items = _cb()
+    assert _item(items, "16")["pass"] is None
+
+
+def test_item17_root_cause_gates(tmp_path, monkeypatch):
+    """AC3 — every eval_error line must carry a root cause (env /
+    parser / patch); an unclassed line fails; zero lines pass
+    vacuously."""
+    monkeypatch.setenv(lp.LIVE_ENV, "1")
+    items = _cb(records=[
+        _rec("a", "eval_error",
+             eval_error_root_cause="env"),
+        _rec("b", "eval_error",
+             eval_error_root_cause="parser")])
+    assert _item(items, "17")["pass"] is True
+    # one unclassed -> FAIL -> NO-GO
+    items = _cb(records=[
+        _rec("a", "eval_error"),  # no root cause
+        _rec("b", "resolved")])
+    assert _item(items, "17")["pass"] is False
+    verdict, failed = lp._verdict(items,
+                                 gating=lp._pilot_gating(
+                                     lp.PilotConfig(pilot="b")))
+    assert verdict == "NO-GO"
+    assert any(f.split(" ", 1)[0] == "17" for f in failed)
+    # a class outside the taxonomy is not a class
+    items = _cb(records=[
+        _rec("a", "eval_error", eval_error_root_cause="mystery")])
+    assert _item(items, "17")["pass"] is False
+
+
+def test_item12_per_window_budget(tmp_path, monkeypatch):
+    """AC4 — a multi-window run is gated PER WINDOW (the WP3 runner
+    sleeps to the next UTC-midnight window at the local daily cap);
+    a single-window run renders the verbatim WP6a text."""
+    monkeypatch.setenv(lp.LIVE_ENV, "1")
+    day1 = int(time.time() // 86400)
+    d1, d2 = day1, day1 + 1
+    # both windows within the cap -> PASS
+    items = _cb(window_buckets={
+        d1: {"sessions": 10, "wall_s": 100.0},
+        d2: {"sessions": 5, "wall_s": 50.0}})
+    assert _item(items, "12")["pass"] is True
+    # one window over the session cap -> FAIL
+    items = _cb(window_buckets={
+        d1: {"sessions": 10, "wall_s": 100.0},
+        d2: {"sessions": 11, "wall_s": 50.0}})
+    assert _item(items, "12")["pass"] is False
+    verdict, failed = lp._verdict(items,
+                                 gating=lp._pilot_gating(
+                                     lp.PilotConfig(pilot="b")))
+    assert verdict == "NO-GO"
+    assert any(f.split(" ", 1)[0] == "12" for f in failed)
+    # the per-window text is present
+    assert "windows:" in _item(items, "12")["observed"]
+    # a single-window run renders the WP6a text (the contract holds)
+    items = _cb(window_buckets={d1: {"sessions": 4,
+                                    "wall_s": 40.0}})
+    assert "sessions (attempts, incl. reruns): 4" in \
+        _item(items, "12")["observed"]
+
+
+def test_dry_run_pilot_b_writes_17_skeleton(tmp_path, live):
+    repos = _three_repos(tmp_path)
+    inst = _instances_file(tmp_path / "inst.json", repos)
+    # the round-14 Medium fix (issue #22 AC1): a pilot-B run
+    # requires the instance file's _meta.stratified_repos — add
+    # it (the AC1 evidence is pilot B's definition)
+    doc = json.loads((tmp_path / "inst.json").read_text())
+    doc["_meta"]["stratified_repos"] = [r["repo"] for r in repos]
+    (tmp_path / "inst.json").write_text(json.dumps(doc))
+    wd = tmp_path / "wd"
+    # the round-13 Medium fix: a pilot-B dry run requires the
+    # import (the AC2 evidence is pilot B's definition) — the
+    # minimal valid source checkpoint (one never-rerun line for an
+    # instance-file id)
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "run-src.jsonl").write_text(
+        json.dumps({"instance_id": repos[0]["instance_id"],
+                    "status": "resolved", "ts": 1.0}) + "\n")
+    # a no-import pilot-B dry run is a config error (exit 2)
+    rc = lp.main(["--dry-run", "--pilot", "b", "--devin-bin",
+                  MOCK_PATH, "--instances", inst,
+                  "--workdir", str(tmp_path / "wd0"),
+                  "--run-id", "dryb0"])
+    assert rc == lp.EXIT_CONFIG
+    # a --import-run without --resume is a config error (exit 2)
+    # (the round-18 Minor fix — the dry run reproduces the live
+    # --resume requirement)
+    rc = lp.main(["--dry-run", "--pilot", "b", "--devin-bin",
+                  MOCK_PATH, "--instances", inst,
+                  "--workdir", str(tmp_path / "wd1"),
+                  "--run-id", "dryb1",
+                  "--import-run", "src",
+                  "--import-workdir", str(src)])
+    assert rc == lp.EXIT_CONFIG
+    # the documented form (--import-run + --resume) writes the
+    # skeleton
+    rc = lp.main(["--dry-run", "--pilot", "b", "--resume",
+                  "--devin-bin",
+                  MOCK_PATH, "--instances", inst,
+                  "--workdir", str(wd), "--run-id", "dryb",
+                  "--import-run", "src",
+                  "--import-workdir", str(src)])
+    assert rc == lp.EXIT_OK
+    md = (wd / "wp6b-pilot-b.md").read_text()
+    for i in range(1, 18):
+        assert f"| {i} |" in md, md
+    # the WP6a record name is not written (the pilot kind selects the
+    # name) — and the stale-record invariant removes both
+    assert not (wd / "wp6a-go-no-go.md").exists()
+    assert "dry-run" in md
+
+
+def test_config_rejects_bad_pilot(tmp_path):
+    with pytest.raises(lp.PilotConfigError):
+        lp.PilotConfig(pilot="c")
+
+
+def test_import_run_source_missing_is_config_error(tmp_path, live):
+    """The import is fail-closed: a missing / corrupt source is a
+    config error (exit 2) BEFORE the pre-flight — no session is ever
+    spent against an import that did not validate."""
+    repos = _three_repos(tmp_path)
+    inst = _instances_file(tmp_path / "inst.json", repos)
+    wd = tmp_path / "wd"
+    # missing source (a path that does not exist)
+    cfg = _cfg(tmp_path, str(inst), run_id="imp", workdir=str(wd),
+              pilot="b", import_run="nope",
+              import_workdir=str(tmp_path / "absent"))
+    with pytest.raises(lp.PilotConfigError):
+        _run(cfg, _mock_make_session("ok"))
+    # a corrupt source (a non-JSON line in the MIDDLE of the file —
+    # the fsync'd corruption; a bad line at EOF is the torn-write
+    # class and is dropped, not fatal)
+    bad = tmp_path / "srcwd"
+    bad.mkdir()
+    (bad / "run-nope.jsonl").write_text(
+        json.dumps({"instance_id": "x", "status": "resolved",
+                   "meta": {}, "ts": 1.0}) + "\n"
+        + "not a checkpoint line\n"
+        + json.dumps({"instance_id": "y", "status": "resolved",
+                     "meta": {}, "ts": 2.0}) + "\n")
+    cfg = _cfg(tmp_path, str(inst), run_id="imp", workdir=str(wd),
+              pilot="b", import_run="nope",
+              import_workdir=str(bad))
+    with pytest.raises(lp.PilotConfigError):
+        _run(cfg, _mock_make_session("ok"))
+
+
+def _pilot_b_repos(tmp_path) -> "tuple[list, str]":
+    """The 3-fixture-repo pilot-B helper (the round-27 Minor fix,
+    issue #22 — the old _two_pilot_b_repos name was stale: it
+    builds THREE repos). A distinct ``repo`` per instance + a
+    ``stratified_repos`` meta (the 12-repo shape, scaled to 3
+    for the fixture)."""
+    repos = []
+    for i in range(3):
+        r = tmp_path / f"srcrepo{i}"
+        commit = _make_repo(r)
+        e = _entry(i, str(r), commit)
+        e["repo"] = f"test/repo{i}"
+        repos.append(e)
+    f = tmp_path / "inst.json"
+    f.write_text(json.dumps({
+        "_meta": {"source": "test fixture",
+                  "stratified_repos":
+                  [f"test/repo{i}" for i in range(3)]},
+        "instances": repos}))
+    return repos, str(f)
+
+
+def test_import_run_reuses_never_rerun_and_reruns_retry(
+        tmp_path, live):
+    """AC2 — the import: the never-rerun statuses are imported (the
+    line copied with its original ts + imported_from, the instance
+    skipped — never re-run, no session spent); the retry-class
+    status is NOT imported — the instance runs (the pass@1 retry
+    class). The source file is untouched; the repeat --resume is
+    idempotent (no duplicate import lines)."""
+    repos, inst = _pilot_b_repos(tmp_path)
+    ids = [e["instance_id"] for e in repos]
+    i0, i1, i2 = ids
+    wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
+    # run 1 (the source): i0 no_patch (never-rerun), i1 no_patch
+    # (never-rerun), i2 ok -> eval_error (retry class, the documented
+    # no-container skip with the host check off)
+    modes1 = {i0: "no_patch", i1: "no_patch", i2: "ok"}
+    cfg1 = _cfg(tmp_path, inst, run_id="src", workdir=str(wd1),
+               host_check=False)
+    assert _run(cfg1, _mock_make_session(modes1)) == lp.EXIT_OK
+    lines1 = _read_jsonl(wd1 / "run-src.jsonl")
+    assert len(lines1) == 3
+    src_ts = {l["instance_id"]: l["ts"] for l in lines1}
+    src_bytes = (wd1 / "run-src.jsonl").read_bytes()
+    # run 2 (the pilot-B import): i0/i1 imported + skipped; i2
+    # re-runs (the retry class)
+    modes2 = {i0: "no_patch", i1: "no_patch", i2: "ok"}
+    cfg2 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               resume=True, host_check=False, pilot="b",
+               import_run="src", import_workdir=str(wd1))
+    assert _run(cfg2, _mock_make_session(modes2)) == lp.EXIT_OK
+    lines2 = _read_jsonl(wd2 / "run-pilotB.jsonl")
+    # 3 lines: i0 + i1 (imported — the original ts, imported_from) +
+    # i2 (the fresh re-run line)
+    assert len(lines2) == 3, lines2
+    by_iid = {}
+    for l in lines2:
+        by_iid.setdefault(l["instance_id"], []).append(l)
+    for iid in (i0, i1):
+        assert len(by_iid[iid]) == 1  # imported, never re-run
+        l = by_iid[iid][0]
+        assert l["status"] == "no_patch"
+        assert l["meta"].get("imported_from") == "src"
+        assert l["ts"] == src_ts[iid]  # the original ts is preserved
+    assert len(by_iid[i2]) == 1
+    # i2 was RE-RUN (a fresh line — not the source line: no
+    # imported_from, a fresh ts)
+    assert by_iid[i2][0]["meta"].get("imported_from") is None
+    assert by_iid[i2][0]["ts"] != src_ts[i2]
+    # the source file is untouched (the import reads, never writes)
+    assert (wd1 / "run-src.jsonl").read_bytes() == src_bytes
+    # the state file records the import
+    state = json.loads((wd2 / "pilot-pilotB.state.json").read_text())
+    assert state["imported"] == sorted([i0, i1])
+    assert state["import_retry_class"] == {i2: "eval_error"}
+    # the WP6b record: items 15/16/17 + the sections; item 16 PASS
+    # (the faithful, non-re-run overlap)
+    gng = (wd2 / "wp6b-pilot-b.md").read_text()
+    for i in (15, 16, 17):
+        row = [l for l in gng.splitlines()
+              if l.startswith(f"| {i} |")][0]
+        assert "PASS" in row, (i, row)
+    assert "## 2-run overlap/variance (issue #22 AC2)" in gng
+    assert "## Stratification (issue #22 AC1)" in gng
+    assert "## Failure taxonomy (issue #22 AC3)" in gng
+    assert "## Budget windows (issue #22 AC4)" in gng
+    # the repeat --resume: i0/i1 are still skipped (no duplicate
+    # import lines); i2's eval_error is the RETRY class — it re-runs
+    # (a fresh, superseding line: the pass@1 retry semantics)
+    modes3 = {i0: "no_patch", i1: "no_patch", i2: "no_patch"}
+    cfg3 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               resume=True, host_check=False, pilot="b",
+               import_run="src", import_workdir=str(wd1))
+    assert _run(cfg3, _mock_make_session(modes3)) == lp.EXIT_OK
+    lines3 = _read_jsonl(wd2 / "run-pilotB.jsonl")
+    assert len(lines3) == 4, lines3  # the i2 retry adds one line
+    assert sum(1 for l in lines3
+               if l["instance_id"] == i0) == 1
+    assert sum(1 for l in lines3
+               if l["instance_id"] == i1) == 1
+    i2_lines = [l for l in lines3 if l["instance_id"] == i2]
+    assert len(i2_lines) == 2
+    assert i2_lines[1]["status"] == "no_patch"
+    assert i2_lines[1]["meta"].get("imported_from") is None
+
+
+def test_pilot_b_full_mock_run_verdict(tmp_path, live):
+    """The pilot-B full mock run: 3-repo fixture + a source run + the
+    import. The verdict is NO-GO with item 11 the only gating failure
+    (the pair was not the intentional interrupt — the live run's
+    ``--interrupt-after`` is the AC4 leg; the mock pair asserts the
+    items 15/16/17 + the arithmetic + the state)."""
+    repos, inst = _pilot_b_repos(tmp_path)
+    i0, i1, i2 = [e["instance_id"] for e in repos]
+    wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
+    modes = {i0: "no_patch", i1: "no_patch", i2: "ok"}
+    cfg1 = _cfg(tmp_path, inst, run_id="src", workdir=str(wd1),
+               host_check=False)
+    assert _run(cfg1, _mock_make_session(modes)) == lp.EXIT_OK
+    cfg2 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               resume=True, host_check=False, pilot="b",
+               import_run="src", import_workdir=str(wd1))
+    assert _run(cfg2, _mock_make_session(modes)) == lp.EXIT_OK
+    gng = (wd2 / "wp6b-pilot-b.md").read_text()
+    assert "**Verdict: NO-GO**" in gng  # item 11 (not the interrupt)
+    failed = gng.split("**Verdict: NO-GO** — failed items:")[1] \
+        .split("\n")[0]
+    assert "11" in failed
+    # 15/16/17 PASS (stratification, the overlap/variance, the
+    # root-caused eval_error — i2's no-container skip is env)
+    for i in (15, 16, 17):
+        row = [l for l in gng.splitlines()
+              if l.startswith(f"| {i} |")][0]
+        assert "PASS" in row, (i, row)
+    # i2's eval_error is root-caused (the documented no-container
+    # skip is env)
+    lines = _read_jsonl(wd2 / "run-pilotB.jsonl")
+    l2 = [l for l in lines if l["instance_id"] == i2][0]
+    assert l2["status"] == "eval_error"
+    assert l2["meta"]["eval_error_root_cause"] == "env"
+
+
+def test_host_check_root_cause_classes(tmp_path, monkeypatch):
+    """AC3 — the host-check failure points map to the root-cause
+    classes (the PLAN-WP6B.md table): the install leg -> env, the
+    model-patch apply -> patch, the test-patch apply -> env, the
+    unparseable pytest -> parser, a spawned-tool failure -> env."""
+    # pip install failure -> env
+    status, s = _host_check_case(
+        tmp_path, monkeypatch, ["tests/test_a.py::test_a"],
+        ["tests/test_b.py::test_b"], b"", pip_rc=1)
+    assert status == "eval_error"
+    assert s.meta["eval_error_root_cause"] == "env"
+    assert s.meta["eval_error_root_cause_detail"]
+
+    # the model-patch apply fails -> patch
+    status, s = _host_check_case(
+        tmp_path, monkeypatch, ["tests/test_a.py::test_a"],
+        ["tests/test_b.py::test_b"], b"", apply_rc=1)
+    assert status == "eval_error"
+    assert s.meta["eval_error_root_cause"] == "patch"
+    assert "model_patch" in s.meta["eval_error_root_cause_detail"]
+
+    # an unparseable pytest (the tests ran, no -rA results) -> parser
+    status, s = _host_check_case(
+        tmp_path, monkeypatch, ["tests/test_a.py::test_a"],
+        ["tests/test_b.py::test_b"], b"garbage, no summary")
+    assert status == "eval_error"
+    assert s.meta["eval_error_root_cause"] == "parser"
+
+    # a spawned-tool failure (a hung pip -> TimeoutExpired) -> env
+    def fake_run(cmd, **kw):
+        a = [str(x) for x in cmd]
+        if a[0].endswith("pip") and "pytest" not in a[1:]:
+            raise subprocess.TimeoutExpired(cmd, 1)
+        return _fake_completed(0)
+    monkeypatch.setattr(lp.subprocess, "run", fake_run)
+    inst = {
+        "instance_id": "test__host-1", "repo": "test/host",
+        "base_commit": "abc123", "problem_statement": "x",
+        "FAIL_TO_PASS": ["tests/test_a.py::test_a"],
+        "PASS_TO_PASS": [], "test_patch": "",
+        "repo_url": "file:///nonexistent"}
+    spec = lp.SessionSpec(
+        instance=inst, mode="sandbox", devin_bin="x", model="m",
+        cwd=str(tmp_path), env={}, wall_s=30.0, host_check=True,
+        workdir=str(tmp_path))
+    s = lp.PilotSession(spec)
+    assert s._host_check("patch body") == "eval_error"
+    assert s.meta["eval_error_root_cause"] == "env"
+
+
+def test_oversize_patch_root_cause_is_patch(tmp_path, live,
+                                            monkeypatch):
+    # the PLAN §4 oversize-patch cap is the ``patch`` class (the
+    # agent's output, not the env / not the parser)
+    monkeypatch.setattr(lp, "PATCH_SIZE_CAP_BYTES", 1)
+    repos = _three_repos(tmp_path)
+    inst = _instances_file(tmp_path / "inst.json", repos)
+    wd = tmp_path / "wd"
+    cfg = _cfg(tmp_path, str(inst), run_id="big", workdir=str(wd),
+              interrupt_after=1)
+    rc = lp.run_pilot(cfg, make_session=_mock_make_session("ok"))
+    assert rc == lp.EXIT_INTERRUPT
+    lines = _read_jsonl(wd / "run-big.jsonl")
+    assert lines[0]["status"] == "eval_error"
+    assert lines[0]["meta"]["eval_error_root_cause"] == "patch"
+
+
+def test_container_eval_error_root_cause(tmp_path, monkeypatch):
+    # container mode: the WP4 typed errors classify — the patch
+    # corruption (the harness's git-apply chain) is ``patch``; every
+    # other harness failure is ``env``
+    inst = {
+        "instance_id": "test__c-1", "repo": "test/c",
+        "base_commit": "abc", "problem_statement": "x",
+        "FAIL_TO_PASS": [], "PASS_TO_PASS": [], "test_patch": ""}
+    spec = lp.SessionSpec(
+        instance=inst, mode="container", devin_bin="x", model="m",
+        cwd="/testbed", env={}, wall_s=30.0, host_check=False,
+        workdir=str(tmp_path), container="c1")
+    s = lp.PilotSession(spec)
+    monkeypatch.setattr(
+        lp.ev, "evaluate",
+        lambda *a, **k: (_ for _ in ()).throw(
+            lp.ev.PatchCorruptionError("the harness wrote "
+                                      "APPLY_PATCH_FAIL")))
+    assert s._eval_container("patch body") == "eval_error"
+    assert s.meta["eval_error_root_cause"] == "patch"
+    monkeypatch.setattr(
+        lp.ev, "evaluate",
+        lambda *a, **k: (_ for _ in ()).throw(
+            lp.ev.HarnessFailedError("the harness process failed")))
+    assert s._eval_container("patch body") == "eval_error"
+    assert s.meta["eval_error_root_cause"] == "env"
+
+
+
+# ---------------------------------------------------------------------------
+# WP6b review round 1 (PR #38 pr-review — the fixes)
+# ---------------------------------------------------------------------------
+
+def test_pilot_b_default_selection_via_main(tmp_path, live, capsys):
+    """The Blocker fix: the documented invocations omit
+    --instances — --pilot b must select pilot_b_instances.json
+    (the 25-instance file) by default; --pilot a keeps
+    pilot_instances.json (the 3). Round-13 Medium fix: a no-import
+    pilot-B invocation is a fail-closed config error (exit 2) —
+    the documented invocation carries the import."""
+    # a minimal valid source checkpoint (one never-rerun line for a
+    # pinned 25-set id)
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "run-src.jsonl").write_text(
+        json.dumps({"instance_id": "django__django-10097",
+                    "status": "resolved", "ts": 1.0}) + "\n")
+    # the no-import pilot-B dry run: a config error (exit 2)
+    rc = lp.main(["--dry-run", "--pilot", "b",
+                  "--workdir", str(tmp_path / "w0"), "--run-id", "x0"])
+    assert rc == lp.EXIT_CONFIG
+    out = lp.main(["--dry-run", "--pilot", "b", "--resume",
+                  "--workdir", str(tmp_path / "w"), "--run-id", "x",
+                  "--import-run", "src",
+                  "--import-workdir", str(src)])
+    captured = capsys.readouterr()
+    assert out == lp.EXIT_OK
+    assert "25 instances:" in captured.out
+    assert "django__django-10097" in captured.out
+    out = lp.main(["--dry-run",
+                  "--workdir", str(tmp_path / "w2"), "--run-id", "y"])
+    captured = capsys.readouterr()
+    assert "3 instances:" in captured.out
+    # the record name follows the pilot kind
+    assert (tmp_path / "w" / "wp6b-pilot-b.md").is_file()
+    assert (tmp_path / "w2" / "wp6a-go-no-go.md").is_file()
+
+
+def test_import_flag_pairing_and_charset(tmp_path):
+    """--import-workdir requires --import-run; --import-run is
+    pilot-B-only; the run id is charset-restricted (no path
+    traversal: the codebase charset-restricts ids for exactly this
+    reason)."""
+    with pytest.raises(lp.PilotConfigError):
+        lp.PilotConfig(import_workdir="/x")
+    with pytest.raises(lp.PilotConfigError):
+        lp.PilotConfig(pilot="a", import_run="pilotA")
+    with pytest.raises(lp.PilotConfigError):
+        lp.PilotConfig(pilot="b", import_run="../x")
+    with pytest.raises(lp.PilotConfigError):
+        lp.PilotConfig(pilot="b", import_run="a..b")
+    # the valid shape passes
+    lp.PilotConfig(pilot="b", import_run="pilotA",
+                  import_workdir="/x")
+    # the CLI (exit 2)
+    assert lp.main(["--dry-run", "--pilot", "b",
+                    "--import-workdir", "/x",
+                    "--workdir", str(tmp_path / "w"),
+                    "--run-id", "z"]) == lp.EXIT_CONFIG
+    assert lp.main(["--dry-run", "--pilot", "a",
+                    "--import-run", "pilotA",
+                    "--workdir", str(tmp_path / "w2"),
+                    "--run-id", "z"]) == lp.EXIT_CONFIG
+    assert lp.main(["--dry-run", "--pilot", "b",
+                    "--import-run", "../x",
+                    "--workdir", str(tmp_path / "w3"),
+                    "--run-id", "z"]) == lp.EXIT_CONFIG
+
+
+def test_import_run_corrupt_source_report_protocol(tmp_path, live):
+    """a charset-invalid instance_id in the source (the WP5 dedupe
+    is fail-loud on it) is a corrupt source — the documented
+    exit-2 config error, not an exit-4 run failure."""
+    repos = _three_repos(tmp_path)
+    inst = _instances_file(tmp_path / "inst.json", repos)
+    bad = tmp_path / "srcwd"
+    bad.mkdir()
+    (bad / "run-bad.jsonl").write_text(
+        json.dumps({"instance_id": "bad id with spaces",
+                   "status": "resolved", "meta": {}, "ts": 1.0})
+        + "\n")
+    wd = tmp_path / "wd"
+    cfg = _cfg(tmp_path, str(inst), run_id="imp", workdir=str(wd),
+              pilot="b", import_run="bad", import_workdir=str(bad))
+    with pytest.raises(lp.PilotConfigError):
+        _run(cfg, _mock_make_session({"test__repo0-1": "ok",
+                                     "test__repo1-1": "ok",
+                                     "test__repo2-1": "ok"}))
+    # and the CLI path: exit 2
+    repos_b, inst_b = _pilot_b_repos(tmp_path)
+    assert lp.main(["--dry-run", "--pilot", "b",
+                    "--instances", inst_b,
+                    "--import-run", "bad",
+                    "--import-workdir", str(bad),
+                    "--workdir", str(tmp_path / "wd2"),
+                    "--run-id", "z"]) == lp.EXIT_CONFIG
+
+
+def test_seed_import_repairs_torn_tail_first(tmp_path, live):
+    """the host-crash class on a resume that imports: the torn tail
+    is truncated BEFORE the import lines are appended (the import
+    lines are durable — not glued onto the fragment and dropped by
+    the next open — and the idempotency read post-repair sees the
+    clean file, so no duplicate import lines)."""
+    p = tmp_path / "run-x.jsonl"
+    good = json.dumps({"instance_id": "a", "status": "no_patch",
+                      "meta": {}, "ts": 1.0})
+    prior_seed = json.dumps(
+        {"instance_id": "b", "status": "resolved",
+         "meta": {"wall": {"session_s": 5.0}, "imported_from": "x"},
+         "ts": 2.0})
+    src = {"b": {"instance_id": "b", "status": "resolved",
+                 "meta": {"wall": {"session_s": 5.0}}, "ts": 2.0}}
+    # a prior invocation seeded 'b' (a complete line — newline-
+    # terminated), then a crash tore the next write (the torn
+    # fragment is the LAST line, the host-crash class)
+    p.write_text(good + "\n" + prior_seed + "\n" +
+                '{"instance_id": "c", "status": ' + '"no_pat')
+    seeded = lp.seed_import_lines(str(p), src, "x")
+    assert seeded == []  # the post-repair read sees the prior seed
+    recs, _ = rr.load_checkpoint(str(p))
+    assert [r["instance_id"] for r in recs] == ["a", "b"]
+    assert len([r for r in recs if r["instance_id"] == "b"]) == 1
+    # a fresh file (no prior seed): the import line is durable and
+    # the torn fragment is gone
+    p2 = tmp_path / "run-y.jsonl"
+    p2.write_text(good + "\n" + '{"instance_id": "a", "status": '
+                 + '"no_pat')
+    seeded = lp.seed_import_lines(str(p2), src, "x")
+    assert seeded == ["b"]
+    recs, _ = rr.load_checkpoint(str(p2))
+    assert [r["instance_id"] for r in recs] == ["a", "b"]
+    # a mid-file corruption (not the torn-tail class) fails loud —
+    # the config error class, before any session
+    p3 = tmp_path / "run-z.jsonl"
+    p3.write_text(good + "\n" + "not json at all\n" + good + "\n")
+    with pytest.raises(lp.PilotConfigError):
+        lp.seed_import_lines(str(p3), src, "x")
+
+
+def test_same_workdir_import_no_same_file_error(tmp_path, live):
+    """--import-workdir defaults to this run's workdir: src == dst
+    for every referenced artifact — the copy must be skipped (the
+    shutil.copyfile SameFileError class), the seeding completes."""
+    repos, inst = _pilot_b_repos(tmp_path)
+    i0, i1, i2 = [e["instance_id"] for e in repos]
+    wd = tmp_path / "wd"
+    # the source run lives in the SAME workdir (run-src.jsonl)
+    cfg1 = _cfg(tmp_path, inst, run_id="src", workdir=str(wd),
+               host_check=False)
+    assert _run(cfg1, _mock_make_session(
+        {i0: "no_patch", i1: "no_patch", i2: "no_patch"})) \
+        == lp.EXIT_OK
+    # the pilot-B import from the same workdir
+    cfg2 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
+               resume=True, host_check=False, pilot="b",
+               import_run="src", import_workdir=str(wd))
+    assert _run(cfg2, _mock_make_session(
+        {i0: "no_patch", i1: "no_patch", i2: "no_patch"})) \
+        == lp.EXIT_OK
+    lines = _read_jsonl(wd / "run-pilotB.jsonl")
+    assert sum(1 for l in lines if l["instance_id"] == i0) == 1
+    assert sum(1 for l in lines if l["instance_id"] == i1) == 1
+    # the artifact survived (it was never copied — it is in place)
+    assert (wd / "runs" / i0 / "trajectory.jsonl").is_file()
+
+
+def test_multi_window_item16_via_state_rederivation(tmp_path, live):
+    """the documented multi-window flow: the continuation window
+    drops --import-run — the source lines re-derive from the state
+    file, so item 16 still evaluates (and gates) on the completing
+    (verdict-producing) record."""
+    repos, inst = _pilot_b_repos(tmp_path)
+    i0, i1, i2 = [e["instance_id"] for e in repos]
+    wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
+    modes = {i0: "no_patch", i1: "no_patch", i2: "ok"}
+    # the source run
+    cfg1 = _cfg(tmp_path, inst, run_id="src", workdir=str(wd1),
+               host_check=False)
+    assert _run(cfg1, _mock_make_session(modes)) == lp.EXIT_OK
+    # window 1: the import + the i2 re-run (eval_error)
+    cfg2 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               resume=True, host_check=False, pilot="b",
+               import_run="src", import_workdir=str(wd1))
+    assert _run(cfg2, _mock_make_session(modes)) == lp.EXIT_OK
+    # the state persists the source lines
+    state = json.loads((wd2 / "pilot-pilotB.state.json").read_text())
+    assert state["import_source"], state
+    # window 2 (the completing record): --resume, NO --import-run
+    cfg3 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               resume=True, host_check=False, pilot="b")
+    assert _run(cfg3, _mock_make_session(
+        {i0: "no_patch", i1: "no_patch", i2: "no_patch"})) \
+        == lp.EXIT_OK
+    gng = (wd2 / "wp6b-pilot-b.md").read_text()
+    row16 = [l for l in gng.splitlines()
+            if l.startswith("| 16 |")][0]
+    assert "n/a" not in row16, row16
+    assert "PASS" in row16, row16
+    # item 16's arithmetic holds with the i2 retry (3 lines for 1
+    # instance: 2 imported + 1 new = 3 unique)
+    assert "Session arithmetic: 2 imported + 1 new = 3 unique — " \
+        "holds" in gng
+
+
+def test_item16_gates_on_arithmetic(tmp_path, monkeypatch):
+    """the session arithmetic (unique-instance basis) is part of
+    item 16's gate: a preflight_failed line (no session burned —
+    excluded from the new-instance count, but a unique instance)
+    breaks the arithmetic → FAIL → NO-GO."""
+    monkeypatch.setenv(lp.LIVE_ENV, "1")
+    src = {"a": {"instance_id": "a", "status": "resolved",
+                 "meta": {"wall": {"session_s": 60.0},
+                         "usage": {"totalTokens": 100}}}}
+    items = _cb(imported={"a": src},
+               config=lp.PilotConfig(pilot="b", max_wall_s=2700.0,
+                                    resume=True),
+               resume_after_interrupt=True,
+               skipped_on_resume={"a": "no_patch"},
+               records=[
+                   _rec("a", "resolved",
+                        usage={"totalTokens": 100},
+                        imported_from="x"),
+                   _rec("b", "resolved"),
+                   _rec("c", "preflight_failed")])
+    assert _item(items, "16")["pass"] is False
+    verdict, failed = lp._verdict(items,
+                                 gating=lp._pilot_gating(
+                                     lp.PilotConfig(pilot="b")))
+    assert verdict == "NO-GO"
+    assert any(f.split(" ", 1)[0] == "16" for f in failed)
+
+
+def test_wp6b_round2_import_rederives_from_checkpoint_after_graceful_exit(
+        tmp_path, live):
+    """The round-2 Major fix (issue #22 AC2): a graceful early exit
+    (the pre-flight failure — exit 4) is followed by the documented
+    multi-window flow (no --import-run) — the source lines
+    re-derive from the state record (the early import record — the
+    round-3 fix persists it BEFORE the seeding) and, when the state
+    is absent (a pre-seed process death), from the checkpoint's own
+    seeded lines (they carry ``meta.imported_from`` + the original
+    ``ts``) — item 16 still gates on the completing record."""
+    repos, inst = _pilot_b_repos(tmp_path)
+    ids = [e["instance_id"] for e in repos]
+    i0, i1, i2 = ids
+    wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
+    # run 1 (the source): i0/i1 never-rerun, i2 eval_error (retry
+    # class) — the WP6b import-test pattern
+    modes1 = {i0: "no_patch", i1: "no_patch", i2: "ok"}
+    cfg1 = _cfg(tmp_path, inst, run_id="src", workdir=str(wd1),
+               host_check=False)
+    assert _run(cfg1, _mock_make_session(modes1)) == lp.EXIT_OK
+    # invocation 1 of the pilot-B pair: --import-run + --resume, but
+    # the pre-flight FAILS (the missing devin binary) — the seeding
+    # has already happened, then exit 4. The early import record
+    # (the round-3 fix) persisted the bookkeeping BEFORE the
+    # seeding — the state file survives the exit with the full set
+    cfg2 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               resume=True, host_check=False, pilot="b",
+               import_run="src", import_workdir=str(wd1),
+               devin_bin=str(tmp_path / "missing-devin"))
+    assert _run(cfg2, _mock_make_session(modes1)) == lp.EXIT_RUN_FAILED
+    st = json.loads((wd2 / "pilot-pilotB.state.json").read_text())
+    assert st.get("import_source"), st
+    assert st.get("imported_run") == "src"
+    # the seeded lines ARE in the checkpoint (the fallback source —
+    # plus the batch-level preflight_failed marker, no instance id)
+    lines = _read_jsonl(wd2 / "run-pilotB.jsonl")
+    inst_lines = [l for l in lines if l.get("instance_id")]
+    assert {l["instance_id"] for l in inst_lines} == {i0, i1}
+    assert all(l["meta"].get("imported_from") == "src"
+               for l in inst_lines)
+    # remove the state file: this invocation now exercises the
+    # CHECKPOINT fallback path (a pre-seed process death would
+    # leave exactly this shape — the seeded lines, no state)
+    (wd2 / "pilot-pilotB.state.json").unlink()
+
+    # invocation 2: --resume, NO --import-run — the fallback
+    # re-derives from the checkpoint's seeded lines; item 16 gates
+    # on the completing record. i0/i1 are skipped (imported); i2
+    # re-runs (the retry class) and is no_patch this time.
+    modes2 = {i0: "no_patch", i1: "no_patch", i2: "no_patch"}
+    cfg3 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               resume=True, host_check=False, pilot="b")
+    assert _run(cfg3, _mock_make_session(modes2)) == lp.EXIT_OK
+    lines3 = _read_jsonl(wd2 / "run-pilotB.jsonl")
+    # no duplicate import lines (the post-repair read — the same
+    # idempotency as the flag path)
+    assert sum(1 for l in lines3 if l["instance_id"] == i0) == 1
+    assert sum(1 for l in lines3 if l["instance_id"] == i1) == 1
+    # item 16 gates on the completing record (2 imported + 1 new =
+    # 3 unique). The round-24 Major fix (issue #22, 4451121577):
+    # the state was removed, so this is the CHECKPOINT fallback —
+    # the faithfulness half renders its explicit self-derived n/a
+    # (a self-comparison would never fail — the fidelity was
+    # verified at seeding) while the arithmetic half still gates
+    gng = (wd2 / "wp6b-pilot-b.md").read_text()
+    i16 = [l for l in gng.splitlines()
+          if l.startswith("| 16 |")][0]
+    assert "faithfulness n/a (self-derived" in i16, i16
+    assert "FAIL" not in i16, i16
+    assert "2 + 1 = 3" in i16, i16
+    assert i16.rstrip().endswith("| PASS |"), i16
+    # the overlap section rendered the per-instance row (i0's line
+    # matches the source's — the faithful, non-re-run overlap)
+    assert "## 2-run overlap/variance (issue #22 AC2)" in gng
+    assert "Overlap match: FAIL" not in gng
+
+
+def test_wp6b_round2_no_import_record_consistent(tmp_path, live):
+    """The round-2 Minor fix (issue #22 AC2): a pilot-B run with NO
+    import renders ``Overlap match: n/a (no import)`` in the section
+    — not ``FAIL`` (zero rows is not a mismatch) — consistent with
+    item 16's n/a (the record does not contradict itself). Round-13
+    Medium fix: a no-import pilot-B *run* is a fail-closed config
+    error (item 16 must not be the path to a GO with zero AC2
+    evidence); the checklist's no-import rendering (the plain n/a,
+    non-gating) is preserved for a direct build."""
+    repos, inst = _pilot_b_repos(tmp_path)
+    ids = [e["instance_id"] for e in repos]
+    i0, i1, i2 = ids
+    wd = tmp_path / "wd"
+    modes = {i0: "no_patch", i1: "no_patch", i2: "ok"}
+    cfg = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
+               host_check=False, pilot="b")
+    try:
+        _run(cfg, _mock_make_session(modes))
+    except lp.PilotConfigError:
+        pass
+    else:
+        raise AssertionError("a no-import pilot-B run was accepted")
+    # the checklist's no-import rendering: the plain n/a (non-
+    # gating) — the record does not contradict itself
+    recs = [_rec(f"r{i}", "resolved") for i in range(3)]
+    items = _cb(records=recs, import_attempted=False)
+    i16 = _item(items, "16")
+    assert i16["pass"] is None
+    assert "n/a (no import" in i16["observed"]
+
+
+def test_wp6b_round2_session_spec_carrys_the_run_id(tmp_path, live):
+    """The round-2 body flag (issue #22): ``_eval_container`` must
+    label its WP4 artifacts with the RUN's run id (a pilot-B run's
+    artifacts are ``pilotB-<iid>-...``, not ``pilotA-...``) — the
+    spec carries the id (run_pilot always passes
+    config.run_id). The round-18 Minor fix (issue #22): the old
+    "pilotA" default was a stale literal — a direct (non-
+    run_pilot) spec construction silently labelled its WP4 eval
+    artifacts / container names ``pilotA``; the default is now the
+    neutral "run" label (the direct-construction case is visible
+    instead)."""
+    spec = lp.SessionSpec(
+        instance={"instance_id": "repo__a-1", "base_commit": "c1"},
+        mode="sandbox", devin_bin=MOCK_PATH, model="m",
+        cwd="/t", env={}, wall_s=1800.0, host_check=False,
+        workdir="wd")
+    assert spec.run_id == "run"  # the neutral default
+    spec_b = lp.SessionSpec(
+        instance={"instance_id": "repo__a-1", "base_commit": "c1"},
+        mode="sandbox", devin_bin=MOCK_PATH, model="m",
+        cwd="/t", env={}, wall_s=1800.0, host_check=False,
+        workdir="wd", run_id="pilotB")
+    assert spec_b.run_id == "pilotB"
+
+
+def test_wp6b_round3_early_import_record_persists_before_seeding(
+        tmp_path, live, monkeypatch):
+    """The round-3 Major fix (issue #22 AC2): the FULL import
+    bookkeeping is persisted BEFORE the seeding — a mid-seed crash
+    (the host-crash class) leaves the state record (the full set)
+    even though the seeding died mid-loop; the end-of-run write
+    would not have run (the process is dead). Here the seed is
+    made to die (a simulated power loss) and the _write_state
+    calls are recorded: the FIRST state write (the early import
+    record) must carry the full import set + the source run id."""
+    repos, inst = _pilot_b_repos(tmp_path)
+    ids = [e["instance_id"] for e in repos]
+    i0, i1, i2 = ids
+    wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
+    modes = {i0: "no_patch", i1: "no_patch", i2: "ok"}
+    cfg1 = _cfg(tmp_path, inst, run_id="src", workdir=str(wd1),
+               host_check=False)
+    assert _run(cfg1, _mock_make_session(modes)) == lp.EXIT_OK
+    state_writes = []
+    real_write = lp._write_state
+
+    def _record(workdir, run_id, state):
+        state_writes.append(dict(state))
+        real_write(workdir, run_id, state)
+
+    def _crash(*args, **kw):
+        raise OSError("simulated power loss mid-seed")
+
+    monkeypatch.setattr(lp, "_write_state", _record)
+    monkeypatch.setattr(lp, "seed_import_lines", _crash)
+    cfg2 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               resume=True, host_check=False, pilot="b",
+               import_run="src", import_workdir=str(wd1))
+    try:
+        _run(cfg2, _mock_make_session(modes))
+    except OSError:
+        pass  # the simulated power loss — the process dies here
+    # (the end-of-run state write never runs: the process is dead)
+    # the early import record: the first state write carries the
+    # FULL set (i0 + i1 — i2 is the retry class, not imported) +
+    # the source run id
+    assert state_writes, "no state write happened"
+    first = state_writes[0]
+    assert sorted(first.get("import_source", {})) == sorted([i0, i1]), \
+        first
+    assert first.get("imported_run") == "src"
+    assert first.get("import_workdir") == str(wd1)
+    assert sorted(first.get("imported", [])) == sorted([i0, i1])
+
+
+def test_wp6b_round3_mid_seed_crash_resume_reseeds_full_set(
+        tmp_path, live):
+    """The round-3 Major fix, the outcome (issue #22 AC2): after a
+    mid-seed crash (a partial import in the checkpoint + the early
+    state record with the FULL set), the follow-up --resume
+    re-derives from the STATE source (the full set — it takes
+    precedence over the truncated checkpoint fallback): the
+    unseeded never-rerun instance is RE-SEEDED, not re-run — no
+    silent AC2 violation, and item 16's comparison set is the true
+    source set."""
+    import json as _json
+    repos, inst = _pilot_b_repos(tmp_path)
+    ids = [e["instance_id"] for e in repos]
+    i0, i1, i2 = ids
+    wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
+    modes = {i0: "no_patch", i1: "no_patch", i2: "ok"}
+    cfg1 = _cfg(tmp_path, inst, run_id="src", workdir=str(wd1),
+               host_check=False)
+    assert _run(cfg1, _mock_make_session(modes)) == lp.EXIT_OK
+    src_lines = _read_jsonl(wd1 / "run-src.jsonl")
+    by_iid = {l["instance_id"]: l for l in src_lines}
+    # simulate the mid-seed crash: only i0 was seeded (i1 never
+    # made it into the checkpoint) + the early state record (the
+    # full set — what the early import record persists)
+    wd2.mkdir()
+    partial = dict(by_iid[i0])
+    pm = dict(partial.get("meta") or {})
+    pm["imported_from"] = "src"
+    partial["meta"] = pm
+    with open(wd2 / "run-pilotB.jsonl", "w") as f:
+        f.write(json.dumps(partial) + "\n")
+    state = {
+        "run_id": "pilotB", "interrupted": False, "aborted": False,
+        "imported": sorted([i0, i1]),
+        "import_source": {i0: by_iid[i0], i1: by_iid[i1]},
+        "imported_run": "src",
+        "import_workdir": str(wd1),
+        "import_retry_class": {i2: "eval_error"},
+    }
+    with open(wd2 / "pilot-pilotB.state.json", "w") as f:
+        f.write(json.dumps(state))
+    # the follow-up --resume (NO --import-run — the documented
+    # continuation flow)
+    cfg3 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               resume=True, host_check=False, pilot="b")
+    assert _run(cfg3, _mock_make_session(
+        {i0: "no_patch", i1: "no_patch", i2: "no_patch"})) == lp.EXIT_OK
+    lines = _read_jsonl(wd2 / "run-pilotB.jsonl")
+    i1_lines = [l for l in lines if l["instance_id"] == i1]
+    # i1 was RE-SEEDED (the early record's full set), NOT re-run:
+    # one line, the imported marker, the source ts
+    assert len(i1_lines) == 1, i1_lines
+    assert i1_lines[0]["meta"].get("imported_from") == "src"
+    assert i1_lines[0]["ts"] == by_iid[i1]["ts"]
+    assert i1_lines[0]["status"] == "no_patch"
+    # i2 re-ran once (the retry class) — one fresh line
+    i2_lines = [l for l in lines if l["instance_id"] == i2]
+    assert len(i2_lines) == 1
+    assert i2_lines[0]["meta"].get("imported_from") is None
+    # item 16 gates on the full set (2 imported + 1 new = 3 unique)
+    gng = (wd2 / "wp6b-pilot-b.md").read_text()
+    row16 = [l for l in gng.splitlines()
+            if l.startswith("| 16 |")][0]
+    assert "PASS" in row16, row16
+    assert "n/a" not in row16, row16
+
+
+def test_wp6b_round3_artifact_copy_self_heals(tmp_path, live,
+                                             monkeypatch):
+    """The round-3 Major fix (issue #22 AC2 / the WP5 cross-check):
+    a crash between a seeded line's fsync and its artifact copy
+    leaves a durable line with missing artifacts — the idempotent
+    per-file copy (it runs for EVERY imported id on every
+    invocation, not just the newly seeded ones) self-heals that on
+    the next invocation instead of leaving the cross-check to
+    fail report_failed with no automated recovery."""
+    repos, inst = _pilot_b_repos(tmp_path)
+    ids = [e["instance_id"] for e in repos]
+    i0, i1, i2 = ids
+    wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
+    # the source run: i0/i1 no_patch (never-rerun — imported), i2
+    # ok -> eval_error (the retry class, the host check off)
+    modes = {i0: "no_patch", i1: "no_patch", i2: "ok"}
+    cfg1 = _cfg(tmp_path, inst, run_id="src", workdir=str(wd1),
+               host_check=False)
+    assert _run(cfg1, _mock_make_session(modes)) == lp.EXIT_OK
+    # the source's artifacts exist (the mock writes the trajectory
+    # for every session)
+    src_run_dir = wd1 / "runs" / i0
+    assert (src_run_dir / "trajectory.jsonl").is_file()
+    # invocation 1: the seeding succeeds but the artifact copy is
+    # lost (a simulated crash between the fsync and the copy)
+    toggle = {"skip": True}
+    real_copy = lp._copy_imported_artifacts
+
+    def _copy_gate(rec, s, d):
+        if toggle["skip"]:
+            return
+        real_copy(rec, s, d)
+
+    monkeypatch.setattr(lp, "_copy_imported_artifacts", _copy_gate)
+    cfg2 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               resume=True, host_check=False, pilot="b",
+               import_run="src", import_workdir=str(wd1))
+    # the stuck state: the lines are durable (the fsync happened),
+    # the artifacts are missing (the copy was lost) — the WP5
+    # cross-check fails the report (exit 4, report_failed) with no
+    # automated recovery (the reviewer's failure mode)
+    assert _run(cfg2, _mock_make_session(modes)) == lp.EXIT_RUN_FAILED
+    lines = _read_jsonl(wd2 / "run-pilotB.jsonl")
+    i0_lines = [l for l in lines if l["instance_id"] == i0]
+    assert len(i0_lines) == 1
+    assert i0_lines[0]["meta"].get("imported_from") == "src"
+    dst_run_dir0 = wd2 / "runs" / i0
+    assert not (dst_run_dir0 / "trajectory.jsonl").is_file()
+    # invocation 2: the continuation (NO --import-run) — the
+    # idempotent per-file copy self-heals the missing artifact
+    toggle["skip"] = False
+    cfg3 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               resume=True, host_check=False, pilot="b")
+    assert _run(cfg3, _mock_make_session(
+        {i0: "no_patch", i1: "no_patch", i2: "no_patch"}))         == lp.EXIT_OK
+    # healed: the trajectory (the imported line's referenced
+    # artifact) is now in THIS run's workdir — the WP5
+    # cross-check's resolution target
+    assert (dst_run_dir0 / "trajectory.jsonl").is_file()
+    # and no duplicate import lines (the idempotency held)
+    lines3 = _read_jsonl(wd2 / "run-pilotB.jsonl")
+    assert sum(1 for l in lines3 if l["instance_id"] == i0) == 1
+
+
+def test_wp6b_round3_state_preserves_import_bookkeeping(
+        tmp_path, live):
+    """The round-3 continuation-window fix (the state clobber, which
+    fed the 'from None' label + broke the artifact self-heal): the
+    end-of-run write on a continuation window (the flag is dropped
+    there) preserves the previous invocation's import bookkeeping —
+    imported_run / import_workdir stay the source's, not None."""
+    repos, inst = _pilot_b_repos(tmp_path)
+    ids = [e["instance_id"] for e in repos]
+    i0, i1, i2 = ids
+    wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
+    modes = {i0: "no_patch", i1: "no_patch", i2: "ok"}
+    cfg1 = _cfg(tmp_path, inst, run_id="src", workdir=str(wd1),
+               host_check=False)
+    assert _run(cfg1, _mock_make_session(modes)) == lp.EXIT_OK
+    cfg2 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               resume=True, host_check=False, pilot="b",
+               import_run="src", import_workdir=str(wd1))
+    assert _run(cfg2, _mock_make_session(modes)) == lp.EXIT_OK
+    # the continuation window: NO --import-run
+    cfg3 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               resume=True, host_check=False, pilot="b")
+    assert _run(cfg3, _mock_make_session(
+        {i0: "no_patch", i1: "no_patch", i2: "no_patch"})) == lp.EXIT_OK
+    state = json.loads((wd2 / "pilot-pilotB.state.json").read_text())
+    assert state["imported_run"] == "src", state
+    assert state["import_workdir"] == str(wd1), state
+    assert state["import_source"], state
+    assert state["imported"] == sorted([i0, i1]), state
+
+
+def test_wp6b_round3_window_buckets_exclude_imported():
+    """The round-3 Medium fix (issue #22 AC4): the per-window budget
+    buckets EXCLUDE the imported lines — a never-rerun reuse burned
+    no session of this run's budget (the source run accounted for
+    it); bucketing them by their source ts (a same-UTC-day source)
+    would fold the source run's sessions into this run's window and
+    falsely fail item 12."""
+    day = int(time.time() // 86400)
+    ts = day * 86400 + 1000.0
+    recs = [
+        {"instance_id": "a", "status": "resolved", "ts": ts,
+         "meta": {"imported_from": "src", "wall_s": 100.0}},
+        {"instance_id": "b", "status": "resolved", "ts": ts,
+         "meta": {"wall_s": 50.0}},
+    ]
+    buckets = lp._window_buckets(recs)
+    assert buckets[day]["sessions"] == 1  # the imported line excluded
+    assert buckets[day]["wall_s"] == 50.0
+    # a preflight_failed line is still excluded (the WP3 contract)
+    recs.append({"instance_id": "c", "status": "preflight_failed",
+                "ts": ts, "meta": {}})
+    assert lp._window_buckets(recs)[day]["sessions"] == 1
+
+
+def test_wp6b_round3_calibrate_excludes_imported(tmp_path, live):
+    """The round-3 Medium fix (issue #22 AC3/AC4): the calibration +
+    item 8/9 attempt stats EXCLUDE the imported lines — the source
+    run's sessions (their source-run wall/usage) are not this
+    run's attempts; folding them in would misstate the run the
+    calibration measures."""
+    repos, inst = _pilot_b_repos(tmp_path)
+    ids = [e["instance_id"] for e in repos]
+    i0, i1, i2 = ids
+    wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
+    modes = {i0: "no_patch", i1: "no_patch", i2: "ok"}
+    cfg1 = _cfg(tmp_path, inst, run_id="src", workdir=str(wd1),
+               host_check=False)
+    assert _run(cfg1, _mock_make_session(modes)) == lp.EXIT_OK
+    # the source line's wall is made LARGE (the source run's
+    # session — 300 s) so an inclusion bug is detectable
+    src_lines = _read_jsonl(wd1 / "run-src.jsonl")
+    for l in src_lines:
+        meta = l.get("meta") or {}
+        wall = meta.get("wall") or {}
+        wall["session_s"] = 300.0
+        l["meta"] = meta
+    with open(wd1 / "run-src.jsonl", "w") as f:
+        for l in src_lines:
+            f.write(json.dumps(l) + "\n")
+    cfg2 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               resume=True, host_check=False, pilot="b",
+               import_run="src", import_workdir=str(wd1))
+    assert _run(cfg2, _mock_make_session(modes)) == lp.EXIT_OK
+    # the direct check: the attempt basis excludes the imported
+    # lines (the same filter the calibrate call uses) — only i2
+    # (i0/i1 imported)
+    lines = _read_jsonl(wd2 / "run-pilotB.jsonl")
+    attempts = [l for l in lines if l.get("instance_id")
+               and not (l.get("meta") or {}).get("imported_from")]
+    assert len(attempts) == 1, attempts
+    cal = lp.calibrate(attempts, lp.PilotConfig(pilot="b"))
+    assert cal["median_session_wall_s"] is not None
+    assert cal["median_session_wall_s"] < 1.0  # the mock's wall —
+    # NOT the imported 300 s source wall (an inclusion bug would
+    # fold it into the median/mean)
+
+
+def test_wp6b_round4_report_failed_state_preserves_import(
+        tmp_path, live, monkeypatch):
+    """The round-4 Major fix (issue #22 AC2): the report_failed
+    state write uses the same preserve-on-continuation fallback as
+    the main write — a WP5 report failure on the documented
+    no-flag continuation window must not null the import
+    bookkeeping (the next resume's artifact self-heal resolves the
+    source workdir from them; without the fallback a missing
+    referenced artifact could never be self-healed and every
+    subsequent resume stayed wedged in report_failed)."""
+    repos, inst = _pilot_b_repos(tmp_path)
+    ids = [e["instance_id"] for e in repos]
+    i0, i1, i2 = ids
+    wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
+    modes = {i0: "no_patch", i1: "no_patch", i2: "ok"}
+    cfg1 = _cfg(tmp_path, inst, run_id="src", workdir=str(wd1),
+               host_check=False)
+    assert _run(cfg1, _mock_make_session(modes)) == lp.EXIT_OK
+    # the import window: the artifact copy is LOST (a simulated
+    # crash between the fsync and the copy) — the durable imported
+    # lines reference a trajectory that is missing in wd2, so the
+    # WP5 cross-check fails the report (exit 4, report_failed)
+    toggle = {"skip": True}
+    real_copy = lp._copy_imported_artifacts
+
+    def _copy_gate(rec, s, d):
+        if toggle["skip"]:
+            return
+        real_copy(rec, s, d)
+
+    monkeypatch.setattr(lp, "_copy_imported_artifacts", _copy_gate)
+    cfg2 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               resume=True, host_check=False, pilot="b",
+               import_run="src", import_workdir=str(wd1))
+    assert _run(cfg2, _mock_make_session(modes)) == lp.EXIT_RUN_FAILED
+    # the report_failed state write preserved the import
+    # bookkeeping (the flag's values here — and, on the no-flag
+    # continuation below, the previous invocation's)
+    st = json.loads((wd2 / "pilot-pilotB.state.json").read_text())
+    assert st["final_state"] == "report_failed", st
+    assert st["imported_run"] == "src", st
+    assert st["import_workdir"] == str(wd1), st
+    assert st["import_source"], st
+    # the continuation window (NO --import-run) — the report fails
+    # again (the artifact is still missing), and the state write
+    # must PRESERVE the bookkeeping (the flag values are None here)
+    toggle["skip"] = True
+    cfg3 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               resume=True, host_check=False, pilot="b")
+    assert _run(cfg3, _mock_make_session(
+        {i0: "no_patch", i1: "no_patch", i2: "no_patch"})) \
+        == lp.EXIT_RUN_FAILED
+    st3 = json.loads((wd2 / "pilot-pilotB.state.json").read_text())
+    assert st3["final_state"] == "report_failed", st3
+    assert st3["imported_run"] == "src", st3
+    assert st3["import_workdir"] == str(wd1), st3
+    assert st3["import_source"], st3
+    # the self-heal: the copy is restored — the next resume heals
+    # the missing artifact and the report completes (exit 0)
+    toggle["skip"] = False
+    cfg4 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               resume=True, host_check=False, pilot="b")
+    assert _run(cfg4, _mock_make_session(
+        {i0: "no_patch", i1: "no_patch", i2: "no_patch"})) \
+        == lp.EXIT_OK
+    assert ((wd2 / "runs" / i0 / "trajectory.jsonl").is_file())
+
+
+def test_wp6b_round4_first_import_window_requires_resume(tmp_path,
+                                                       live):
+    """The round-4 Minor fix (the documented contract): a first
+    `--import-run` invocation on a fresh workdir WITHOUT --resume
+    seeds the checkpoint and then is rejected (exit 2) by the
+    'a checkpoint exists — pass --resume' guard — the import
+    creates the very file the guard trips on. The seeded lines
+    survive (the operator's --resume re-invocation is the
+    documented window-1 continuation)."""
+    repos, inst = _pilot_b_repos(tmp_path)
+    ids = [e["instance_id"] for e in repos]
+    i0, i1, i2 = ids
+    wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
+    modes = {i0: "no_patch", i1: "no_patch", i2: "ok"}
+    cfg1 = _cfg(tmp_path, inst, run_id="src", workdir=str(wd1),
+               host_check=False)
+    assert _run(cfg1, _mock_make_session(modes)) == lp.EXIT_OK
+    # the first import window WITHOUT --resume: exit 2 (the guard)
+    cfg2 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               host_check=False, pilot="b",
+               import_run="src", import_workdir=str(wd1))
+    assert _run(cfg2, _mock_make_session(modes)) == 2
+    # the seeded lines survive the rejection (the documented
+    # --resume re-invocation picks them up — no re-seed needed)
+    lines = _read_jsonl(wd2 / "run-pilotB.jsonl")
+    seeded = [l for l in lines if l.get("instance_id")]
+    assert {l["instance_id"] for l in seeded} == {i0, i1}
+    assert all(l["meta"].get("imported_from") == "src"
+               for l in seeded)
+    # the --resume re-invocation completes (the window-1 flow)
+    cfg3 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               resume=True, host_check=False, pilot="b",
+               import_run="src", import_workdir=str(wd1))
+    assert _run(cfg3, _mock_make_session(modes)) == lp.EXIT_OK
+    lines3 = _read_jsonl(wd2 / "run-pilotB.jsonl")
+    assert sum(1 for l in lines3 if l["instance_id"] == i0) == 1
+    assert sum(1 for l in lines3 if l["instance_id"] == i1) == 1
+
+
+def test_wp6b_round4_run_id_charset_validation(tmp_path):
+    """The round-4 Minor fix: --run-id has the same charset
+    validation as --import-run (fail-closed config error — the id
+    is joined into the checkpoint / state filenames and reaches
+    ev.evaluate, where a non-conforming id would degrade to a
+    per-instance eval_error instead of a fail-closed config
+    error)."""
+    for bad in ("../evil", "a..b", "-lead", "sp ace",
+               "semi;colon", "slash/ed"):
+        try:
+            lp.PilotConfig(mode="sandbox", run_id=bad,
+                          instances_file="x.json")
+        except lp.PilotConfigError:
+            pass
+        else:
+            raise AssertionError(f"run_id {bad!r} was accepted")
+    for good in ("pilotA", "pilotB", "a.b-c_1", "x"):
+        lp.PilotConfig(mode="sandbox", run_id=good,
+                      instances_file="x.json")
+    # a generated id (run_id=None) is unaffected
+    lp.PilotConfig(mode="sandbox", run_id=None,
+                  instances_file="x.json")
+
+
+def test_wp6b_round5_self_import_rejected(tmp_path, live):
+    """The round-5 Medium fix (issue #22 AC2): a SELF-IMPORT is
+    rejected — --import-run equal to --run-id with the default
+    import-workdir (this run's workdir) makes the source this run's
+    own checkpoint; a later-window --resume would re-derive
+    ``imported`` from the run's own seeded lines, overwrite
+    ``state.import_source`` / ``imported_run``, and item 16 would
+    pass on a self-comparison (the real 2-run overlap evidence
+    clobbered). Fail-closed: a config error before the pre-flight."""
+    repos, inst = _pilot_b_repos(tmp_path)
+    wd = tmp_path / "wd"
+    # the self-import: import_run == run_id, the default workdir
+    cfg = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
+               host_check=False, pilot="b",
+               import_run="pilotB")
+    try:
+        lp.load_imported(cfg, str(wd), [])
+    except lp.PilotConfigError:
+        pass
+    else:
+        raise AssertionError("the self-import was accepted")
+    # an explicit same-workdir self-import is rejected too
+    cfg2 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
+                host_check=False, pilot="b",
+                import_run="pilotB", import_workdir=str(wd))
+    try:
+        lp.load_imported(cfg2, str(wd), [])
+    except lp.PilotConfigError:
+        pass
+    else:
+        raise AssertionError("the explicit self-import was accepted")
+    # the same run id in a DIFFERENT workdir is a legitimate import
+    # (the source file is a different file) — not rejected
+    other = tmp_path / "other"
+    other.mkdir()
+    with open(other / "run-pilotB.jsonl", "w") as f:
+        f.write(json.dumps({"instance_id": "x", "status": "resolved",
+                            "ts": 1.0, "meta": {}}) + "\n")
+    cfg3 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
+                host_check=False, pilot="b",
+                import_run="pilotB", import_workdir=str(other))
+    # no config error at the self-import check (the source exists)
+    try:
+        lp.load_imported(cfg3, str(wd), [])
+    except lp.PilotConfigError as exc:
+        # a different-workdir source must not trip the self-import
+        # rejection (it may fail for other reasons, never the
+        # self-import one)
+        assert "self-import" not in str(exc), exc
+
+
+def test_wp6b_round5_artifacts_dir_absent_copies_to_workdir_root(
+        tmp_path):
+    """The round-5 Minor fix (issue #22 AC2 / the WP5 cross-check):
+    a referenced artifact on a line whose ``meta.artifacts_dir`` is
+    absent resolves against the run JSONL's directory (the workdir
+    — the WP5 ``_ref_path`` contract) — the import copy must land
+    there too (a None base made the same-path guard a trivial no-op
+    and the artifact was never copied — the cross-check then
+    reports it missing at report time)."""
+    srcwd, dstwd = tmp_path / "src", tmp_path / "dst"
+    srcwd.mkdir()
+    dstwd.mkdir()
+    (srcwd / "trajectory.jsonl").write_text("t\n")
+    rec = {"instance_id": "x", "status": "resolved", "ts": 1.0,
+           "meta": {"trajectory": "trajectory.jsonl"}}  # no
+    # artifacts_dir
+    lp._copy_imported_artifacts(rec, str(srcwd), str(dstwd))
+    assert (dstwd / "trajectory.jsonl").is_file()
+    # the idempotent fast path (an existing destination) + the
+    # missing-source case (left as-is — the cross-check flags it,
+    # the WP5 semantics)
+    (dstwd / "eval.log").unlink(missing_ok=True)
+    rec2 = {"instance_id": "x", "status": "resolved", "ts": 1.0,
+           "meta": {"eval_log": "eval.log"}}
+    lp._copy_imported_artifacts(rec2, str(srcwd), str(dstwd))
+    assert not (dstwd / "eval.log").is_file()  # missing source
+
+
+def test_wp6b_round5_run_id_type_guard(tmp_path):
+    """The round-5 Minor fix: a non-string run_id is a fail-closed
+    PilotConfigError (exit 2) — the isinstance guard import_run has
+    — instead of a bare TypeError at the ``'..' in self.run_id``
+    check (a generic exit 4)."""
+    try:
+        lp.PilotConfig(mode="sandbox", run_id=123,
+                      instances_file="x.json")
+    except lp.PilotConfigError:
+        pass
+    else:
+        raise AssertionError("a non-string run_id was accepted")
+    try:
+        lp.PilotConfig(mode="sandbox", run_id=None,
+                      instances_file="x.json")
+    except lp.PilotConfigError:
+        raise AssertionError("run_id None (the generated id) was "
+                             "rejected")
+
+
+def test_wp6b_round6_host_check_path_failure_classifies_env(
+        tmp_path, monkeypatch):
+    """The round-6 Blocker fix (issue #22 AC3): the host-check's
+    ``git apply`` leg — a "can't open patch"-class failure is a
+    HARNESS path failure (the file is missing — e.g. the
+    workdir-relative path resolved against the clone by ``git -C``),
+    not the model's patch content: it classifies ``env`` (the model
+    patch content never got a chance; classifying it ``patch``
+    would misgate the AC3 taxonomy). A genuine apply conflict
+    (the content does not apply) stays ``patch`` for the model
+    patch and ``env`` for the test patch (the harness fixture /
+    the pinned base)."""
+    inst = {"instance_id": "a__b-1", "repo": "a/b",
+            "base_commit": "0" * 40,
+            "model_patch": "diff --git a/x b/x\n",
+            "test_patch": "diff --git a/y b/y\n"}
+    spec = lp.SessionSpec(instance=inst, mode="sandbox",
+                         devin_bin="devin", model="swe-2-high",
+                         cwd=str(tmp_path), env={}, wall_s=1.0,
+                         host_check=False, workdir=str(tmp_path),
+                         run_id="t")
+    # the shared bare cache pre-created (the bare clone is skipped)
+    (tmp_path / "clone-cache" / "a__b.git").mkdir(parents=True)
+    calls = {"apply_err": "error: can't open "
+             "'./pilot-b/host-check/a__b-1/model_patch.diff': "
+             "No such file or directory"}
+
+    class _P:
+        returncode = 0
+        stdout = b""
+        stderr = b""
+
+    def fake_run(args, **kw):
+        p = _P()
+        if args[0] == "git" and "apply" in args:
+            p.returncode = 128
+            p.stderr = calls["apply_err"].encode()
+        return p
+    monkeypatch.setattr(lp.subprocess, "run", fake_run)
+    session = lp.PilotSession.__new__(lp.PilotSession)
+    session._spec = spec
+    session.meta = {"wall": {}}
+    session._artifact_dir = lambda: str(tmp_path / "art")
+    # 1. the "can't open patch" class — the model patch leg: the
+    # HARNESS failure classifies env (not patch)
+    assert session._host_check(
+        "diff --git a/x b/x\n") == "eval_error"
+    assert session.meta["eval_error_root_cause"] == "env", \
+        session.meta["eval_error_root_cause"]
+    # 2. a genuine apply conflict — the model patch leg stays
+    # patch (the model's content does not apply to the checkout)
+    calls["apply_err"] = "error: patch failed: a/x:1\n" \
+        "error: a/x: patch does not apply"
+    assert session._host_check(
+        "diff --git a/x b/x\n") == "eval_error"
+    assert session.meta["eval_error_root_cause"] == "patch", \
+        session.meta["eval_error_root_cause"]
+    # 3. the TEST patch leg is env either way (the harness fixture /
+    # the pinned base — not the agent's patch)
+    calls["apply_err"] = "error: patch failed: a/y:1"
+    assert session._host_check("") == "eval_error"  # an empty model
+    # patch skips the model leg; the test patch leg fails
+    assert session.meta["eval_error_root_cause"] == "env", \
+        session.meta["eval_error_root_cause"]
+
+
+
+
+def test_wp6b_round7_truncated_dst_recopied(tmp_path):
+    """The round-7 Major fix (issue #22 AC2): the isfile(dst) fast
+    path no longer trusts a PARTIALLY-COPIED artifact —
+    shutil.copyfile is not atomic, so a mid-copy crash left a
+    truncated dst that every later invocation skipped (the
+    self-heal only covered a MISSING dst) and the WP5
+    check_artifacts R2 byte-compare then failed the cross-check at
+    report time (a permanent report_failed wedge — the same class
+    rounds 3-4 were fixing). Now: the fast path checks the size
+    (the source is immutable — size equality IS completeness) and
+    the copy is atomic (<dst>.part + os.replace — a new mid-copy
+    crash leaves no partial dst, only an orphan .part the next
+    copy overwrites)."""
+    srcwd, dstwd = tmp_path / "src", tmp_path / "dst"
+    srcwd.mkdir()
+    dstwd.mkdir()
+    (srcwd / "trajectory.jsonl").write_text("complete-content\n" * 10)
+    # a TRUNCATED dst (a pre-fix mid-copy crash): re-copied
+    (dstwd / "trajectory.jsonl").write_text("complete-con")
+    rec = {"instance_id": "x", "status": "resolved", "ts": 1.0,
+           "meta": {"trajectory": "trajectory.jsonl"}}
+    lp._copy_imported_artifacts(rec, str(srcwd), str(dstwd))
+    assert (dstwd / "trajectory.jsonl").read_text() \
+        == (srcwd / "trajectory.jsonl").read_text()
+    # the complete dst: the fast path (no re-copy — mtime would
+    # change if re-copied)
+    import os
+    mtime = (dstwd / "trajectory.jsonl").stat().st_mtime_ns
+    lp._copy_imported_artifacts(rec, str(srcwd), str(dstwd))
+    assert (dstwd / "trajectory.jsonl").stat().st_mtime_ns == mtime
+    # a missing src with a present dst: left as-is (the WP5
+    # fail-loud semantics — the cross-check flags it)
+    rec2 = {"instance_id": "x", "status": "resolved", "ts": 1.0,
+            "meta": {"eval_log": "eval.log"}}
+    (dstwd / "eval.log").write_text("dst-only")
+    lp._copy_imported_artifacts(rec2, str(srcwd), str(dstwd))
+    assert (dstwd / "eval.log").read_text() == "dst-only"
+    # the atomic copy: a mid-copy crash leaves no partial dst
+    import shutil as _sh
+    real_copyfile = _sh.copyfile
+
+    def boom(src, dst, **kw):
+        if dst.endswith(".part"):
+            open(dst, "w").write("partial")  # simulate a crash
+            raise OSError("simulated mid-copy crash")
+        return real_copyfile(src, dst, **kw)
+    import subprocess  # noqa: F401
+    real_replace = os.replace
+    (dstwd / "traj2.jsonl").unlink(missing_ok=True)
+    (srcwd / "traj2.jsonl").write_text("t2\n")
+    rec3 = {"instance_id": "x", "status": "resolved", "ts": 1.0,
+            "meta": {"trajectory": "traj2.jsonl"}}
+    try:
+        _sh2 = lp.shutil
+        old_cf = _sh2.copyfile
+        _sh2.copyfile = boom
+        try:
+            lp._copy_imported_artifacts(rec3, str(srcwd), str(dstwd))
+        except OSError:
+            pass
+        finally:
+            _sh2.copyfile = old_cf
+    except Exception:
+        pass
+    # after the simulated crash: NO partial dst (only the .part)
+    assert not (dstwd / "traj2.jsonl").is_file()
+    # the next invocation heals (the dst is absent — a fresh copy)
+    lp._copy_imported_artifacts(rec3, str(srcwd), str(dstwd))
+    assert (dstwd / "traj2.jsonl").read_text() == "t2\n"
+
+
+def test_wp6b_round7_state_write_crash_atomic(tmp_path, monkeypatch):
+    """The round-7 Major fix (issue #22): _write_state is
+    crash-atomic (tmp + fsync + os.replace) — a mid-write crash
+    (a process kill / power loss during the write) leaves the
+    PREVIOUS state file intact, so the resume's import
+    re-derivation (the state's full source set + the checkpoint
+    fallback) is never clobbered by a torn write (the old
+    open("w") truncated in place — a mid-write crash left a torn
+    JSON that _load_state swallowed to {})."""
+    wd = tmp_path / "wd"
+    wd.mkdir()
+    rid = "t"
+    first = {"a": 1, "imported_run": "src",
+             "import_source": {"x": {"instance_id": "x"}}}
+    lp._write_state(str(wd), rid, first)
+    # a crash mid-write: os.replace never runs
+    import os
+    real_replace = os.replace
+
+    def no_rename(src, dst, **kw):
+        raise OSError("simulated crash mid-write (before the rename)")
+    monkeypatch.setattr(lp.os, "replace", no_rename)
+    try:
+        lp._write_state(str(wd), rid, {"b": 2})
+    except OSError:
+        pass
+    # the previous state is INTACT (no in-place truncation)
+    st = json.loads((wd / f"pilot-{rid}.state.json").read_text())
+    assert st == first, st
+    monkeypatch.undo()
+    # a normal write still works
+    lp._write_state(str(wd), rid, {"b": 2})
+    st2 = json.loads((wd / f"pilot-{rid}.state.json").read_text())
+    assert st2 == {"b": 2}, st2
+
+
+def test_wp6b_round7_corrupt_source_line_meta(tmp_path, live):
+    """The round-7 Medium fix (issue #22 AC2): a corrupt source
+    line with a non-dict meta (or a non-numeric ts) passes the
+    load_checkpoint / dedupe validation (they only check
+    instance_id / status) and would crash the seeding loop
+    MID-SEED (exit 4) instead of the documented fail-closed config
+    error (exit 2, before any session) — and the persisted early
+    import record made every later --resume hit the same crash.
+    load_imported now validates both, before any session."""
+    repos, inst = _pilot_b_repos(tmp_path)
+    ids = [e["instance_id"] for e in repos]
+    wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
+    # a corrupt source: a line whose meta is a STRING (plus a
+    # good line, so the known-set filtering passes)
+    src = wd1 / "run-src.jsonl"
+    wd1.mkdir()
+    with open(src, "w") as f:
+        f.write(json.dumps({"instance_id": ids[0],
+                            "status": "resolved", "ts": 1.0,
+                            "meta": "a-non-dict-meta"}) + "\n")
+        f.write(json.dumps({"instance_id": ids[1],
+                            "status": "resolved", "ts": 2.0,
+                            "meta": {}}) + "\n")
+    cfg = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               host_check=False, pilot="b",
+               import_run="src", import_workdir=str(wd1))
+    insts = json.loads(Path(inst).read_text())["instances"]
+    try:
+        lp.load_imported(cfg, str(wd2), insts)
+    except lp.PilotConfigError as exc:
+        assert "non-dict meta" in str(exc), exc
+    else:
+        raise AssertionError("a non-dict meta was accepted")
+    # a non-numeric ts is rejected too (it would break the
+    # window-bucket day arithmetic downstream)
+    with open(src, "w") as f:
+        f.write(json.dumps({"instance_id": ids[0],
+                            "status": "resolved", "ts": "not-a-timestamp",
+                            "meta": {}}) + "\n")
+    try:
+        lp.load_imported(cfg, str(wd2), insts)
+    except lp.PilotConfigError as exc:
+        assert "_parse_ts" in str(exc), exc
+    else:
+        raise AssertionError("a non-numeric ts was accepted")
+    # a well-formed source still passes (no over-rejection)
+    with open(src, "w") as f:
+        f.write(json.dumps({"instance_id": ids[0],
+                            "status": "resolved", "ts": 1.0,
+                            "meta": {}}) + "\n")
+    imported, _ = lp.load_imported(cfg, str(wd2), insts)
+    assert ids[0] in imported
+
+
+def test_wp6b_round7_root_cause_table_escapes(tmp_path):
+    """The round-7 Minor fix (issue #22 AC3 record): the detail
+    (operator text — a root-cause detail) is escaped into the
+    markdown table like the checklist rows — a | or a newline in it
+    would corrupt the table."""
+    wp6b = {"per_repo": {}, "expected_repos": [],
+            "import": {}, "taxonomy": {},
+            "root_causes": [
+                {"instance_id": "a__b-1", "root_cause": "env",
+                 "detail": "git apply | failed\nto a new line"}],
+            "windows": []}
+    out = lp._render_pilot_b_sections(wp6b)
+    joined = "\n".join(out)
+    assert "| failed" in joined  # the escaped pipe renders as text
+    assert "\\|" in joined  # the escape is present in the source
+    assert "to a new line" in joined
+    # the row: 2 outer delimiters + 2 unescaped cell separators +
+    # 1 escaped pipe (\| — the escaped char is not a delimiter to
+    # a markdown parser, but it is a raw '|' char) = 5 raw chars;
+    # a literal unescaped pipe inside the cell would be a 6th
+    row = [l for l in out
+           if l.startswith("| a__b-1")][0]
+    assert row.count("|") == 5, row
+    assert row.endswith("|")  # a clean row end (no dangling cell)
+
+
+def test_wp6b_round7_pin_fetch_cycle_guard(tmp_path, monkeypatch):
+    """The round-7 Minor fix: the no-progress guard catches a
+    misbehaving API CYCLING two or more distinct pages (an
+    immediate-only repeat check left a 2+-page cycle unbounded)."""
+    import scripts.pin_pilot_b_instances as pin
+    # the cycle: page A, page B, page A again (a distinct first
+    # row each time — an immediate-only repeat check would loop
+    # forever; the seen-set guard terminates on the repeat)
+    seq = [
+        {"partial": True,
+         "rows": [{"row_idx": 0, "row": {}},
+                  {"row_idx": 1, "row": {}}]},
+        {"partial": True,
+         "rows": [{"row_idx": 2, "row": {}},
+                  {"row_idx": 3, "row": {}}]},
+        {"partial": True,
+         "rows": [{"row_idx": 0, "row": {}},
+                  {"row_idx": 1, "row": {}}]},
+    ]
+    calls = {"i": 0}
+
+    def fake_get(url):
+        d = seq[min(calls["i"], len(seq) - 1)]
+        calls["i"] += 1
+        return d
+    monkeypatch.setattr(pin, "_get", fake_get)
+    pin.fetch_all_rows()
+    assert calls["i"] == 3, calls["i"]  # terminated on the repeat
+    # the normal termination (a non-partial short page) is
+    # unaffected
+    seq2 = [
+        {"partial": True,
+         "rows": [{"row_idx": 0, "row": {}}]},
+        {"partial": False,
+         "rows": [{"row_idx": 1, "row": {}}]},
+    ]
+    calls2 = {"i": 0}
+
+    def fake_get2(url):
+        d = seq2[min(calls2["i"], len(seq2) - 1)]
+        calls2["i"] += 1
+        return d
+    monkeypatch.setattr(pin, "_get", fake_get2)
+    rows2 = pin.fetch_all_rows()
+    assert calls2["i"] == 2, calls2["i"]
+    assert [r["row_idx"] for r in rows2] == [0, 1]
+
+
+
+
+def test_wp6b_round8_ts_wp5_contract(tmp_path, live):
+    """The round-8 Medium fix (issue #22 AC2): the ts guard admits
+    only what the WP5 ``date_range`` / ``_parse_ts`` contract
+    admits — a ``None`` / ``bool`` / non-finite / non-positive ts
+    (which the old isinstance guard admitted — ``rec.get("ts",
+    ...)`` writes the literal value when the key is present) then
+    fails ``rep.generate`` as ``report_failed`` and wedges every
+    later --resume on the same durable line. Fail-closed instead."""
+    repos, inst = _pilot_b_repos(tmp_path)
+    ids = [e["instance_id"] for e in repos]
+    wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
+    wd1.mkdir()
+    src = wd1 / "run-src.jsonl"
+    cfg = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               host_check=False, pilot="b",
+               import_run="src", import_workdir=str(wd1))
+    insts = json.loads(Path(inst).read_text())["instances"]
+    for bad in (None, True, False, float("nan"), float("inf"),
+               float("-inf"), 0, -5):
+        with open(src, "w") as f:
+            f.write(json.dumps({"instance_id": ids[0],
+                                "status": "resolved", "ts": bad,
+                                "meta": {}}) + "\n")
+        try:
+            lp.load_imported(cfg, str(wd2), insts)
+        except lp.PilotConfigError:
+            pass
+        else:
+            raise AssertionError(f"ts {bad!r} was accepted")
+    # a valid finite positive ts still passes
+    with open(src, "w") as f:
+        f.write(json.dumps({"instance_id": ids[0],
+                            "status": "resolved", "ts": 1793220874.9,
+                            "meta": {}}) + "\n")
+    imported, _ = lp.load_imported(cfg, str(wd2), insts)
+    assert ids[0] in imported
+
+
+def test_wp6b_round8_preflight_failed_wall_counts(tmp_path):
+    """The round-8 Minor fix (issue #22 AC4 / item 12): a
+    preflight_failed line is not a SESSION (no session ran — the
+    pre-flight leg failed) and does not count toward the session
+    count — but its REAL wall (a failed pre-flight leg — the
+    image-pull class — can be minutes) counts toward the wall gate
+    (the WP6a wall_used_s basis counted it; the old code dropped
+    the whole line, under-counting the window's wall)."""
+    day = 20759
+    ts = day * 86400 + 100
+    recs = [
+        {"instance_id": "a", "status": "resolved", "ts": ts,
+         "meta": {"wall_s": 100.0}},
+        {"instance_id": "b", "status": "preflight_failed",
+         "ts": ts + 1, "meta": {"wall_s": 300.0}},
+        {"instance_id": "c", "status": "resolved", "ts": ts + 2,
+         "meta": {"wall_s": 50.0}},
+    ]
+    out = lp._window_buckets(recs)
+    assert out[day]["sessions"] == 2, out  # the preflight line is
+    # not a session
+    assert out[day]["wall_s"] == 450.0, out  # but its wall (300s)
+    # counts
+
+
+def test_wp6b_round9_interrupted_resume_record_item11(tmp_path, live):
+    """The round-9 Minor fix (issue #22 AC4 / WP3b item 11): on a
+    pilot-B window-1 interrupted record, the seeded import lines
+    leave skipped_on_resume non-empty while resume_after_interrupt
+    is still False — the OLD ordering let the plain
+    resume-with-skip branch shadow the interrupted branch, so item
+    11 rendered \"the pair was not the intentional interrupt (AC3
+    not exercised)\" + FAIL on the very invocation that just
+    performed the interrupt. The interrupted invocation IS the
+    interrupt leg of the pair: the AC3 evidence completes on the
+    following resume invocation (the first branch)."""
+    repos = _three_repos(tmp_path)
+    inst = _instances_file(tmp_path / "inst.json", repos)
+    # the round-14 Medium fix (issue #22 AC1): a pilot-B run
+    # requires the instance file's _meta.stratified_repos — add
+    # it (the AC1 evidence is pilot B's definition)
+    doc = json.loads((tmp_path / "inst.json").read_text())
+    doc["_meta"]["stratified_repos"] = [r["repo"] for r in repos]
+    (tmp_path / "inst.json").write_text(json.dumps(doc))
+    ids = [e["instance_id"] for e in repos]
+    i0, i1, i2 = ids
+    wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
+    # the source run: i0 no_patch (never-rerun — the import), i1 /
+    # i2 ok -> eval_error (the retry class — re-run in pilot B)
+    modes1 = {i0: "no_patch", i1: "ok", i2: "ok"}
+    cfg1 = _cfg(tmp_path, inst, run_id="src", workdir=str(wd1),
+               host_check=False)
+    assert _run(cfg1, _mock_make_session(modes1)) == lp.EXIT_OK
+    # the import window: i0 imported (skipped on the resume), i1 /
+    # i2 re-run (the retry class); the interrupt fires after i1
+    # (ONE session — i2 remains); skipped_on_resume is non-empty
+    # (i0), resume_after_interrupt is False (no prior interrupt)
+    cfg2 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               resume=True, host_check=False, pilot="b",
+               import_run="src", import_workdir=str(wd1),
+               interrupt_after=1)
+    assert _run(cfg2, _mock_make_session(
+        {i0: "no_patch", i1: "no_patch", i2: "no_patch"}))         == lp.EXIT_INTERRUPT
+    gng = (wd2 / "wp6b-pilot-b.md").read_text()
+    row11 = [l for l in gng.splitlines()
+            if l.startswith("| 11 |")][0]
+    assert "the resume invocation must follow" in row11, row11
+    assert "AC3 not exercised" not in row11, row11
+    # the following resume completes the pair: item 11 PASS (the
+    # first branch — the AC3 evidence)
+    cfg3 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               resume=True, host_check=False, pilot="b")
+    assert _run(cfg3, _mock_make_session(
+        {i0: "no_patch", i1: "no_patch", i2: "no_patch"}))         == lp.EXIT_OK
+    gng3 = (wd2 / "wp6b-pilot-b.md").read_text()
+    row11_3 = [l for l in gng3.splitlines()
+              if l.startswith("| 11 |")][0]
+    assert "resumed after the intentional interrupt" in row11_3, \
+        row11_3
+    assert "PASS" in row11_3, row11_3
+
+
+def test_wp6b_round9_mid_file_corruption_is_config_error(tmp_path):
+    """The round-9 Minor fix (issue #22 AC2): a mid-file corrupt
+    line in this run's own checkpoint makes load_checkpoint raise
+    RunnerProtocolError (the tail repair covers only the tail) —
+    seed_import_lines now catches it and fails closed (exit 2, the
+    config error class, before any session) as the comment
+    promises, instead of letting it propagate to the exit-4
+    runner-error path."""
+    wd = tmp_path / "wd"
+    wd.mkdir()
+    cp = wd / "run-t.jsonl"
+    good1 = json.dumps({"instance_id": "a", "status": "no_patch",
+                        "ts": 1.0, "meta": {}})
+    good2 = json.dumps({"instance_id": "b", "status": "ok",
+                        "ts": 2.0, "meta": {}})
+    # a MID-FILE corrupt line (not the tail — the tail repair
+    # truncates only the torn tail; a mid-file line survives the
+    # repair and makes load_checkpoint raise)
+    cp.write_text(good1 + "\n" + "this-is-not-json\n" + good2 + "\n")
+    try:
+        lp.seed_import_lines(str(cp), {"c": {"instance_id": "c",
+                                             "status": "no_patch",
+                                             "ts": 3.0,
+                                             "meta": {}}},
+                            "src", str(wd))
+    except lp.PilotConfigError:
+        pass
+    else:
+        raise AssertionError("a mid-file corruption was not a "
+                             "config error")
+
+
+def test_wp6b_round10_rederivation_non_dict_meta(tmp_path, live):
+    """The round-10 Minor fix (issue #22 AC2): a truthy non-dict
+    meta on a checkpoint line (the same corrupt-line class
+    load_imported validates on the source side) no longer crashes
+    the checkpoint re-derivation with an uncaught AttributeError
+    (exit 4) — the _meta_of guard normalizes it to {} (the line
+    simply lacks a meta for the accounting / re-derivation), and
+    the run proceeds (exit 0)."""
+    repos = _three_repos(tmp_path)
+    inst = _instances_file(tmp_path / "inst.json", repos)
+    ids = [e["instance_id"] for e in repos]
+    i0, i1, i2 = ids
+    wd = tmp_path / "wd"
+    wd.mkdir()
+    cp = wd / "run-t.jsonl"
+    good0 = json.dumps({"instance_id": i0, "status": "no_patch",
+                        "ts": 1.0, "meta": {}})
+    corrupt = json.dumps({"instance_id": i1, "status": "no_patch",
+                          "ts": 2.0,
+                          "meta": "a-corrupt-string-meta"})
+    cp.write_text(good0 + "\n" + corrupt + "\n")
+    cfg = _cfg(tmp_path, inst, run_id="t", workdir=str(wd),
+               resume=True, host_check=False)
+    # the run PROCEEDS through the re-derivation (i2 runs — the
+    # fresh session line exists) and then fails at the WP5 report
+    # (its fail-loud meta validation — the documented report
+    # class, the resume class — NOT the old uncaught
+    # AttributeError at the re-derivation, which crashed BEFORE i2
+    # ran)
+    assert _run(cfg, _mock_make_session(
+        {i0: "no_patch", i1: "no_patch", i2: "no_patch"})) \
+        == lp.EXIT_RUN_FAILED
+    lines = _read_jsonl(cp)
+    # i2 was RUN (the re-derivation did not crash before the
+    # sessions)
+    assert sum(1 for l in lines if l["instance_id"] == i2) == 1
+    # the failure is the WP5 report class (the documented resume
+    # class) — not a generic runner error
+    st = json.loads((wd / "pilot-t.state.json").read_text())
+    assert st["final_state"] == "report_failed", st
+
+
+def test_wp6b_round11_source_layout_normalization(tmp_path, live):
+    """The round-11 Blocker fix (issue #22 AC2): the pre-commit
+    Pilot-A run (2026-10-28 20:46-20:56 UTC — before commit
+    4259460) wrote meta.artifacts_dir = <iid> while its artifacts
+    lived under runs/<iid>/ — the import resolution (<src>/<iid>/)
+    found nothing, the copy no-opped, and the seeded durable lines
+    referenced paths that could never exist: the completing
+    invocation's rep.generate raised ArtifactCheckError
+    (report_failed, exit 4) and every --resume re-hit the same
+    wedge (the self-heal could never find the sources). The
+    normalization: if the line's references resolve MISSING under
+    its own artifacts_dir but ALL exist under runs/<ad>/ in the
+    source workdir (the current _artifact_dir layout), the
+    imported line's meta is rewritten to the current layout. A
+    normal-layout source is unchanged; a genuinely missing
+    reference is left as-is (the WP5 fail-loud semantics)."""
+    repos, inst = _pilot_b_repos(tmp_path)
+    ids = [e["instance_id"] for e in repos]
+    i0, i1, i2 = ids
+    wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
+    # the SOURCE workdir: artifacts under runs/<iid>/ (the current
+    # layout)
+    (wd1 / "runs" / i0).mkdir(parents=True)
+    (wd1 / "runs" / i0 / "patch.diff").write_text("p")
+    (wd1 / "runs" / i0 / "trajectory.jsonl").write_text("t")
+    (wd1 / "runs" / i0 / "eval.log").write_text("e")
+    (wd1 / "runs" / i1).mkdir(parents=True)
+    (wd1 / "runs" / i1 / "patch.diff").write_text("p")
+    (wd1 / "runs" / i1 / "trajectory.jsonl").write_text("t")
+    (wd1 / "runs" / i1 / "eval.log").write_text("e")
+    # the source checkpoint: OLD layout (artifacts_dir = <iid>)
+    src = wd1 / "run-src.jsonl"
+    with open(src, "w") as f:
+        f.write(json.dumps({"instance_id": i0, "status": "no_patch",
+                            "ts": 1.0,
+                            "meta": {"artifacts_dir": i0,
+                                    "patch_diff": "patch.diff",
+                                    "trajectory": "trajectory.jsonl",
+                                    "eval_log": "eval.log"}}) + "\n")
+        f.write(json.dumps({"instance_id": i1, "status": "resolved",
+                            "ts": 2.0,
+                            "meta": {"artifacts_dir": "runs/" + i1,
+                                    "patch_diff": "patch.diff",
+                                    "trajectory": "trajectory.jsonl",
+                                    "eval_log": "eval.log"}}) + "\n")
+    cfg = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               host_check=False, pilot="b",
+               import_run="src", import_workdir=str(wd1))
+    insts = json.loads(Path(inst).read_text())["instances"]
+    imported, _ = lp.load_imported(cfg, str(wd2), insts)
+    # the OLD-layout line is normalized (the AC2 copy can now find
+    # the sources — the cross-check holds)
+    m0 = imported[i0]["meta"]
+    assert m0["artifacts_dir"] == "runs/" + i0, m0
+    # the NORMAL-layout line is unchanged
+    m1 = imported[i1]["meta"]
+    assert m1["artifacts_dir"] == "runs/" + i1, m1
+    # the seeded line carries the normalized meta + the copy lands
+    lp.seed_import_lines(str(wd2 / "run-pilotB.jsonl"), imported,
+                        "src", str(wd1))
+    lines = _read_jsonl(wd2 / "run-pilotB.jsonl")
+    by = {l["instance_id"]: l for l in lines}
+    assert by[i0]["meta"]["artifacts_dir"] == "runs/" + i0
+    # the referenced artifacts were COPIED (the cross-check holds)
+    assert (wd2 / "runs" / i0 / "patch.diff").is_file()
+    assert (wd2 / "runs" / i0 / "trajectory.jsonl").is_file()
+    assert (wd2 / "runs" / i0 / "eval.log").is_file()
+    # a genuinely missing reference is LEFT AS-IS (the WP5
+    # fail-loud semantics — the cross-check flags it)
+    (wd1 / "runs" / i2).mkdir(parents=True)
+    src2 = wd1 / "run-src2.jsonl"
+    with open(src2, "w") as f:
+        f.write(json.dumps({"instance_id": i2, "status": "resolved",
+                            "ts": 3.0,
+                            "meta": {"artifacts_dir": i2,
+                                    "patch_diff": "missing.diff",
+                                    "trajectory": "missing.jsonl",
+                                    "eval_log": "missing.log"}})
+               + "\n")
+    cfg2 = _cfg(tmp_path, inst, run_id="pilotB2",
+                workdir=str(tmp_path / "wd3"), host_check=False,
+                pilot="b", import_run="src2",
+                import_workdir=str(wd1))
+    imported2, _ = lp.load_imported(cfg2, str(tmp_path / "wd3"),
+                                   insts)
+    assert imported2[i2]["meta"]["artifacts_dir"] == i2  # unchanged
+
+
+def test_wp6b_round11_ref_path_schema_validation(tmp_path, live):
+    """The round-11 Medium fix (issue #22 AC2): the fail-closed
+    source-line validation covers the WP5 _ref_path schema — a
+    non-string non-null meta.artifacts_dir / patch_diff /
+    trajectory / eval_log seeds verbatim and crosscheck raises
+    ReportProtocolError → report_failed (the same durable-line
+    wedge class the meta/ts guards were added to close).
+    Fail-closed instead: a config error before any session."""
+    repos, inst = _pilot_b_repos(tmp_path)
+    ids = [e["instance_id"] for e in repos]
+    wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
+    wd1.mkdir()
+    src = wd1 / "run-src.jsonl"
+    cfg = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               host_check=False, pilot="b",
+               import_run="src", import_workdir=str(wd1))
+    insts = json.loads(Path(inst).read_text())["instances"]
+    for key, bad in (("artifacts_dir", 123),
+                     ("artifacts_dir", ""),
+                     ("patch_diff", {}),
+                     ("trajectory", ["t"]),
+                     ("eval_log", 5)):
+        with open(src, "w") as f:
+            f.write(json.dumps({"instance_id": ids[0],
+                                "status": "resolved", "ts": 1.0,
+                                "meta": {key: bad}}) + "\n")
+        try:
+            lp.load_imported(cfg, str(wd2), insts)
+        except lp.PilotConfigError:
+            pass
+        else:
+            raise AssertionError(f"{key}={bad!r} was accepted")
+    # a conforming reference (non-empty strings / null) still
+    # passes
+    with open(src, "w") as f:
+        f.write(json.dumps({"instance_id": ids[0],
+                            "status": "resolved", "ts": 1.0,
+                            "meta": {"artifacts_dir": "runs/x",
+                                    "patch_diff": "patch.diff",
+                                    "trajectory": None,
+                                    "eval_log": "eval.log"}}) + "\n")
+    imported, _ = lp.load_imported(cfg, str(wd2), insts)
+    assert ids[0] in imported
+
+
+def test_wp6b_round12_null_meta_normalized(tmp_path, live):
+    """The round-12 Major fix (issue #22 AC2): a source line with
+    no meta key (or meta: null) previously crashed the _ref_path
+    schema loop (meta.get(k) on None — an uncaught AttributeError
+    that escaped run_pilot to main's generic handler, exit 4,
+    contradicting the fail-closed contract, and every --resume
+    re-hit the same crash). Now: a missing / null meta is
+    schema-conformant (all references absent) — normalized to {}
+    and imported without error."""
+    repos, inst = _pilot_b_repos(tmp_path)
+    ids = [e["instance_id"] for e in repos]
+    wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
+    wd1.mkdir()
+    src = wd1 / "run-src.jsonl"
+    cfg = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               host_check=False, pilot="b",
+               import_run="src", import_workdir=str(wd1))
+    insts = json.loads(Path(inst).read_text())["instances"]
+    for payload in ({"instance_id": ids[0], "status": "resolved",
+                    "ts": 1.0},
+                   {"instance_id": ids[1], "status": "resolved",
+                    "ts": 2.0, "meta": None}):
+        with open(src, "w") as f:
+            f.write(json.dumps(payload) + "\n")
+        imported, _ = lp.load_imported(cfg, str(wd2), insts)
+        assert payload["instance_id"] in imported
+        assert imported[payload["instance_id"]].get("meta") in (None, {})
+
+
+def test_wp6b_round12_zero_overlap_import_fail_closed(tmp_path, live):
+    """The round-12 Medium fix (issue #22 AC2): a --import-run
+    source that shares NO instance ids with the instance file
+    (an existing but unrelated run id — it passes every other
+    fail-closed check) previously produced an empty import: item
+    16 rendered n/a (non-gating) and the record could GO with
+    zero AC2 overlap evidence, indistinguishable from a
+    legitimate non-import run. Fail-closed: a config error
+    before any session. A source whose shared ids are all
+    retry-class still passes (the import re-runs them — item 16
+    renders the explicit vacuous state)."""
+    repos, inst = _pilot_b_repos(tmp_path)
+    ids = [e["instance_id"] for e in repos]
+    wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
+    wd1.mkdir()
+    src = wd1 / "run-src.jsonl"
+    cfg = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               host_check=False, pilot="b",
+               import_run="src", import_workdir=str(wd1))
+    insts = json.loads(Path(inst).read_text())["instances"]
+    # zero overlap (an unrelated id)
+    with open(src, "w") as f:
+        f.write(json.dumps({"instance_id": "other__repo-9999",
+                            "status": "resolved", "ts": 1.0})
+               + "\n")
+    try:
+        lp.load_imported(cfg, str(wd2), insts)
+    except lp.PilotConfigError:
+        pass
+    else:
+        raise AssertionError("a zero-overlap import was accepted")
+    # all shared ids retry-class: passes (the import re-runs them)
+    with open(src, "w") as f:
+        f.write(json.dumps({"instance_id": ids[0],
+                            "status": "eval_error", "ts": 1.0})
+               + "\n")
+    imported, retry = lp.load_imported(cfg, str(wd2), insts)
+    assert not imported and ids[0] in retry
+    # item 16 renders the explicit vacuous state (not a bare
+    # "n/a (no import)")
+    items = lp.build_checklist(
+        config=cfg, dry_run=False, gate=None, preflight_ok=None,
+        preflight_failures=[], records=[], skipped_on_resume={},
+        interrupted_this_run=None, resume_after_interrupt=False,
+        devin_ok=None, sessions_used=0, wall_budget_s=1.0,
+        wall_used_s=0.0, pilot_b=True, imported={},
+        import_attempted=True)
+    it16 = next(i for i in items if i["item"].startswith("16 "))
+    assert "import attempted — zero imported instances" in it16["observed"]
+    # and a legitimate non-import run renders the plain n/a
+    items2 = lp.build_checklist(
+        config=cfg, dry_run=False, gate=None, preflight_ok=None,
+        preflight_failures=[], records=[], skipped_on_resume={},
+        interrupted_this_run=None, resume_after_interrupt=False,
+        devin_ok=None, sessions_used=0, wall_budget_s=1.0,
+        wall_used_s=0.0, pilot_b=True, imported={},
+        import_attempted=False)
+    it16b = next(i for i in items2 if i["item"].startswith("16 "))
+    assert "n/a (no import" in it16b["observed"]
+
+
+def test_wp6b_round12_item12_wp5_sessions_annotation(tmp_path, live):
+    """The round-12 Medium fix (issue #22 AC2): the WP5 report's
+    'Sessions used (attempts)' counts every non-preflight_failed
+    line in the record (the WP5 record-level methodology — the
+    imported lines are part of the record), while this run's
+    budget arithmetic (item 12 / the calibrate basis) excludes
+    them. Item 12's observation now states the difference
+    explicitly when imports are present (the same record no
+    longer contradicts the WP5 report)."""
+    repos, inst = _pilot_b_repos(tmp_path)
+    cfg = _cfg(tmp_path, inst, host_check=False, pilot="b")
+    items = lp.build_checklist(
+        config=cfg, dry_run=False, gate=None, preflight_ok=None,
+        preflight_failures=[], records=[], skipped_on_resume={},
+        interrupted_this_run=None, resume_after_interrupt=False,
+        devin_ok=None, sessions_used=3, wall_budget_s=100.0,
+        wall_used_s=1.0, pilot_b=True,
+        imported={"a__r-1": {"instance_id": "a__r-1"}},
+        import_attempted=True, window_buckets=None)
+    it12 = next(i for i in items if i["item"].startswith("12 "))
+    assert "the WP5 report's sessions-used also counts the 1 " \
+        "imported line(s)" in it12["observed"], it12["observed"]
+
+
+def test_wp6b_round13_item10_excludes_imported(tmp_path, live):
+    """The round-13 Blocker fix (issue #22 AC2): the imported
+    (never-rerun) finals flow through the item-10 per-line loop
+    verbatim — the real Pilot-A source lines (and the already-
+    seeded lines) carry no meta.pruning (the per-line pruning
+    record postdates that run), so the missing-record check
+    flipped pruning_ok to False: item 10 is gating, so the
+    completing record rendered a permanent NO-GO. Fix: imported
+    lines are excluded from the check (the source run's own
+    record gates its own pruning; this run's item 10 gates the
+    sessions it actually ran). The check still applies to this
+    run's own lines (a fresh line without the record fails)."""
+    imported_rec = {"instance_id": "imp", "status": "resolved",
+                   "ts": 1.0,
+                   "meta": {"imported_from": "pilotA",
+                           "wall": {"session_s": 60.0},
+                           "usage": {"totalTokens": 100},
+                           "permissions": {"requests": 1,
+                                           "allowed": 1, "denied": 0},
+                           "vendor_notifications": 0,
+                           "orphan_check": True,
+                           "leak_verify": {"remotes": [],
+                                           "tags": [],
+                                           "clean": True}}}
+    recs = [imported_rec, _rec("fresh", "resolved")]
+    items = _cb(records=recs, imported={"imp": imported_rec})
+    assert _item(items, "10")["pass"] is True
+    assert "imported (the source run's record gates the " \
+        "pruning)" in _item(items, "10")["observed"]
+    # the check still applies to this run's OWN lines
+    bad = _rec("bad", "resolved")
+    bad["meta"].pop("pruning")
+    items2 = _cb(records=[bad])
+    assert _item(items2, "10")["pass"] is False
+
+
+def test_wp6b_round13_pilot_b_requires_import(tmp_path, live):
+    """The round-13 Medium fix (issue #22 AC2): a --pilot b run
+    that omits --import-run rendered item 16 'n/a (no import —
+    non-gating)' and could GO with zero AC2 overlap evidence —
+    the same under-evidenced-verdict hole the zero-overlap
+    guard closed for a mismatched source. Fail-closed: a config
+    error before any session. A --resume on a workdir whose
+    state carries the import bookkeeping passes (the documented
+    continuation window)."""
+    repos, inst = _pilot_b_repos(tmp_path)
+    i0, i1, i2 = [e["instance_id"] for e in repos]
+    wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
+    modes = {i0: "no_patch", i1: "no_patch", i2: "ok"}
+    # a no-import pilot-B run is a config error (exit 2)
+    cfg = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               resume=True, host_check=False, pilot="b")
+    try:
+        _run(cfg, _mock_make_session(modes))
+    except lp.PilotConfigError:
+        pass
+    else:
+        raise AssertionError("a no-import pilot-B run was accepted")
+    # the documented flow: window 1 with the import, then the
+    # continuation window (state re-derivation) passes
+    cfg1 = _cfg(tmp_path, inst, run_id="src", workdir=str(wd1),
+               host_check=False)
+    assert _run(cfg1, _mock_make_session(modes)) == lp.EXIT_OK
+    cfg2 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               resume=True, host_check=False, pilot="b",
+               import_run="src", import_workdir=str(wd1))
+    assert _run(cfg2, _mock_make_session(
+        {i0: "no_patch", i1: "no_patch", i2: "no_patch"})) \
+        == lp.EXIT_OK
+    # the continuation window (no --import-run — the state
+    # re-derivation satisfies the check)
+    cfg3 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               resume=True, host_check=False, pilot="b")
+    assert _run(cfg3, _mock_make_session(
+        {i0: "no_patch", i1: "no_patch", i2: "no_patch"})) \
+        == lp.EXIT_OK
+
+
+def test_wp6b_round14_pilot_b_requires_stratified_meta(tmp_path, live):
+    """The round-14 Medium fix (issue #22 AC1): a --pilot b run
+    over an instances file without _meta.stratified_repos (e.g.
+    --instances pilot_instances.json --import-run pilotA — a valid
+    source with a meta-less instance file) rendered item 15 n/a
+    and could GO with zero AC1 stratification evidence — the same
+    under-evidenced-verdict hole _check_pilot_b_requirements was
+    added to close for item 16 (AC2). Fail-closed: a config
+    error before any session (pilot B is defined as the
+    stratified 12-repo set; a non-stratified instance file is
+    not the documented pilot B — run it as a pilot A)."""
+    repos = _three_repos(tmp_path)
+    # a META-LESS instance file (the bare list form)
+    inst = tmp_path / "bare.json"
+    inst.write_text(json.dumps(
+        [dict(r) for r in repos]))
+    wd = tmp_path / "wd"
+    # the source checkpoint (the AC2 requirement — so the AC1
+    # check is what fires)
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "run-src.jsonl").write_text(
+        json.dumps({"instance_id": repos[0]["instance_id"],
+                    "status": "resolved", "ts": 1.0}) + "\n")
+    cfg = _cfg(tmp_path, str(inst), run_id="pilotB",
+               workdir=str(wd), resume=True, host_check=False,
+               pilot="b", import_run="src",
+               import_workdir=str(src))
+    modes = {r["instance_id"]: "ok" for r in repos}
+    try:
+        _run(cfg, _mock_make_session(modes))
+    except lp.PilotConfigError:
+        pass
+    else:
+        raise AssertionError("a non-stratified pilot-B run was "
+                           "accepted")
+    # and the documented pilot-B file (the _pilot_b_repos
+    # helper carries the meta) still passes
+    repos2, inst2 = _pilot_b_repos(tmp_path)
+    i0, i1, i2 = [e["instance_id"] for e in repos2]
+    wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
+    modes2 = {i0: "no_patch", i1: "no_patch", i2: "ok"}
+    cfg1 = _cfg(tmp_path, inst2, run_id="src2", workdir=str(wd1),
+               host_check=False)
+    assert _run(cfg1, _mock_make_session(modes2)) == lp.EXIT_OK
+    cfg2 = _cfg(tmp_path, inst2, run_id="pilotB2", workdir=str(wd2),
+               resume=True, host_check=False, pilot="b",
+               import_run="src2", import_workdir=str(wd1))
+    assert _run(cfg2, _mock_make_session(modes2)) == lp.EXIT_OK
+
+
+def test_wp6b_round14_multi_window_obs12_annotation(tmp_path, live):
+    """The round-14 Minor fix (issue #22 AC4): the multi-window
+    item-12 observation omits the imported-lines annotation the
+    single-window branch prints, so the record no longer stated
+    why its session count differs from the WP5 report's (which
+    counts the imported lines). Both branches now carry it."""
+    cfg = lp.PilotConfig(pilot="b", max_wall_s=2700.0,
+                        import_run="src")
+    items = lp.build_checklist(
+        config=cfg, dry_run=False, gate=None, preflight_ok=None,
+        preflight_failures=[], records=[], skipped_on_resume={},
+        interrupted_this_run=None, resume_after_interrupt=False,
+        devin_ok=None, sessions_used=3, wall_budget_s=100.0,
+        wall_used_s=1.0, pilot_b=True,
+        imported={"a__r-1": {"instance_id": "a__r-1"}},
+        import_attempted=True,
+        window_buckets={19000: {"sessions": 2,
+                              "wall_s": 10.0},
+                        19001: {"sessions": 1,
+                               "wall_s": 5.0}})
+    it12 = next(i for i in items if i["item"].startswith("12 "))
+    assert "the WP5 report's sessions-used also counts the 1 " \
+        "imported line(s)" in it12["observed"], it12["observed"]
+
+
+def _imported_rec_bad(iid: str, **meta) -> dict:
+    """A source-run shaped imported line (no this-run session
+    meta keys — the round-15 Major class) + the given meta."""
+    m = {"imported_from": "pilotA", "ts": 1.0}
+    m.update(meta)
+    return {"instance_id": iid, "status": "resolved",
+            "ts": 1.0, "meta": m}
+
+
+def test_wp6b_round15_imported_excluded_from_session_items(
+        tmp_path, live):
+    """The round-15 Major fix (issue #22 AC2): the imported
+    lines' source-run meta fed the gating checks for items 5
+    (untrusted cwd), 6 (permissions arithmetic / send failures),
+    7 (orphan_check), 14 (leak_guard / leak_verify.clean) — a
+    source whose lines carry a send failure / permissions
+    mismatch / a non-clean leak verify / a missing orphan check
+    fails those gating items on evidence from the source run's
+    sessions: a permanent NO-GO on this run's record for
+    sessions it never ran. Fix: imported lines are excluded from
+    items 5/6/7/10/14 (the source run's own record gates its own
+    sessions) with an explicit obs annotation. The checks still
+    apply to this run's own lines."""
+    bad = _imported_rec_bad(
+        "imp",
+        permissions={"requests": 3, "allowed": 1, "denied": 0},
+        permission_send_failures=2,
+        orphan_check=False,
+        leak_verify={"clean": False, "remotes": ["origin"],
+                     "tags": []},
+        suspected_untrusted_cwd=True)
+    recs = [bad, _rec("fresh", "resolved")]
+    items = _cb(records=recs, imported={"imp": bad})
+    for n in ("5", "6", "7", "10", "14"):
+        assert _item(items, n)["pass"] is True, \
+            (n, _item(items, n))
+    assert "imported (the source run's record gates the " \
+        "leak guard)" in _item(items, "14")["observed"]
+    # the checks still apply to this run's OWN lines
+    own = _rec("own", "resolved")
+    own["meta"]["leak_verify"] = {"clean": False, "remotes": [],
+                                  "tags": []}
+    items2 = _cb(records=[own])
+    assert _item(items2, "14")["pass"] is False
+
+
+def test_wp6b_round15_import_ref_traversal_rejected(
+        tmp_path, live):
+    """The round-15 Medium fix (issue #22): the reference
+    values (artifacts_dir / patch_diff / trajectory / eval_log)
+    join into the artifact copy's source/destination paths
+    (os.path.join(base, ref)) — a source line with a '..' path
+    element or an absolute reference would make the copy's
+    makedirs/replace write outside this run's workdir (the
+    traversal class the run-id / instance-id charsets exist to
+    prevent). Fail-closed: a config error before any session."""
+    repos, inst = _pilot_b_repos(tmp_path)
+    ids = [e["instance_id"] for e in repos]
+    wd1, wd2 = tmp_path / "wd1", tmp_path / "wd2"
+    wd1.mkdir()
+    src = wd1 / "run-src.jsonl"
+    cfg = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               host_check=False, pilot="b",
+               import_run="src", import_workdir=str(wd1))
+    insts = json.loads(Path(inst).read_text())["instances"]
+    for key, bad in (("artifacts_dir", "../../x"),
+                     ("artifacts_dir", "/abs/x"),
+                     ("patch_diff", "../evil.diff"),
+                     ("trajectory", "/etc/evil.jsonl")):
+        with open(src, "w") as f:
+            f.write(json.dumps({"instance_id": ids[0],
+                                "status": "resolved", "ts": 1.0,
+                                "meta": {key: bad}}) + "\n")
+        try:
+            lp.load_imported(cfg, str(wd2), insts)
+        except lp.PilotConfigError:
+            pass
+        else:
+            raise AssertionError(f"{key}={bad!r} was accepted")
+    # a conforming relative reference still passes
+    with open(src, "w") as f:
+        f.write(json.dumps({"instance_id": ids[0],
+                            "status": "resolved", "ts": 1.0,
+                            "meta": {"artifacts_dir": "runs/x",
+                                    "patch_diff": "patch.diff"}})
+               + "\n")
+    imported, _ = lp.load_imported(cfg, str(wd2), insts)
+    assert ids[0] in imported
+
+
+def test_wp6b_round16_section_arithmetic_matches_item16(tmp_path, live):
+    """The round-16 Medium fix (issue #22 AC2): the AC2 section's
+    session arithmetic counted an instance as 'new' when ANY raw
+    checkpoint line was non-import/non-preflight_failed, while
+    item 16 computes the same equation over the DEDUPED finals —
+    an instance with an eval_error attempt superseded by a
+    preflight_failed final counted as new here yet was excluded
+    in item 16, so the record could render 'holds' and 'BROKEN'
+    for the same run. The section's arithmetic is now on the
+    deduped-finals basis (matching item 16); new_sessions stays
+    on the raw (attempt) basis (it is a session count)."""
+    repos, inst = _pilot_b_repos(tmp_path)
+    i0, i1, i2 = [e["instance_id"] for e in repos]
+    # raw lines: an eval_error attempt for i2 superseded by a
+    # preflight_failed final
+    raw = [
+        {"instance_id": i0, "status": "resolved", "ts": 1.0,
+         "meta": {"imported_from": "pilotA"}},
+        {"instance_id": i2, "status": "eval_error", "ts": 2.0,
+         "meta": {}},
+        {"instance_id": i2, "status": "preflight_failed",
+         "ts": 3.0, "meta": {}},
+    ]
+    # the deduped finals (last line per instance)
+    finals = {r["instance_id"]: r for r in raw}
+    cfg = _cfg(tmp_path, inst, run_id="pilotB", host_check=False,
+               pilot="b")
+    sec = lp._pilot_b_sections(
+        cfg, json.loads(Path(inst).read_text())["instances"],
+        raw, list(finals.values()),
+        {i0: raw[0]},
+        {19000: {"sessions": 1, "wall_s": 10.0}})
+    ar = sec["import"]
+    # i2's final is preflight_failed (a RETRY class — i2 is not
+    # yet complete): the equation is legitimately broken (1 + 0
+    # != 2 — i2 has no final line) — but it must be the SAME
+    # result item 16 renders (the record no longer shows 'holds'
+    # here and 'BROKEN' there)
+    assert ar["new_instances"] == 0, ar
+    items = _cb(records=[dict(r) for r in list(finals.values())],
+               imported={i0: raw[0]})
+    it16 = _item(items, "16")
+    assert ("BROKEN" in it16["observed"]) == (not ar["arithmetic_holds"]), \
+        (it16["observed"], ar["arithmetic_holds"])
+    # new_sessions stays on the raw (attempt) basis: the i2
+    # eval_error attempt IS a session (the preflight line is not)
+    assert ar["new_sessions"] == 1, ar
+    # a COMPLETE record (i2's final is terminal): both sides hold
+    raw_done = raw + [{"instance_id": i2, "status": "resolved",
+                      "ts": 4.0, "meta": {}}]
+    finals_done = {r["instance_id"]: r for r in raw_done}
+    sec2 = lp._pilot_b_sections(
+        cfg, json.loads(Path(inst).read_text())["instances"],
+        raw_done, list(finals_done.values()),
+        {i0: raw[0]},
+        {19000: {"sessions": 2, "wall_s": 20.0}})
+    assert sec2["import"]["arithmetic_holds"] is True, sec2["import"]
+    items2 = _cb(records=[dict(r) for r in list(finals_done.values())],
+                imported={i0: raw[0]})
+    assert _item(items2, "16")["pass"] is True
+
+
+def test_wp6b_round16_dry_run_checkpoint_derivation(tmp_path, live):
+    """The round-16 Minor fix (issue #22 AC2): the dry-run
+    requirement check did not apply the checkpoint re-derivation
+    the live path performs — a --pilot b --dry-run --resume on a
+    workdir whose checkpoint carries seeded import lines but
+    whose state file is absent was rejected while the equivalent
+    live --resume proceeded. Now the dry run re-derives the
+    import from the checkpoint's seeded lines."""
+    repos, inst = _pilot_b_repos(tmp_path)
+    i0, i1, i2 = [e["instance_id"] for e in repos]
+    wd = tmp_path / "wd"
+    wd.mkdir()
+    # a checkpoint with a seeded import line (the marker) and NO
+    # state file (the graceful-early-exit class)
+    with open(wd / "run-pilotB.jsonl", "w") as f:
+        f.write(json.dumps({"instance_id": i0,
+                            "status": "no_patch", "ts": 1.0,
+                            "meta": {"imported_from": "src"}})
+               + "\n")
+    rc = lp.main(["--dry-run", "--pilot", "b", "--resume",
+                  "--devin-bin", MOCK_PATH,
+                  "--instances", inst, "--workdir", str(wd),
+                  "--run-id", "pilotB"])
+    assert rc == lp.EXIT_OK, rc
+    # a fresh workdir (no checkpoint, no state) is still rejected
+    rc2 = lp.main(["--dry-run", "--pilot", "b",
+                   "--devin-bin", MOCK_PATH,
+                   "--instances", inst,
+                   "--workdir", str(tmp_path / "wd2"),
+                   "--run-id", "pilotB"])
+    assert rc2 == lp.EXIT_CONFIG, rc2
+
+
+def test_wp6b_round16_self_import_symlink_rejected(tmp_path, live):
+    """The round-16 Minor fix (issue #22): the self-import
+    guard compared os.path.abspath paths, which do not resolve
+    symlinks — an --import-workdir that is a symlinked alias of
+    this run's workdir bypassed the rejection. Now
+    os.path.realpath (which resolves symlinks) is compared."""
+    repos, inst = _pilot_b_repos(tmp_path)
+    wd = tmp_path / "wd"
+    wd.mkdir()
+    alias = tmp_path / "alias"
+    os.symlink(str(wd), str(alias))
+    cfg = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
+               host_check=False, pilot="b",
+               import_run="pilotB", import_workdir=str(alias))
+    insts = json.loads(Path(inst).read_text())["instances"]
+    try:
+        lp.load_imported(cfg, str(wd), insts)
+    except lp.PilotConfigError:
+        pass
+    else:
+        raise AssertionError("a symlinked self-import was "
+                           "accepted")
+
+
+def test_wp6b_round17_import_workdir_persisted_absolute(
+        tmp_path, live):
+    """The round-17 Medium fix (issue #22 AC2): state
+    'import_workdir' persisted config.import_workdir VERBATIM —
+    a relative --import-workdir re-resolved on continuation
+    windows against that invocation's cwd (a different cwd
+    silently broke the artifact self-heal copy — missing
+    sources → the WP5 cross-check fails → a report_failed
+    wedge every subsequent resume re-hits). Now it is
+    persisted ABSOLUTE (resolved at import time; the flag-
+    absent default is this run's workdir, absolute)."""
+    repos, inst = _pilot_b_repos(tmp_path)
+    i0, i1, i2 = [e["instance_id"] for e in repos]
+    src = tmp_path / "src"
+    src.mkdir()
+    wd2 = tmp_path / "wd2"
+    old_cwd = os.getcwd()
+    try:
+        os.chdir(str(tmp_path))
+        # the source run (its checkpoint in src/)
+        cfg1 = _cfg(tmp_path, inst, run_id="src", workdir=str(src),
+                   host_check=False)
+        assert _run(cfg1, _mock_make_session(
+            {i0: "no_patch", i1: "no_patch", i2: "ok"})) == lp.EXIT_OK
+        # the import window: a RELATIVE --import-workdir (./src)
+        cfg2 = _cfg(tmp_path, inst, run_id="pilotB",
+                   workdir=str(wd2), resume=True, host_check=False,
+                   pilot="b", import_run="src",
+                   import_workdir=os.path.join(".", "src"))
+        assert _run(cfg2, _mock_make_session(
+            {i0: "no_patch", i1: "no_patch", i2: "no_patch"})) \
+            == lp.EXIT_OK
+        state = json.loads(
+            (wd2 / "pilot-pilotB.state.json").read_text())
+        assert os.path.isabs(state["import_workdir"]), state
+        assert state["import_workdir"] == os.path.abspath(
+            str(src)), state
+    finally:
+        os.chdir(old_cwd)
+
+
+def test_wp6b_round17_item4_7_own_session_counts(tmp_path, live):
+    """The round-17 Minor fix (issue #22 AC2): with imported
+    lines skipped in the session checks, the item-4 / item-7
+    observations still reported len(records) (deduped finals
+    including imports) — the gating record claimed 'initialize
+    ok on 25 instance(s)' / 'orphan check: PASS on all 25' for
+    sessions this run never exercised. The obs now count this
+    run's own sessions + an explicit imported annotation."""
+    imported_rec = {"instance_id": "imp", "status": "resolved",
+                   "ts": 1.0,
+                   "meta": {"imported_from": "pilotA"}}
+    recs = [imported_rec, _rec("r1", "resolved"),
+            _rec("r2", "resolved")]
+    items = _cb(records=recs, imported={"imp": imported_rec})
+    assert "initialize ok on 2 instance(s) (+ 1 imported — " \
+        "not initialized this run)" in _item(items, "4")["observed"], \
+        _item(items, "4")["observed"]
+    it7 = _item(items, "7")["observed"]
+    assert "PASS on all 2 instance(s)" in it7, it7
+    assert "(+ 1 imported — not closed this run)" in it7, it7
+    # a non-import run renders the plain count (no annotation)
+    items2 = _cb(records=[_rec("r1", "resolved")])
+    assert "initialize ok on 1 instance(s)" in \
+        _item(items2, "4")["observed"]
+    assert "(+ " not in _item(items2, "4")["observed"]
+
+
+def test_wp6b_round18_zero_overlap_rerivation_fail_closed(
+        tmp_path, live):
+    """The round-18 Medium fix (issue #22 AC2): the
+    re-derivation accepted the state's import bookkeeping without
+    checking that the re-derived import actually overlaps the
+    current instance file — a --resume pointed at a different
+    (still stratified) --instances file proceeded with zero
+    overlap (the re-derived set filters to the known ids and can
+    end up {}), and item 16 rendered the vacuous non-gating n/a:
+    the completing record could GO with no AC2 evidence (the same
+    under-evidenced-verdict class the flag-path zero-overlap
+    guard made a config error). Fail-closed: a config error."""
+    repos, inst = _pilot_b_repos(tmp_path)
+    i0, i1, i2 = [e["instance_id"] for e in repos]
+    src, wd2 = tmp_path / "src", tmp_path / "wd2"
+    src.mkdir()
+    modes = {i0: "no_patch", i1: "no_patch", i2: "ok"}
+    cfg1 = _cfg(tmp_path, inst, run_id="src", workdir=str(src),
+               host_check=False)
+    assert _run(cfg1, _mock_make_session(modes)) == lp.EXIT_OK
+    # window 1: the import (state persists the bookkeeping)
+    cfg2 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd2),
+               resume=True, host_check=False, pilot="b",
+               import_run="src", import_workdir=str(src))
+    assert _run(cfg2, _mock_make_session(modes)) == lp.EXIT_OK
+    # a DIFFERENT (still stratified) instance file: the two
+    # fixture helpers share the test__repoN-1 id namespace, so
+    # rewrite the ids to be genuinely disjoint
+    repos3 = _three_repos(tmp_path)
+    _instances_file(tmp_path / "inst3.json", repos3)
+    doc3 = json.loads((tmp_path / "inst3.json").read_text())
+    new_ids = []
+    for e in doc3["instances"]:
+        e["instance_id"] = "other__" + e["instance_id"]
+        e["repo"] = "other/" + e["repo"].split("/")[-1]
+        new_ids.append(e["instance_id"])
+    doc3["_meta"]["stratified_repos"] = sorted(
+        {e["repo"] for e in doc3["instances"]})
+    (tmp_path / "inst3.json").write_text(json.dumps(doc3))
+    inst3 = str(tmp_path / "inst3.json")
+    cfg3 = _cfg(tmp_path, inst3, run_id="pilotB",
+               workdir=str(wd2), resume=True, host_check=False,
+               pilot="b")
+    try:
+        _run(cfg3, _mock_make_session({
+            i: "ok" for i in new_ids}))
+    except lp.PilotConfigError:
+        pass
+    else:
+        raise AssertionError("a zero-overlap re-derivation was "
+                           "accepted")
+
+
+def test_wp6b_round18_dry_run_import_requires_resume(
+        tmp_path, live):
+    """The round-18 Minor fix (issue #22): the dry-run check did
+    not reproduce the --resume requirement the live path
+    enforces — --pilot b --import-run X without --resume exits 0
+    dry while the live invocation seeds the checkpoint and then
+    fails EXIT_CONFIG. The dry run now rejects it up front (the
+    contract: a dry run that passes is an invocation that would
+    actually work)."""
+    repos, inst = _pilot_b_repos(tmp_path)
+    i0, i1, i2 = [e["instance_id"] for e in repos]
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "run-src.jsonl").write_text(
+        json.dumps({"instance_id": i0, "status": "no_patch",
+                    "ts": 1.0}) + "\n")
+    # --import-run without --resume: a config error (exit 2)
+    rc = lp.main(["--dry-run", "--pilot", "b",
+                  "--devin-bin", MOCK_PATH,
+                  "--instances", inst,
+                  "--workdir", str(tmp_path / "wd"),
+                  "--run-id", "pilotB",
+                  "--import-run", "src",
+                  "--import-workdir", str(src)])
+    assert rc == lp.EXIT_CONFIG, rc
+    # the documented form (--import-run + --resume) passes
+    rc2 = lp.main(["--dry-run", "--pilot", "b", "--resume",
+                   "--devin-bin", MOCK_PATH,
+                   "--instances", inst,
+                   "--workdir", str(tmp_path / "wd2"),
+                   "--run-id", "pilotB",
+                   "--import-run", "src",
+                   "--import-workdir", str(src)])
+    assert rc2 == lp.EXIT_OK, rc2
+
+
+def test_wp6b_round19_dry_run_reflects_live_predicate(
+        tmp_path, live):
+    """The round-19 Minor fix (issue #22, 4450720403): the dry-run
+    check reproduced the live existing-checkpoint guard's effect,
+    not its predicate — it rejected --import-run without --resume
+    unconditionally, while the live path rejects only when a
+    checkpoint exists after seeding, which never fires when the
+    import seeds nothing (an all-retry-class source) and the
+    workdir has no checkpoint yet (the repair early-returns on a
+    missing file; an empty seeding creates no file) — the
+    identical live invocation proceeds. The dry run now rejects
+    exactly when the live guard would fire (existing checkpoint,
+    or a non-empty import that would create one) — the contract
+    holds in both directions."""
+    repos, inst = _pilot_b_repos(tmp_path)
+    i0, i1 = [e["instance_id"] for e in repos[:2]]
+    src = tmp_path / "src"
+    src.mkdir()
+    # an ALL-RETRY-CLASS source: seeds nothing
+    (src / "run-src.jsonl").write_text(
+        json.dumps({"instance_id": i0, "status": "eval_error",
+                    "ts": 1.0}) + "\n"
+        + json.dumps({"instance_id": i1,
+                     "status": "quota_limited", "ts": 2.0}) + "\n")
+    # dry run, fresh workdir, no --resume: the live invocation
+    # would proceed (no checkpoint is created) — the dry run
+    # must agree (EXIT_OK)
+    rc = lp.main(["--dry-run", "--pilot", "b",
+                  "--devin-bin", MOCK_PATH,
+                  "--instances", inst,
+                  "--workdir", str(tmp_path / "wd-empty"),
+                  "--run-id", "pilotB",
+                  "--import-run", "src",
+                  "--import-workdir", str(src)])
+    assert rc == lp.EXIT_OK, rc
+    # a NON-EMPTY import (never-rerun source line) with a fresh
+    # workdir: the live invocation would seed and then be
+    # rejected by the existing-checkpoint guard — the dry run
+    # rejects up front (EXIT_CONFIG)
+    src2 = tmp_path / "src2"
+    src2.mkdir()
+    (src2 / "run-src2.jsonl").write_text(
+        json.dumps({"instance_id": i0, "status": "no_patch",
+                    "ts": 1.0}) + "\n")
+    rc2 = lp.main(["--dry-run", "--pilot", "b",
+                   "--devin-bin", MOCK_PATH,
+                   "--instances", inst,
+                   "--workdir", str(tmp_path / "wd-seed"),
+                   "--run-id", "pilotB",
+                   "--import-run", "src2",
+                   "--import-workdir", str(src2)])
+    assert rc2 == lp.EXIT_CONFIG, rc2
+    # an EXISTING checkpoint (any content) with a fresh import:
+    # the live guard fires — the dry run rejects (EXIT_CONFIG)
+    wd3 = tmp_path / "wd-pre"
+    wd3.mkdir()
+    (wd3 / "run-pilotB.jsonl").write_text("")
+    rc3 = lp.main(["--dry-run", "--pilot", "b",
+                   "--devin-bin", MOCK_PATH,
+                   "--instances", inst,
+                   "--workdir", str(wd3),
+                   "--run-id", "pilotB",
+                   "--import-run", "src",
+                   "--import-workdir", str(src)])
+    assert rc3 == lp.EXIT_CONFIG, rc3
+
+
+def test_wp6b_round20_rederivation_traversal_fail_closed(
+        tmp_path, live):
+    """The round-20 Medium fix (issue #22, 4450828209): the
+    checkpoint re-derivation rebuilt ``imported`` without the
+    load_imported validation (the round-15 ref traversal guard,
+    the ts contract) — a checkpoint line carrying
+    meta.imported_from plus a ``..`` / absolute artifacts_dir
+    would reach _copy_imported_artifacts (the value joins into
+    the copy's destination paths — a write outside the workdir),
+    while the identical value is a fail-closed config error on
+    the --import-run path. The re-derivation now applies the
+    SHARED validation: such a line is a PilotConfigError (exit 2)
+    before any session."""
+    repos, inst = _pilot_b_repos(tmp_path)
+    i0, i1, i2 = [e["instance_id"] for e in repos]
+    wd = tmp_path / "wd"
+    wd.mkdir()
+    src = tmp_path / "src"
+    src.mkdir()
+    cfg1 = _cfg(tmp_path, inst, run_id="src", workdir=str(src),
+               host_check=False)
+    modes = {i0: "no_patch", i1: "no_patch", i2: "ok"}
+    assert _run(cfg1, _mock_make_session(modes)) == lp.EXIT_OK
+    # a window-1 import (state persists the bookkeeping)
+    cfg2 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
+               resume=True, host_check=False, pilot="b",
+               import_run="src", import_workdir=str(src))
+    assert _run(cfg2, _mock_make_session(modes)) == lp.EXIT_OK
+    # CORRUPT the seeded checkpoint line: a traversal
+    # artifacts_dir (the state still carries the clean
+    # bookkeeping, but the checkpoint fallback line is corrupt —
+    # exercise the checkpoint branch; also corrupt the state's
+    # import_source copy to exercise both branches)
+    p = wd / "run-pilotB.jsonl"
+    lines = p.read_text().splitlines()
+    out = []
+    for l in lines:
+        r = json.loads(l)
+        if r.get("instance_id") == i0:
+            r["meta"]["artifacts_dir"] = "../../evil"
+            r["meta"]["imported_from"] = "src"
+        out.append(json.dumps(r))
+    p.write_text("\n".join(out) + "\n")
+    st = json.loads((wd / "pilot-pilotB.state.json").read_text())
+    st["import_source"][i0]["meta"]["artifacts_dir"] = "../../evil"
+    (wd / "pilot-pilotB.state.json").write_text(json.dumps(st))
+    # the resume: the re-derivation (both branches now feed the
+    # shared validation) must be a config error (exit 2)
+    cfg3 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
+               resume=True, host_check=False, pilot="b")
+    try:
+        _run(cfg3, _mock_make_session({r["instance_id"]: "ok"
+                                      for r in repos}))
+    except lp.PilotConfigError:
+        pass
+    else:
+        raise AssertionError("a traversal reference in the "
+                           "re-derivation was accepted")
+
+
+def test_wp6b_round20_pin_fetch_error_body(tmp_path):
+    """The round-20 Minor fix (issue #22): a 200 error-shaped
+    API body ({"error": ...} — no "rows") would raise an
+    uncaught KeyError (fetch_all_rows accessed data["rows"]
+    without a guard; _get retries fetch exceptions but not a
+    parsed error body). Fail closed with a SystemExit before
+    the access."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "pin_pilot_b", str(Path(__file__).parent.parent
+                          / "scripts" /
+                          "pin_pilot_b_instances.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    mod._get = lambda url: {"error": "rate limited",
+                           "message": "slow down"}
+    try:
+        mod.fetch_all_rows()
+    except SystemExit as e:
+        assert "error-shaped" in str(e)
+    else:
+        raise AssertionError("a 200 error-shaped body was "
+                           "accepted")
+
+
+def test_wp6b_round21_rederivation_corrupt_meta_status(
+        tmp_path, live):
+    """The round-21 Medium fix (issue #22, 4450889550): the
+    shared _validate_imported_line did not reproduce the full
+    load_imported contract — a non-dict meta was normalized
+    (accepted) rather than rejected as corrupt, and status was
+    never checked. A corrupt state["import_source"] / checkpoint
+    line with a non-dict meta would crash the seeding (uncaught,
+    exit 4 — not the fail-closed exit 2); a non-terminal status
+    would seed verbatim and poison the checkpoint (every later
+    load_checkpoint raises RunnerProtocolError — a permanent
+    resume wedge). The helper now rejects both (exit 2, before
+    any session, on both import paths)."""
+    repos, inst = _pilot_b_repos(tmp_path)
+    i0, i1, i2 = [e["instance_id"] for e in repos]
+    wd = tmp_path / "wd"
+    wd.mkdir()
+    src = tmp_path / "src"
+    src.mkdir()
+    cfg1 = _cfg(tmp_path, inst, run_id="src", workdir=str(src),
+               host_check=False)
+    modes = {i0: "no_patch", i1: "no_patch", i2: "ok"}
+    assert _run(cfg1, _mock_make_session(modes)) == lp.EXIT_OK
+    cfg2 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
+               resume=True, host_check=False, pilot="b",
+               import_run="src", import_workdir=str(src))
+    assert _run(cfg2, _mock_make_session(modes)) == lp.EXIT_OK
+    st = json.loads((wd / "pilot-pilotB.state.json").read_text())
+    # (a) a non-dict meta in the state's import_source line
+    st["import_source"][i0]["meta"] = "corrupt"
+    (wd / "pilot-pilotB.state.json").write_text(json.dumps(st))
+    cfg3 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
+               resume=True, host_check=False, pilot="b")
+    try:
+        _run(cfg3, _mock_make_session({r["instance_id"]: "ok"
+                                      for r in repos}))
+    except lp.PilotConfigError:
+        pass
+    else:
+        raise AssertionError("a non-dict meta in the "
+                           "re-derivation was accepted")
+    # (b) a non-terminal status in the state's import_source
+    # line (the state branch feeds the shared validation
+    # directly — without it, the seeding would write the
+    # non-terminal status verbatim, and the next load_checkpoint
+    # would fail-loud on the durable line: a permanent resume
+    # wedge)
+    st = json.loads((wd / "pilot-pilotB.state.json").read_text())
+    st["import_source"][i0]["meta"] = {}  # reset (a)
+    st["import_source"][i0]["status"] = "running"  # non-terminal
+    (wd / "pilot-pilotB.state.json").write_text(json.dumps(st))
+    cfg4 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
+               resume=True, host_check=False, pilot="b")
+    try:
+        _run(cfg4, _mock_make_session({r["instance_id"]: "ok"
+                                      for r in repos}))
+    except lp.PilotConfigError:
+        pass
+    else:
+        raise AssertionError("a non-terminal status in the "
+                           "re-derivation was accepted")
+    # (c) the --import-run path still rejects a non-dict meta
+    # (the round-7 behavior — the shared helper did not
+    # regress it)
+    src2 = tmp_path / "srcbad"
+    src2.mkdir()
+    (src2 / "run-srcbad.jsonl").write_text(
+        json.dumps({"instance_id": i0, "status": "no_patch",
+                    "meta": "corrupt", "ts": 1.0}) + "\n")
+    rc = lp.main(["--dry-run", "--pilot", "b", "--resume",
+                  "--devin-bin", MOCK_PATH,
+                  "--instances", inst,
+                  "--workdir", str(tmp_path / "wdbad"),
+                  "--run-id", "pilotB",
+                  "--import-run", "srcbad",
+                  "--import-workdir", str(src2)])
+    assert rc == lp.EXIT_CONFIG, rc
+
+
+def test_wp6b_round22_all_retry_class_import_persists_bookkeeping(
+        tmp_path, live):
+    """The round-22 Medium fix (issue #22, 4450983654): the early
+    import record was only written when ``imported`` was
+    non-empty — an all-retry-class --import-run (no never-rerun
+    shared ids) seeded nothing and persisted no bookkeeping
+    before the sessions: a crash — or a graceful pre-flight /
+    model-gate early exit (no state write) — left the documented
+    bare --resume failing the pilot-B import requirement (exit 2)
+    with neither state nor seeded imported_from lines to
+    re-derive from. The early record now writes on EVERY
+    --import-run (empty imported set + the retry class + the
+    absolute workdir), so the resume re-derives from the state
+    and the pilot-B requirement holds."""
+    repos, inst = _pilot_b_repos(tmp_path)
+    i0, i1, i2 = [e["instance_id"] for e in repos]
+    wd = tmp_path / "wd"
+    wd.mkdir()
+    src = tmp_path / "src"
+    src.mkdir()
+    # an ALL-RETRY-CLASS source: nothing to import, 2 re-runs
+    (src / "run-src.jsonl").write_text(
+        json.dumps({"instance_id": i0, "status": "eval_error",
+                    "ts": 1.0}) + "\n"
+        + json.dumps({"instance_id": i1,
+                     "status": "quota_limited", "ts": 2.0}) + "\n")
+    # the import window: all-retry-class — no seeding
+    cfg2 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
+               resume=True, host_check=False, pilot="b",
+               import_run="src", import_workdir=str(src))
+    assert _run(cfg2, _mock_make_session(
+        {r["instance_id"]: "ok" for r in repos})) == lp.EXIT_OK
+    st = json.loads((wd / "pilot-pilotB.state.json").read_text())
+    # the bookkeeping persisted despite the empty imported set
+    assert st.get("imported_run") == "src"
+    assert st.get("imported") == []
+    assert st.get("import_retry_class")
+    assert st.get("import_workdir")
+    # the bare --resume: the pilot-B import requirement holds via
+    # the state bookkeeping (exit 0 — not the round-22 exit-2
+    # wedge); the checkpoint has no imported_from lines (nothing
+    # was seeded) — the state branch re-derives
+    cfg3 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
+               resume=True, host_check=False, pilot="b")
+    assert _run(cfg3, _mock_make_session(
+        {r["instance_id"]: "ok" for r in repos})) == lp.EXIT_OK
+
+
+def test_wp6b_round22_absent_ts_rejected(
+        tmp_path, live):
+    """The round-22 Minor fix (issue #22, 4450983658): a source
+    line with no ts key skipped the ts check (only a PRESENT ts
+    was checked) and was seeded with time.time() — silently
+    re-stamped into this run's window (and the WP5 date range)
+    instead of preserving the source ts the import contract
+    promises. An absent ts is now a fail-closed config error
+    (the source line's ts is its timestamp; a line without one
+    is corrupt for the import)."""
+    repos, inst = _pilot_b_repos(tmp_path)
+    i0 = repos[0]["instance_id"]
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "run-src.jsonl").write_text(
+        json.dumps({"instance_id": i0, "status": "no_patch"}) + "\n")
+    rc = lp.main(["--dry-run", "--pilot", "b", "--resume",
+                  "--devin-bin", MOCK_PATH,
+                  "--instances", inst,
+                  "--workdir", str(tmp_path / "wd"),
+                  "--run-id", "pilotB",
+                  "--import-run", "src",
+                  "--import-workdir", str(src)])
+    assert rc == lp.EXIT_CONFIG, rc
+
+
+def test_wp6b_round23_dry_run_full_rederivation(tmp_path, live):
+    """The round-23 Major fix (issue #22, 4451051304): the dry-run
+    re-derivation skipped the live --resume path's fail-closed
+    checks — truthy state bookkeeping skipped the derivation
+    entirely (the zero-overlap guard never fired in a dry run: a
+    --dry-run --resume pointed at a different stratified
+    --instances file exited 0 where the identical live invocation
+    exits 2), and the checkpoint-derived lines bypassed
+    _validate_imported_line (a seeded line with a ../absolute
+    artifacts_dir or absent/bad ts passed dry while failing
+    live). The dry run now runs the SAME shared re-derivation
+    (state branch + checkpoint fallback + validation +
+    zero-overlap guard) — the contract: a dry run that passes is
+    an invocation that would actually work."""
+    repos, inst = _pilot_b_repos(tmp_path)
+    i0, i1, i2 = [e["instance_id"] for e in repos]
+    wd = tmp_path / "wd"
+    wd.mkdir()
+    src = tmp_path / "src"
+    src.mkdir()
+    modes = {i0: "no_patch", i1: "no_patch", i2: "ok"}
+    cfg1 = _cfg(tmp_path, inst, run_id="src", workdir=str(src),
+               host_check=False)
+    assert _run(cfg1, _mock_make_session(modes)) == lp.EXIT_OK
+    cfg2 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
+               resume=True, host_check=False, pilot="b",
+               import_run="src", import_workdir=str(src))
+    assert _run(cfg2, _mock_make_session(modes)) == lp.EXIT_OK
+    # (a) a dry-run --resume against a DIFFERENT (stratified)
+    # instance file: the state bookkeeping is truthy but the
+    # re-derived set has zero overlap — the live invocation is a
+    # config error; the dry run must agree
+    repos3 = _three_repos(tmp_path)
+    _instances_file(tmp_path / "inst3.json", repos3)
+    doc3 = json.loads((tmp_path / "inst3.json").read_text())
+    for e in doc3["instances"]:
+        e["instance_id"] = "other__" + e["instance_id"]
+    doc3["_meta"]["stratified_repos"] = sorted(
+        {e["repo"] for e in doc3["instances"]})
+    (tmp_path / "inst3.json").write_text(json.dumps(doc3))
+    rc = lp.main(["--dry-run", "--pilot", "b", "--resume",
+                  "--devin-bin", MOCK_PATH,
+                  "--instances", str(tmp_path / "inst3.json"),
+                  "--workdir", str(wd), "--run-id", "pilotB"])
+    assert rc == lp.EXIT_CONFIG, rc
+    # (b) a checkpoint-derived line with a traversal reference:
+    # corrupt the seeded checkpoint line (and clear the state's
+    # import set so the checkpoint fallback runs)
+    st = json.loads((wd / "pilot-pilotB.state.json").read_text())
+    st.pop("import_source")
+    st.pop("imported")
+    (wd / "pilot-pilotB.state.json").write_text(json.dumps(st))
+    p = wd / "run-pilotB.jsonl"
+    lines = []
+    for l in p.read_text().splitlines():
+        r = json.loads(l)
+        if r.get("instance_id") == i0:
+            r["meta"]["artifacts_dir"] = "/abs/evil"
+        lines.append(json.dumps(r))
+    p.write_text("\n".join(lines) + "\n")
+    rc2 = lp.main(["--dry-run", "--pilot", "b", "--resume",
+                   "--devin-bin", MOCK_PATH,
+                   "--instances", inst,
+                   "--workdir", str(wd), "--run-id", "pilotB"])
+    assert rc2 == lp.EXIT_CONFIG, rc2
+
+
+def test_wp6b_round24_checkpoint_provenance_not_laundered(
+        tmp_path, live):
+    """The round-24 Major fix (issue #22, 4451121577): the
+    end-of-run state write persisted the checkpoint-derived
+    imported set as import_source, making item 16's
+    self-comparison durable on every later resume (the same
+    self-referential comparison the self-import guard rejects).
+    A checkpoint-provenance run must not launder: the state
+    stays bookkeeping-less (the later resumes stay on the
+    checkpoint fallback — the honest rendering), while a
+    state-provenance (or flag) run persists as before."""
+    repos, inst = _pilot_b_repos(tmp_path)
+    i0, i1, i2 = [e["instance_id"] for e in repos]
+    wd = tmp_path / "wd"
+    wd.mkdir()
+    src = tmp_path / "src"
+    src.mkdir()
+    modes = {i0: "no_patch", i1: "no_patch", i2: "ok"}
+    cfg1 = _cfg(tmp_path, inst, run_id="src", workdir=str(src),
+               host_check=False)
+    assert _run(cfg1, _mock_make_session(modes)) == lp.EXIT_OK
+    cfg2 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
+               resume=True, host_check=False, pilot="b",
+               import_run="src", import_workdir=str(src))
+    assert _run(cfg2, _mock_make_session(modes)) == lp.EXIT_OK
+    # the state is removed (a pre-seed process death) — the next
+    # resume is the pure checkpoint fallback
+    (wd / "pilot-pilotB.state.json").unlink()
+    cfg3 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
+               resume=True, host_check=False, pilot="b")
+    assert _run(cfg3, _mock_make_session(
+        {r["instance_id"]: "ok" for r in repos})) == lp.EXIT_OK
+    st = json.loads((wd / "pilot-pilotB.state.json").read_text())
+    # NO laundering: the checkpoint-derived set did not become
+    # the durable import_source / imported set
+    assert not st.get("import_source"), st
+    assert not st.get("imported"), st
+    # the next resume: still the checkpoint fallback (the
+    # bookkeeping-less state) — the record renders the honest
+    # self-derived n/a, not a vacuous PASS from a self-comparison
+    cfg4 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
+               resume=True, host_check=False, pilot="b")
+    assert _run(cfg4, _mock_make_session(
+        {r["instance_id"]: "ok" for r in repos})) == lp.EXIT_OK
+    gng = (wd / "wp6b-pilot-b.md").read_text()
+    i16 = [l for l in gng.splitlines()
+          if l.startswith("| 16 |")][0]
+    assert "faithfulness n/a (self-derived" in i16, i16
+    assert "FAIL" not in i16, i16
+    # the round-29 Minor fix (issue #22, 4451583337): the
+    # per-row PASS/FAIL cells of the overlap table are a
+    # self-comparison under the checkpoint fallback — the
+    # cells now render the explicit n/a (the round-24 fix
+    # neutralized only the summary label)
+    overlap_rows = [l for l in gng.splitlines()
+                   if l.startswith("| test__repo")
+                   and "→" in l and "|" in l]
+    assert overlap_rows, gng
+    assert all("n/a (self-derived)" in l
+               for l in overlap_rows), overlap_rows
+
+
+def test_wp6b_round25_out_of_range_ts_rejected(
+        tmp_path, live):
+    """The round-25 Minor fix (issue #22, 4451208198): the ts
+    guard enforced math.isfinite (the _parse_ts contract) but
+    the WP5 date_range consumer calls datetime.fromtimestamp,
+    which raises OSError / ValueError on finite-but-out-of-
+    range values (e.g. ts: 1e18) — such a source line would
+    seed durably and crash rep.generate with an error outside
+    the ReportError handler on every later --resume (the
+    permanent-wedge class the guard exists to close). The
+    guard now range-checks with the consumer's own function
+    (whatever fromtimestamp accepts is the contract)."""
+    repos, inst = _pilot_b_repos(tmp_path)
+    i0 = repos[0]["instance_id"]
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "run-src.jsonl").write_text(
+        json.dumps({"instance_id": i0, "status": "no_patch",
+                    "ts": 1e18}) + "\n")
+    rc = lp.main(["--dry-run", "--pilot", "b", "--resume",
+                  "--devin-bin", MOCK_PATH,
+                  "--instances", inst,
+                  "--workdir", str(tmp_path / "wd"),
+                  "--run-id", "pilotB",
+                  "--import-run", "src",
+                  "--import-workdir", str(src)])
+    assert rc == lp.EXIT_CONFIG, rc
+
+
+def test_wp6b_round25_mid_file_corruption_surfaces(
+        tmp_path, live):
+    """The round-25 Minor fix (issue #22, 4451208201): the
+    checkpoint-fallback comment mischaracterized the contract —
+    load_checkpoint SILENTLY DROPS a torn tail (it never raises
+    for one); only a MID-FILE corruption raises
+    RunnerProtocolError. The old code swallowed the raise to an
+    empty derivation, so a corrupt checkpoint with no state
+    bookkeeping surfaced the misleading '--pilot b requires
+    --import-run' config error instead of the corruption. The
+    fallback now fails closed with the corruption itself
+    (exit 2, before any session)."""
+    repos, inst = _pilot_b_repos(tmp_path)
+    i0, i1, i2 = [e["instance_id"] for e in repos]
+    wd = tmp_path / "wd"
+    wd.mkdir()
+    src = tmp_path / "src"
+    src.mkdir()
+    modes = {i0: "no_patch", i1: "no_patch", i2: "ok"}
+    cfg1 = _cfg(tmp_path, inst, run_id="src", workdir=str(src),
+               host_check=False)
+    assert _run(cfg1, _mock_make_session(modes)) == lp.EXIT_OK
+    cfg2 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
+               resume=True, host_check=False, pilot="b",
+               import_run="src", import_workdir=str(src))
+    assert _run(cfg2, _mock_make_session(modes)) == lp.EXIT_OK
+    # remove the state (no bookkeeping) + corrupt the
+    # checkpoint MID-FILE (a non-JSON line — the second of
+    # three, so the torn-tail drop cannot apply)
+    (wd / "pilot-pilotB.state.json").unlink()
+    p = wd / "run-pilotB.jsonl"
+    lines = p.read_text().splitlines()
+    assert len(lines) >= 3
+    lines[1] = "not json at all"
+    p.write_text("\n".join(lines) + "\n")
+    cfg3 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
+               resume=True, host_check=False, pilot="b")
+    try:
+        _run(cfg3, _mock_make_session(
+            {r["instance_id"]: "ok" for r in repos}))
+    except lp.PilotConfigError as e:
+        assert "corrupt" in str(e), str(e)
+    else:
+        raise AssertionError("a mid-file corrupt checkpoint "
+                           "with no state did not surface the "
+                           "corruption")
+
+
+def test_wp6b_round26_rederivation_non_dict_source_value(
+        tmp_path, live):
+    """The round-26 Medium fix (issue #22, 4451289798):
+    _rederive_import fed state[\"import_source\"] values into
+    _validate_imported_line unchecked — a corrupt (non-dict)
+    value crashed on rec.get with an uncaught AttributeError
+    (exit 4) instead of the documented fail-closed exit-2
+    contract. A non-dict import_source value is now a
+    PilotConfigError before any session (the checkpoint branch's
+    lines are dicts by construction — load_checkpoint validates
+    the record shape — so the guard is for the state branch)."""
+    repos, inst = _pilot_b_repos(tmp_path)
+    i0, i1, i2 = [e["instance_id"] for e in repos]
+    wd = tmp_path / "wd"
+    wd.mkdir()
+    src = tmp_path / "src"
+    src.mkdir()
+    modes = {i0: "no_patch", i1: "no_patch", i2: "ok"}
+    cfg1 = _cfg(tmp_path, inst, run_id="src", workdir=str(src),
+               host_check=False)
+    assert _run(cfg1, _mock_make_session(modes)) == lp.EXIT_OK
+    cfg2 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
+               resume=True, host_check=False, pilot="b",
+               import_run="src", import_workdir=str(src))
+    assert _run(cfg2, _mock_make_session(modes)) == lp.EXIT_OK
+    st = json.loads((wd / "pilot-pilotB.state.json").read_text())
+    # corrupt an import_source value to a non-dict
+    st["import_source"][i0] = "corrupt-line"
+    (wd / "pilot-pilotB.state.json").write_text(json.dumps(st))
+    cfg3 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
+               resume=True, host_check=False, pilot="b")
+    try:
+        _run(cfg3, _mock_make_session(
+            {r["instance_id"]: "ok" for r in repos}))
+    except lp.PilotConfigError as e:
+        assert "not a record" in str(e), str(e)
+    else:
+        raise AssertionError("a non-dict import_source value "
+                           "was accepted by the re-derivation")
+
+
+def test_wp6b_round28_stratify_rule(tmp_path):
+    """The round-28 Medium fix (issue #22, 4451495681): stratify
+    — the documented reproducibility rule (1 per each of the 12
+    repos; the remaining 13 seats round-robin in descending repo
+    size, ties by name, capped at each repo's row count in the
+    split; first N rows in dataset order) — had no unit test: a
+    regression would silently produce a different 25-instance
+    pin. The test rebuilds the 500-row split with the committed
+    per-repo sizes (the pilot_b_instances.json
+    per_repo_total_in_split) and asserts the rule's full
+    contract: the 25 selection, the per-repo seat distribution
+    (django 3, sympy 3, nine repos 2, flask 1 — the flask cap:
+    its single split row exhausts its seat), the 12-repo
+    coverage, the first-N-in-row_idx selection, and the fail-
+    loud on a 11-repo split."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "pin_pilot_b", str(Path(__file__).parent.parent
+                          / "scripts" /
+                          "pin_pilot_b_instances.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    totals = {"django/django": 231, "sympy/sympy": 75,
+              "sphinx-doc/sphinx": 44, "matplotlib/matplotlib": 34,
+              "scikit-learn/scikit-learn": 32, "astropy/astropy": 22,
+              "pydata/xarray": 22, "pytest-dev/pytest": 19,
+              "pylint-dev/pylint": 10, "psf/requests": 8,
+              "mwaskom/seaborn": 2, "pallets/flask": 1}
+    rows = []
+    idx = 0
+    for repo in sorted(totals):  # a deterministic dataset order
+        for _ in range(totals[repo]):
+            rows.append({"row_idx": idx,
+                        "row": {"repo": repo,
+                               "instance_id": f"{repo}-{idx}"}})
+            idx += 1
+    assert len(rows) == 500
+    selected, per_repo = mod.stratify(rows)
+    assert len(selected) == 25
+    assert per_repo == totals
+    # stratify returns the row OBJECTS (the wrapper dicts carry
+    # the row_idx) — map back for the order checks
+    sel_count = {}
+    for r in selected:
+        sel_count[r["repo"]] = sel_count.get(r["repo"], 0) + 1
+    # the documented distribution (the committed pin's
+    # per_repo_selected): 1 per repo + the 13 seats dealt
+    # round-robin in descending size (flask — its single split
+    # row — is exhausted by its first seat and takes no extra)
+    assert sel_count == {
+        "django/django": 3, "sympy/sympy": 3,
+        "astropy/astropy": 2, "matplotlib/matplotlib": 2,
+        "mwaskom/seaborn": 2, "psf/requests": 2,
+        "pydata/xarray": 2, "pylint-dev/pylint": 2,
+        "pytest-dev/pytest": 2, "scikit-learn/scikit-learn": 2,
+        "sphinx-doc/sphinx": 2, "pallets/flask": 1}, sel_count
+    assert len(sel_count) == 12  # all 12 repos covered
+    # the flask cap: 1 seat — its single split row
+    assert sel_count["pallets/flask"] == 1
+    # within a repo: the FIRST N rows in dataset (row_idx) order
+    for repo, n in sel_count.items():
+        picked = sorted(r["row_idx"] for r in rows
+                       if r["row"] in selected
+                       and r["row"]["repo"] == repo)
+        all_in_repo = sorted(r["row_idx"] for r in rows
+                            if r["row"]["repo"] == repo)
+        assert picked == all_in_repo[:n], repo
+    # fail-loud: an 11-repo split is a SystemExit (not a silent
+    # 11-repo pin)
+    rows11 = [r for r in rows
+             if r["row"]["repo"] != "pallets/flask"]
+    try:
+        mod.stratify(rows11)
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("an 11-repo split was accepted")
+
+
+def test_wp6b_round29_pilot_a_resume_does_not_rederive(
+        tmp_path, live):
+    """The round-29 Major fix (issue #22, 4451583330): the
+    re-derivation + seeding ran on ANY --resume with no
+    config.pilot check — a --pilot a --resume on a pilot-B
+    workdir re-derived imported from the state / checkpoint
+    bookkeeping, seeded imported_from lines, and rendered the
+    WP6a 14-item record with the import unverified (items
+    15–17 do not render under --pilot a) — the exact hazard
+    PilotConfig.__post_init__ fail-closes on for the
+    --import-run flag. The re-derivation (live + dry run) is
+    now gated to --pilot b. The test: a pilot-B import window
+    (2 imported + 1 fresh), the checkpoint removed (the
+    bookkeeping-only state survives), then a --pilot a
+    resume: NO re-derivation, NO seeding (the pre-fix code
+    would seed the imported_from lines and render the 14-item
+    record with the import unverified) — the 3 instances run
+    as pilot A, and no line carries the imported_from meta."""
+    repos, inst = _pilot_b_repos(tmp_path)
+    i0, i1, i2 = [e["instance_id"] for e in repos]
+    src = tmp_path / "src"
+    src.mkdir()
+    wd = tmp_path / "wd"
+    wd.mkdir()
+    modes = {i0: "no_patch", i1: "no_patch", i2: "ok"}
+    cfg1 = _cfg(tmp_path, inst, run_id="src", workdir=str(src),
+               host_check=False)
+    assert _run(cfg1, _mock_make_session(modes)) == lp.EXIT_OK
+    cfg2 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
+               resume=True, host_check=False, pilot="b",
+               import_run="src", import_workdir=str(src))
+    assert _run(cfg2, _mock_make_session(
+        {r["instance_id"]: "ok" for r in repos})) == lp.EXIT_OK
+    # the checkpoint is lost (the bookkeeping-only state
+    # survives — the re-derivation trigger condition)
+    (wd / "run-pilotB.jsonl").unlink()
+    cfg3 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
+               resume=True, host_check=False, pilot="a")
+    assert _run(cfg3, _mock_make_session(
+        {r["instance_id"]: "ok" for r in repos})) == lp.EXIT_OK
+    # NO seeding: no line carries the imported_from meta (the
+    # pre-fix code would seed the 2 no_patch instances with
+    # the marker and render the 14-item record with the import
+    # unverified)
+    lines = _read_jsonl(wd / "run-pilotB.jsonl")
+    session_lines = [l for l in lines
+                    if l.get("instance_id") is not None]
+    assert all("imported_from" not in (l.get("meta") or {})
+           for l in session_lines), session_lines
+    # all 3 ran as pilot A (3 session lines, no imported rows)
+    assert len(session_lines) == 3, len(session_lines)
+    # the 14-item WP6a record (no pilot-B sections)
+    gng = (wd / "wp6a-go-no-go.md").read_text()
+    assert "## 2-run overlap/variance" not in gng
+    # the state's bookkeeping survives untouched (the pilot-A
+    # run must not clobber it — a later --pilot b resume is
+    # still on the checkpoint fallback)
+    st = json.loads((wd / "pilot-pilotB.state.json").read_text())
+    assert st.get("import_source"), st
+
+
+def test_wp6b_round29_resume_hint_carries_pilot_flag(
+        tmp_path, live, capsys):
+    """The round-29 Major fix (issue #22, 4451583330, the
+    resume-hint half): the interrupt resume hint used to omit
+    the pilot flag — on a pilot-B workdir that steered the
+    operator into a --pilot a --resume (the pre-fix hazard). The
+    hint now carries --pilot <kind> explicitly."""
+    repos, inst = _pilot_b_repos(tmp_path)
+    wd = tmp_path / "wh"
+    wd.mkdir()
+    src = tmp_path / "src"
+    src.mkdir()
+    i0, i1, i2 = [e["instance_id"] for e in repos]
+    # 1 never-rerun (imported — never re-run) + 2 fresh (the
+    # interrupt_after=1 check is on the per-invocation session
+    # count: after fresh session 1, before fresh session 2)
+    modes = {i0: "no_patch", i1: "ok", i2: "ok"}
+    cfg1 = _cfg(tmp_path, inst, run_id="src", workdir=str(src),
+               host_check=False)
+    assert _run(cfg1, _mock_make_session(modes)) == lp.EXIT_OK
+    cfg = _cfg(tmp_path, inst, run_id="hint", workdir=str(wd),
+              resume=True, host_check=False, pilot="b",
+              import_run="src", import_workdir=str(src),
+              interrupt_after=1)
+    assert _run(cfg, _mock_make_session(
+        {r["instance_id"]: "ok" for r in repos})) == lp.EXIT_INTERRUPT
+    out = capsys.readouterr().out
+    hint = [l for l in out.splitlines()
+           if l.startswith("[pilot] resume with:")]
+    assert hint, out
+    assert "--pilot b" in hint[0], hint[0]

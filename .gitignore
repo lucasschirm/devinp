@@ -154,3 +154,5 @@ __pycache__/
 bench/notes/raw-frames.jsonl
 pilot-a/
 pilot-a-smoke/
+pilot-b/
+pilot-b-smoke/
