@@ -120,7 +120,18 @@ def stratify(rows: list) -> "tuple[list, dict]":
     (selected_rows, per_repo_total_counts)."""
     by_repo: dict = {}
     for r in rows:  # dataset order (row_idx ascending)
-        by_repo.setdefault(r["row"]["repo"], []).append(r["row"])
+        # the round-26 Minor fix (issue #22, 4451289803): the
+        # row OBJECT is guarded too — the schema-drift checks
+        # cover rows / row_idx but not r["row"] (a missing /
+        # non-dict row, or a row missing 'repo', would raise an
+        # uncaught KeyError) — fail closed
+        row = r.get("row")
+        if not isinstance(row, dict) or not isinstance(
+                row.get("repo"), str) or not row.get("repo"):
+            raise SystemExit(
+                "an API row is missing its row object / repo "
+                f"(schema drift): {json.dumps(r)[:200]}")
+        by_repo.setdefault(row["repo"], []).append(row)
     if len(by_repo) != EXPECTED_REPOS:
         raise SystemExit(
             f"expected {EXPECTED_REPOS} repos, got {len(by_repo)}: "
@@ -168,6 +179,19 @@ def main(out_path: str) -> None:
     # the Pilot-A reuse precondition (issue #22 AC2): all 3 must be in
     # the 25 (flask: the split's only flask row; seaborn / requests:
     # reached by the first-N rule)
+    # the round-26 Minor fix (issue #22, 4451289803): the KEEP
+    # projection is guarded too — a row missing any KEEP field
+    # (schema drift) would raise an uncaught KeyError in the
+    # projection below (and in the sel_ids / repo accesses) —
+    # fail closed before any access (every selected row must
+    # carry every KEEP field)
+    for r in selected:
+        missing = [k for k in KEEP if k not in r]
+        if missing:
+            raise SystemExit(
+                "an API row is missing KEEP fields "
+                f"(schema drift): {missing} in row "
+                f"{r.get('instance_id')!r}")
     sel_ids = {r["instance_id"] for r in selected}
     missing = [i for i in PILOT_A if i not in sel_ids]
     if missing:

@@ -5246,3 +5246,44 @@ def test_wp6b_round25_mid_file_corruption_surfaces(
         raise AssertionError("a mid-file corrupt checkpoint "
                            "with no state did not surface the "
                            "corruption")
+
+
+def test_wp6b_round26_rederivation_non_dict_source_value(
+        tmp_path, live):
+    """The round-26 Medium fix (issue #22, 4451289798):
+    _rederive_import fed state[\"import_source\"] values into
+    _validate_imported_line unchecked — a corrupt (non-dict)
+    value crashed on rec.get with an uncaught AttributeError
+    (exit 4) instead of the documented fail-closed exit-2
+    contract. A non-dict import_source value is now a
+    PilotConfigError before any session (the checkpoint branch's
+    lines are dicts by construction — load_checkpoint validates
+    the record shape — so the guard is for the state branch)."""
+    repos, inst = _two_pilot_b_repos(tmp_path)
+    i0, i1, i2 = [e["instance_id"] for e in repos]
+    wd = tmp_path / "wd"
+    wd.mkdir()
+    src = tmp_path / "src"
+    src.mkdir()
+    modes = {i0: "no_patch", i1: "no_patch", i2: "ok"}
+    cfg1 = _cfg(tmp_path, inst, run_id="src", workdir=str(src),
+               host_check=False)
+    assert _run(cfg1, _mock_make_session(modes)) == lp.EXIT_OK
+    cfg2 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
+               resume=True, host_check=False, pilot="b",
+               import_run="src", import_workdir=str(src))
+    assert _run(cfg2, _mock_make_session(modes)) == lp.EXIT_OK
+    st = json.loads((wd / "pilot-pilotB.state.json").read_text())
+    # corrupt an import_source value to a non-dict
+    st["import_source"][i0] = "corrupt-line"
+    (wd / "pilot-pilotB.state.json").write_text(json.dumps(st))
+    cfg3 = _cfg(tmp_path, inst, run_id="pilotB", workdir=str(wd),
+               resume=True, host_check=False, pilot="b")
+    try:
+        _run(cfg3, _mock_make_session(
+            {r["instance_id"]: "ok" for r in repos}))
+    except lp.PilotConfigError as e:
+        assert "not a record" in str(e), str(e)
+    else:
+        raise AssertionError("a non-dict import_source value "
+                           "was accepted by the re-derivation")

@@ -3582,8 +3582,20 @@ def _rederive_import(state: dict, workdir: str, run_id: str,
     # the round-20 Medium fix (issue #22, 4450828209): the
     # shared fail-closed validation of every re-derived line
     # (the ts contract + the reference schema + the round-15
-    # ref traversal guard)
+    # ref traversal guard). The round-26 Medium fix (issue #22,
+    # 4451289798): a state["import_source"] value is fed to the
+    # validation unchecked — a corrupt (non-dict) value would
+    # crash on rec.get with an uncaught AttributeError (exit 4)
+    # instead of the documented fail-closed exit-2 contract
+    # (the checkpoint branch's lines are dicts by construction —
+    # load_checkpoint validates the record shape)
     for _iid, _rec in imported.items():
+        if not isinstance(_rec, dict):
+            raise PilotConfigError(
+                f"the import re-derivation line for {_iid!r} "
+                f"is not a record ({type(_rec).__name__}) — a "
+                f"corrupt state line (fail-closed before any "
+                f"session)")
         _validate_imported_line(
             _rec, _iid,
             "the import re-derivation (state / checkpoint "
