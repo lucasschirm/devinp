@@ -1,4 +1,7 @@
-"""WP6a (issue #21) — the ``BENCH_LIVE=1`` Pilot-A smoke harness.
+"""WP6a (issue #21) / WP6b (issue #22) — the ``BENCH_LIVE=1``
+pilot smoke harness (Pilot A: 3 real instances; Pilot B: the 25
+stratified instances across all 12 repos, reusing Pilot A via the
+checkpoint import).
 
 Runs **3 small-repo SWE-bench Verified instances sequentially** through
 the full WP1–WP5 stack (``AcpSession`` + ``SwebenchPolicy``, the WP3
@@ -3095,10 +3098,8 @@ def _render_pilot_b_sections(wp6b: dict) -> list:
 
 def render_checklist_md(items: list, config: PilotConfig,
                        calibration: "Optional[dict]",
-                       meta: dict,
+                       meta: dict, title: str,
                        interrupted: bool = False,
-                       title: str = "WP6a Pilot A — go/no-go record "
-                                   "(auto-generated)",
                        gating: "Optional[frozenset]" = None) -> str:
     verdict, failed = _verdict(items, interrupted=interrupted,
                               gating=gating)
@@ -4366,8 +4367,9 @@ def run_pilot(config: PilotConfig,
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="live_pilot",
-        description="the WP6a Pilot-A smoke harness (issue #21) — "
-                    "BENCH_LIVE=1 required for a real run")
+        description="the WP6a/WP6b pilot smoke harness "
+                    "(issues #21/#22) — BENCH_LIVE=1 required for a "
+                    "real run")
     p.add_argument("--mode", choices=("container", "sandbox"),
                    default="sandbox")
     p.add_argument("--instances", default=None,

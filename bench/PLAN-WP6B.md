@@ -153,8 +153,11 @@ resume restarts the counter — the account-level 429 backstop, PLAN
 §2.3, is the hard stop, and a `quota_limited` line is the retry class
 that resumes in the next window). Checklist item 12 therefore gates
 **per window** (checkpoint lines bucketed by their `ts`'s UTC day —
-imported lines keep the source run's `ts`, so they land in the source
-window, never in this run's): every window ≤ `max_sessions_per_day`
+imported lines are EXCLUDED from this run's window budget entirely:
+the source run accounted for them in its own windows, so counting
+them here would double-spend the budget; a same-UTC-day source
+therefore does not count toward this run's cap — the code comment
+documents exactly this exclusion): every window ≤ `max_sessions_per_day`
 sessions and ≤ `max_wall_per_session × max_sessions_per_day` wall. A
 single-window run renders exactly the current text (the WP6a contract
 is unchanged).
