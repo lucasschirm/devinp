@@ -704,6 +704,58 @@ def write_artifacts(
 
 
 # ---------------------------------------------------------------------------
+# the report.md reader (the pass@1 cross-check's other half)
+# ---------------------------------------------------------------------------
+
+#: The section header of the per-repo table (the format this module
+#: renders, and the format :func:`parse_report_pass1` reads back).
+PER_REPO_SECTION = "## Per-repo pass@1"
+
+#: The overall line as :func:`render_report` writes it.
+_OVERALL_RE = re.compile(r"pass@1 \(overall\): (\d+)/(\d+) \(([^)]*)\)")
+
+
+def parse_report_pass1(md: str) -> "tuple[dict | None, dict]":
+    """Read the pass@1 numbers back out of a rendered ``report.md``:
+    ``({resolved, terminal, pct}, {repo: (resolved, terminal, pct)})``.
+    A missing overall line is ``None`` and a missing/empty section an
+    empty dict — the *caller* decides whether absence is a failure (a
+    run with nothing graded really does render ``n/a``), so the parser
+    itself never guesses.
+
+    This exists so the cross-check (WP6c items 21 / issue #44 E4's
+    ``scripts/verify_submission.py``) compares the *rendered* numbers
+    with the recomputation instead of trusting either alone — the report
+    is the published artifact, the checkpoint is the source of truth.
+    """
+    overall = None
+    m = _OVERALL_RE.search(md)
+    if m:
+        overall = {"resolved": int(m.group(1)),
+                  "terminal": int(m.group(2)), "pct": m.group(3)}
+    rows: dict = {}
+    in_section = False
+    for line in md.splitlines():
+        if line.startswith("## "):
+            in_section = line.strip() == PER_REPO_SECTION
+            continue
+        if not in_section or not line.startswith("|"):
+            continue
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) != 4 or cells[0] in ("Repo",):
+            continue
+        if set("".join(cells)) <= {"-", ":"}:
+            continue  # the |---|---| delimiter row
+        try:
+            rows[cells[0]] = (int(cells[1]), int(cells[2]), cells[3])
+        except ValueError:
+            # a non-numeric cell is a malformed table — record it so the
+            # caller's comparison fails loudly instead of skipping it
+            rows[cells[0]] = (None, None, cells[3])  # type: ignore
+    return overall, rows
+
+
+# ---------------------------------------------------------------------------
 # AC3 — the methodology block
 # ---------------------------------------------------------------------------
 
@@ -788,6 +840,12 @@ def render_report(ctx: "dict") -> str:
     lines: "list[str]" = []
     lines.append("# SWE-bench Verified — Devin ACP run report")
     lines.append("")
+    # the submission label (WP6c E3) — the line the leaderboard /
+    # Cognition handoff expects to see, carried from the run meta
+    label = ctx.get("label")
+    if isinstance(label, str) and label.strip():
+        lines.append(f"**{label.strip()}**")
+        lines.append("")
     lines.append("## Summary")
     lines.append("")
     if ov["terminal"] > 0:
@@ -892,6 +950,11 @@ def _ctx(records: "list", dropped: bool, meta_file: "dict | None") -> "dict":
     return {
         "records": records,
         "finals": finals,
+        # the submission label (WP6c E3 / PLAN-WP6C §3 D5): rendered as
+        # the report header when the run meta carries it. Optional on
+        # purpose — a meta without a label renders the WP5 report
+        # unchanged (the label is the *run's* claim, not a WP5 field).
+        "label": (meta_file or {}).get("label"),
         "markers": markers,
         "p1": p1,
         "tax": tax,

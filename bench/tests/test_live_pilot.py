@@ -2334,8 +2334,13 @@ def test_dry_run_pilot_b_writes_17_skeleton(tmp_path, live):
 
 
 def test_config_rejects_bad_pilot(tmp_path):
+    # 'c' became valid with the WP6c full-run mode (issue #44 E2) — the
+    # rejected set is everything else (see test_pilot_c.py for the 'c'
+    # contract itself)
     with pytest.raises(lp.PilotConfigError):
-        lp.PilotConfig(pilot="c")
+        lp.PilotConfig(pilot="d")
+    with pytest.raises(lp.PilotConfigError):
+        lp.PilotConfig(pilot="")
 
 
 def test_import_run_source_missing_is_config_error(tmp_path, live):
