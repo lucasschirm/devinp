@@ -62,6 +62,18 @@ root-caused `eval_error`s — the PLAN §2.5/§2.6 variance report + the
 AC1–AC4 map) + zero-quota CI tests. `PLAN-WP6B.md` (the plan of
 record; the import is the WP6a→WP6b reuse mechanism). The live run +
 measured record: `notes/wp6b-pilot-b.md`.
+**WP6c pre-flight (issue #44) — the 500-instance run (#23)** — the
+harness extended to the full run, and the run made operable:
+`--pilot c` (the pinned 500-instance manifest, its own workdir and record,
+checklist items 18–23), `--stop-at-window-cap` + `scripts/run_window.sh`
+(one invocation per quota window instead of one 10–50-day process),
+`scripts/run_status.py` (read-only progress/ETA/disk dashboard for a run in
+flight), `scripts/verify_submission.py` + `scripts/package_submission.py`
+(the submission must be machine-verifiable and reproducible),
+`scripts/archive_run.py` (per-window durable copy, verified), and
+`bench/live_pilot_budget.json` (the budget + the B2 authorization the full
+run refuses to start without). The blockers that are decisions, not code,
+are listed unanswered in `notes/wp6c-preflight.md`.
 
 ## Layout
 
@@ -73,20 +85,28 @@ measured record: `notes/wp6b-pilot-b.md`.
 | `PLAN-WP5.md` | WP5 implementation plan (AC map, WP3-schema fact record, design decisions pinned by the tests, contingencies) |
 | `PLAN-WP6A.md` | WP6a implementation plan (AC map, the two run modes, the gate ordering, the checklist, the deviation record) |
 | `PLAN-WP6B.md` | WP6b implementation plan (the AC1–AC4 map, the `--import-run` checkpoint import + the never-rerun/retry-class reuse rule, the per-window budget, the checklist items 15–17) |
-| `live_pilot.py` | **WP6a+WP6b** — the `BENCH_LIVE=1` live-pilot harness: the pinned sequential run through WP1–WP5 (pre-flight → fail-closed model gate → sessions → patch extraction → checkpoint → pruning → report), the intentional interrupt (`--interrupt-after`, exit 42, host-crash class) + `--resume` via `resume_queue`, the `max_sessions_per_day` calibration, the go/no-go checklist (WP6a: items 1–14; WP6b: items 15–17 + the per-UTC-window item 12, exit codes 0/2/3/4/42), the WP6b `--import-run/--import-workdir` checkpoint import (the never-rerun statuses reused verbatim, the retry-class re-run, the referenced artifacts copied so the WP5 cross-check holds) |
+| `verified_instances.json` | The **WP6c** pinned 500-instance Verified manifest (issue #44 E1) — the exact instances the run submits, produced by `scripts/pin_verified_instances.py` (fail-closed: a split short of 500, a repo with too few rows, an id outside the split or a duplicate is an error, never a silent truncation; the schema is validated through the WP5 reader before commit, so the run cannot start on a file WP5 would reject) |
+| `live_pilot_budget.json` | The **WP6c** budget + authorization file (issue #44 B2) — the numeric caps every pilot reads, plus the fields only an operator can fill (`authorized_by`, `completion_deadline`, `abort_rule`, `basis`, `calibrated_at`). Committed with `PENDING`: `--pilot c` refuses to spend a session while any of them says so, and a `PENDING` cap is a config error for any pilot |
+| `live_pilot.py` | **WP6a+WP6b** — the `BENCH_LIVE=1` live-pilot harness: the pinned sequential run through WP1–WP5 (pre-flight → fail-closed model gate → sessions → patch extraction → checkpoint → pruning → report), the intentional interrupt (`--interrupt-after`, exit 42, host-crash class) + `--resume` via `resume_queue`, the `max_sessions_per_day` calibration, the go/no-go checklist (WP6a: items 1–14; WP6b: items 15–17 + the per-UTC-window item 12; **WP6c**: `--pilot c` for the 500-instance run + items 18–23 + the B2 authorization gate + `--stop-at-window-cap`; exit codes 0/2/3/4/42), the WP6b `--import-run/--import-workdir` checkpoint import (the never-rerun statuses reused verbatim, the retry-class re-run, the referenced artifacts copied so the WP5 cross-check holds) |
 | `pilot_instances.json` | The three pinned Pilot-A instances (one from each of the smallest Verified repos: pallets/flask, mwaskom/seaborn, psf/requests — verbatim SWE-bench Verified fields incl. `test_patch` for the host check) |
 | `pilot_b_instances.json` | The 25 pinned Pilot-B instances — stratified across all 12 Verified repos (1 each; the remaining 13 seats dealt round-robin in descending repo size, capped at each repo's row count in the split — in the pinned set: django 3, sympy 3, nine repos 2, flask 1 — its single split row) — verbatim Verified fields incl. `test_patch` + a `repo` key per instance + the `stratified_repos` meta (checklist item 15); produced by `scripts/pin_pilot_b_instances.py` (deterministic — the selection rule in its header; `_meta` records the source, the fetch date, the per-repo selection, and the per-repo split row counts) |
 | `notes/acp-surface.md` | **WP0 notes** — the recon record answering every "?" |
 | `notes/models-list.json` | Raw `devin models list --format json` (2026-10-26) |
 | `notes/auth-status.txt` | `devin auth status` output (quota evidence) |
+| `notes/wp6c-preflight.md` | **WP6c** — what the code now enforces for the 500-instance run, the environment facts measured here, and the blockers that remain operator decisions (B1 quota, B2 authorization, B3/B6 model + mode, B4 destination, B5 deadline + account, B7 cadence) |
 | `notes/*` | Additional recon evidence (version, image registry scans…) |
 | `probes/acp_probe.py` | NDJSON JSON-RPC probe for `devin acp` (4 modes) |
+| `scripts/verify_submission.py` | **WP6c** (issue #44 E4) — prove a finished run is submittable: re-verifies the artifacts with WP5's own `build_report` (exit 3 on an integrity failure), then the parts only the submission needs — the persisted `run_meta.json` (no `pending` methodology field, the grading leg stated honestly), queue completeness against the pinned manifest, the pass@1 the report renders recomputed from the checkpoint, the grading-queue break where a non-terminal record sits between two decided ones, and the declared submission label; `--bundle` also proves the `runs/<run_id>/<instance_id>/` layout. Exit 0 verified · 2 bad input · 3 integrity |
+| `scripts/package_submission.py` | **WP6c** (issue #44 E4) — package what `verify_submission.py` verified: `runs/<run_id>/<iid>/{patch.diff,trajectory.jsonl,eval.log}` + `all_preds.jsonl` + `report.md` + `run_meta.json` + the checkpoint + `SHA256SUMS`, and a README written for the reviewer (the label, the methodology, the deviations, the reproduction command). Verifies first and refuses a non-empty target unless `--force`; `--allow-incomplete` stamps an interim bundle as not-leaderboard-submittable instead of pretending |
+| `scripts/run_status.py` | **WP6c** (issue #44 E5) — the read-only dashboard for a run in flight: instances decided / 500, the queue still open (derived through WP3's `resume_queue`, never a second implementation), pass@1 so far, sessions per UTC day against the cap, the ETA from the measured median wall, disk free, and the state the previous window left (window cap / interrupt / abort). Exit 0 = readable, 2 = unreadable input |
+| `scripts/run_window.sh` | **WP6c** (issue #44 E5 + B7) — ONE operator window: runs the harness exactly once, tees to `<workdir>/logs/window-<UTC>.log`, prints how to read the exit code, and exits with the code it got (`42` = window cap, resume next window; `4` = STOP, do not loop-retry). Never retries, never backgrounds, never edits the checkpoint. `WP6C_ARCHIVE_DEST` also archives + verifies the window's artifacts (exit 5 if that fails) |
+| `scripts/archive_run.py` | **WP6c** (issue #44 B4) — make a window's artifacts durable: an append-only, content-addressed bundle under `<dest>/<run_id>/windows/<UTC>/` with a `MANIFEST.tsv`, the copy verified byte-for-byte before success is reported, and `--verify --bundle …` to re-prove any past window. The answer to the Pilot B artifact loss (issue #22) |
 | `acp_client.py` | **WP1** — NDJSON JSON-RPC 2.0 client core (pure stdlib) |
 | `mock_devin.py` | **WP2** — `mock_devin` test double: a fake `devin` binary (canned ACP agent, modes `ok`/`no_patch`/`hang`/`quota`/`crash`, canned `models list` fixture) |
 | `runner.py` | **WP3a + WP3b** — sequential queue (concurrency 1 by default), quota-budget state machine (`running → budget_exhausted → sleeping → resume`), overlap guard + concurrency flag contract, abort on 2 consecutive `agent_error`; checkpoint/resume with pass@1-correct retry semantics (`JsonlCheckpoint`, `resume_queue`), the dynamic cost-tier model gate (fail-closed, `gate_cost_tier`/`parse_models_list`/`fetch_models_list`), the zero-quota pre-flight (`Preflight`, before every batch + every instance) (pure stdlib) |
 | `evaluate.py` | **WP4** — the SWE-bench evaluation leg: a thin delegate to `python -m swebench.harness.run_evaluation` (standard predictions file, fresh harness-created container, `{resolved, logs}` return contract, typed error hierarchy `InvalidInputError`/`PatchCorruptionError`/`EvaluationTimeoutError`/`HarnessFailedError`; never imports `swebench` — the subprocess is the only harness interaction; pure stdlib + subprocess) |
-| `report.py` | **WP5** — the report leg: pass@1 overall + per-repo table (WP3b resume-dedup; the retry class excluded from the denominator — the pass@1-correct semantics), the failure taxonomy, the methodology block, the leaderboard artifacts (`all_preds.jsonl` + `trajs/`), the artifact cross-check (typed errors `InvalidInputError`/`ReportProtocolError`/`ArtifactCheckError`; reads the run JSONL by import from `runner.load_checkpoint` — one source of truth for the WP3 schema; pure stdlib + `runner`) |
-| `tests/` | **WP1** — unit tests + in-process mock `devin` server; **WP2** — `mock_devin` integration tests (driven through the real WP1 client); **WP3a** — `runner` unit tests (instrumented fake sessions); **WP3b** — resume fixtures (incl. EOF corruption + retry-class rules), cost-tier gate fixtures (paid model, shape change, paid override), pre-flight stub-failure tests; **WP4** — `evaluate` unit tests (injected harness runner + fabricated harness trees, zero quota) + CI integration tests (positive control on the public flask image, corruption guard, isolation; skip without a Docker daemon); **WP5** — `report` unit tests (fixture JSONL → exact expected numbers: resume-dedup, terminal-status exclusion, artifact cross-checks, trajs byte-for-byte, methodology, determinism, CLI exit codes; zero quota); **WP6a** — `test_live_pilot.py` (the full pilot pipeline through `mock_devin`, zero quota; the failure-mode mapping; interrupt + resume pass@1 semantics; the pre-flight batch marker; the paid-model gate refusal; the patch guards incl. pre-staged junk + collapsed-dir expansion; the host-check verdicts; the calibration/checklist math; one `BENCH_LIVE`-gated real-binary handshake smoke; **WP6b** — the `--import-run` import (the never-rerun reuse: the original timestamp preserved, no session spent; the retry-class re-run; the idempotent seeding; the referenced-artifact copy; the fail-closed source validation), the checklist items 15 (stratification), 16 (the 2-run overlap/variance), 17 (the root-caused `eval_error`), the per-UTC-window item 12 + the root-cause taxonomy (env/parser/patch)); **CI (issue #20)** — the `BENCH_LIVE` gate (real-Devin tests excluded by default; `BENCH_LIVE=1` opts in; the static guard fails the suite on an unmarked real-Devin test; zero quota) |
+| `report.py` | **WP5** — the report leg: pass@1 overall + per-repo table (WP3b resume-dedup; the retry class excluded from the denominator — the pass@1-correct semantics), the failure taxonomy, the methodology block, the leaderboard artifacts (`all_preds.jsonl` + `trajs/`), the artifact cross-check, and `parse_report_pass1` (the one parser for the pass@1 a rendered report claims — `live_pilot.py` item 21 and `scripts/verify_submission.py` both read it, so the claim and the check cannot drift apart) (typed errors `InvalidInputError`/`ReportProtocolError`/`ArtifactCheckError`; reads the run JSONL by import from `runner.load_checkpoint` — one source of truth for the WP3 schema; pure stdlib + `runner`) |
+| `tests/` | **WP1** — unit tests + in-process mock `devin` server; **WP2** — `mock_devin` integration tests (driven through the real WP1 client); **WP3a** — `runner` unit tests (instrumented fake sessions); **WP3b** — resume fixtures (incl. EOF corruption + retry-class rules), cost-tier gate fixtures (paid model, shape change, paid override), pre-flight stub-failure tests; **WP4** — `evaluate` unit tests (injected harness runner + fabricated harness trees, zero quota) + CI integration tests (positive control on the public flask image, corruption guard, isolation; skip without a Docker daemon); **WP5** — `report` unit tests (fixture JSONL → exact expected numbers: resume-dedup, terminal-status exclusion, artifact cross-checks, trajs byte-for-byte, methodology, determinism, CLI exit codes; zero quota); **WP6c (issue #44)** — `test_pilot_c.py` (the `--pilot c` kind, the B2 authorization gate incl. `PENDING`-not-authorization, items 18–23, `report/run_meta.json`, the submission label, the mode-gated import), `test_verify_submission.py` (verify/package: every failure class, a package round-trip through the verifier, deterministic output), `test_run_ops.py` (the window wrapper's exit-code contract, a real two-window resume drill, the status math, the durable archive + its verification failures), `test_pin_verified.py` (the pinned 500-instance manifest); **WP6a** — `test_live_pilot.py` (the full pilot pipeline through `mock_devin`, zero quota; the failure-mode mapping; interrupt + resume pass@1 semantics; the pre-flight batch marker; the paid-model gate refusal; the patch guards incl. pre-staged junk + collapsed-dir expansion; the host-check verdicts; the calibration/checklist math; one `BENCH_LIVE`-gated real-binary handshake smoke; **WP6b** — the `--import-run` import (the never-rerun reuse: the original timestamp preserved, no session spent; the retry-class re-run; the idempotent seeding; the referenced-artifact copy; the fail-closed source validation), the checklist items 15 (stratification), 16 (the 2-run overlap/variance), 17 (the root-caused `eval_error`), the per-UTC-window item 12 + the root-cause taxonomy (env/parser/patch)); **CI (issue #20)** — the `BENCH_LIVE` gate (real-Devin tests excluded by default; `BENCH_LIVE=1` opts in; the static guard fails the suite on an unmarked real-Devin test; zero quota) |
 | `conftest.py` | pytest path shim for the flat layout + the `BENCH_LIVE` gate (`@pytest.mark.bench_live` — real-Devin tests are excluded by default; CI never consumes quota, PLAN §6) |
 | `pyproject.toml` / `requirements.lock` | Python ≥3.11; `swebench==5.0.2` pinned; `pytest-timeout` (the integration tests' watchdog) |
 
@@ -672,6 +692,101 @@ BENCH_LIVE=1 python live_pilot.py --pilot b --mode sandbox \
   verdict + the measured numbers (the per-repo variance, the overlap
   table, the failure taxonomy, the window budget arithmetic) are
   recorded in `notes/wp6b-pilot-b.md`.
+
+## The 500-instance run (WP6c pre-flight, issue #44)
+
+`--pilot c` runs the 500 Verified instances in `verified_instances.json`
+through the same WP1–WP5 pipeline. What the pre-flight added is not a new
+pipeline but the parts that only a 10–50-day submission run needs:
+
+```bash
+cd bench
+# 0. the manifest is pinned once, in the repo (issue #44 E1)
+python scripts/pin_verified_instances.py            # → verified_instances.json
+# 1. B2: fill in live_pilot_budget.json (authorized_by, completion_deadline,
+#    abort_rule, basis, calibrated_at). PENDING = not authorized: --pilot c
+#    exits 2 before the live-run gate, before connecting, before any session.
+$EDITOR live_pilot_budget.json
+# 2. one window per UTC day — the operator starts it, the harness stops at
+#    the cap, the wrapper interprets the exit code and archives the evidence
+WP6C_ARCHIVE_DEST=/mnt/offhost/devinp \
+  scripts/run_window.sh --pilot c --mode container --run-id full500 \
+  --workdir ./full-run --resume
+# 3. any time, read-only, while the run is in flight
+python scripts/run_status.py --workdir ./full-run --run-id full500
+# 4. after the queue is empty: verify, then package
+python scripts/verify_submission.py --run-id full500 --workdir ./full-run \
+  --instances verified_instances.json --bundle
+python scripts/package_submission.py --run-id full500 --workdir ./full-run \
+  --instances verified_instances.json
+```
+
+- **The window model (E5, B7).** A run this long is one invocation per
+  window, not one long-lived process: `--stop-at-window-cap` makes the
+  harness **exit 42** when the per-UTC-day cap is reached (the WP3 runner
+  would otherwise sleep to the next window inside the process — right for
+  Pilot B, wrong for an operator who reboots). `scripts/run_window.sh` is
+  the wrapper: one harness invocation, no retry, output tee'd to
+  `<workdir>/logs/window-<UTC>.log`, and the exit code explained
+  (`42` resume · `4` **STOP**, do not loop-retry · `3` the live-run gate ·
+  `2` configuration · `5` the archive failed). It never touches the
+  checkpoint.
+- **Progress without guessing (E5).** `scripts/run_status.py` reads the
+  checkpoint and says what is decided, what is still queued (derived
+  through WP3's `resume_queue` — never a second implementation of the
+  resume rule, which is the only way this dashboard can disagree with the
+  run), pass@1 so far, sessions per UTC day vs the cap, the ETA from the
+  measured median wall, and disk free. Read-only, so an operator can run it
+  while a window is live.
+- **Authorization is a gate, not a checklist item (B2).** `--pilot c` reads
+  `live_pilot_budget.json` and refuses (exit 2) while `authorized_by` /
+  `completion_deadline` / `abort_rule` / `basis` / `calibrated_at` are
+  missing or still say `PENDING`. The committed template carries the WP6a
+  caps (so pilots a/b are unchanged) and `PENDING` authorizations — filling
+  them in is the operator's decision, and the harness will not guess it.
+- **Methodology that is written down, not remembered (E3).** Every run
+  persists `report/run_meta.json` — model id + `cost_tier`, mode, the models
+  sha256, the devin CLI version, the instance count + manifest sha256, the
+  run dates, and the **submission label**
+  (`Devin (agent) on SWE-bench Verified`, `live_pilot.SUBMISSION_LABEL`).
+  The report renders the label from that file, so a label cannot be true in
+  one artifact and absent from another; `--import-run` refuses a source run
+  whose recorded mode/model/cost-tier differs from this run's (a mixed
+  methodology has no single pass@1 — and a source with *no* meta, i.e. a
+  pre-WP6c run, is refused for `--pilot c` rather than trusted).
+- **Items 18–23 (the full-run checklist).** 18 completeness against the
+  pinned manifest (retry-class gaps are named: they are re-runnable, an
+  undecided instance is not); 19 artifact integrity (WP5's own cross-check);
+  20 methodology completeness; 21 pass@1 recomputed from the checkpoint
+  equals what `report.md` renders; 22 the submission label in `run_meta.json`
+  **and** in the report; 23 batch discipline across UTC windows (never more
+  than the cap in any one window, and the queue never breaks on a
+  `--resume`).
+- **Verification and packaging (E4).** `scripts/verify_submission.py`
+  re-runs WP5's `build_report` (so R1/R2 integrity is WP5's own verdict,
+  exit 3 on failure) and then checks the submission-only properties: every
+  manifest instance decided, the grading queue unbroken, the rendered pass@1
+  reproducible, `run_meta.json` complete and honest about the grading leg,
+  the label consistent, and — with `--bundle` — the
+  `runs/<run_id>/<iid>/{patch.diff,trajectory.jsonl,eval.log}` layout.
+  `scripts/package_submission.py` verifies first, then writes that layout
+  plus `SHA256SUMS` and a reviewer README (the label, the methodology table,
+  the deviations, the reproduction command), refusing a non-empty target
+  unless `--force`.
+- **Durability (B4).** `scripts/archive_run.py` copies a window's artifacts
+  to `--dest` in an append-only bundle and **verifies the copy**
+  (`--verify --bundle …` re-proves it later); `run_window.sh` runs it when
+  `WP6C_ARCHIVE_DEST` is set and exits 5 if the verification fails. This is
+  the fix for the Pilot B artifact deletion (issue #22, closed by waiver).
+- **Zero-quota CI:** `tests/test_pilot_c.py` (the pilot kind, the B2 gate,
+  items 18–23, the meta, the label, the mode-gated import),
+  `tests/test_verify_submission.py` (verify + package, incl. every failure
+  class and a package round-trip through the verifier),
+  `tests/test_run_ops.py` (the window wrapper's exit-code contract against a
+  stub harness **and** a real two-window resume drill against the real
+  harness, the status math, the archive + its verification failures) and
+  `tests/test_pin_verified.py` (the pinned manifest: 500, 12 repos, no
+  duplicates, schema-valid, reproducible).
 
 ## SWE-bench pin (WP0 result)
 
