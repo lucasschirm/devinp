@@ -21,10 +21,10 @@ and the PR for #23 must target `dev`.
 |---|---|
 | `runner.py` (WP3a/b/c) | Sequential queue + overlap guard + `pilot.lock`, budget state machine (`running → budget_exhausted → sleeping(next UTC midnight) → resume`), pass@1-correct `resume_queue`, fail-closed cost-tier gate, pre-flight, post-eval image/container pruning. 2 093 lines, merged. |
 | `live_pilot.py` (WP6a/b) | 4 491 lines: pre-flight → model gate → real `devin acp` session (WP1 `AcpSession` + `SwebenchPolicy`) → leak guard → patch extraction → checkpoint → prune → WP5 report → auto-generated go/no-go checklist (items 1–14; +15–17 for `--pilot b`). Exit codes 0/2/3/4/42. `--interrupt-after` + `--resume` + `--import-run` are the multi-window primitives. |
-| `evaluate.py` (WP4) | Delegates to `python -m swebench.harness.run_evaluation` (`swebench==5.0.2`) on a standard predictions file in a fresh container. Unit-tested; **its container integration tests skip without a Docker daemon** → never executed for real. |
+| `evaluate.py` (WP4) | Delegates to `python -m swebench.harness.run_evaluation` (`swebench==5.0.2`) on a standard predictions file in a fresh container. Unit-tested **and its two Docker-gated integration tests really do run in CI** on `ubuntu-latest` (run 41594305600: *466 passed, 1 skipped* — the lone skip is the `BENCH_LIVE` handshake): the **positive control** (the published `pallets__flask-5014` gold patch → `resolved: true`, with the eval-vs-agent container-id isolation assertion) and the **corruption guard** (truncated patch → `PatchCorruptionError`). A proven grading path — but for **1 of 12 repos**, and with **no agent inside the container**. |
 | `report.py` (WP5) | pass@1 overall + per-repo table + taxonomy + methodology block + `all_preds.jsonl` + `trajs/` + `--check` (R1 referenced-files-exist, R2 patch byte-equality). CLI exit 0/2/3/4. |
 | Pilots | Pilot A **GO** (3 instances, `notes/wp6a-go-no-go.md` — complete record). Pilot B: harness + 25-instance manifest + record file merged; the **live 25-instance record is incomplete** (§0.3). |
-| CI | `.github/workflows/ci.yml` has the Node job, the pack job (bench/ never ships) and the Python job (`pip install -r bench/requirements.lock`, `pytest bench/`); `publish.yml` has `paths-ignore: ['bench/**']`. Baseline at PR #38: 464 passed, 3 skipped, zero quota. |
+| CI | `.github/workflows/ci.yml` has the Node job, the pack job (bench/ never ships) and the Python job (`pip install -r bench/requirements.lock`, `pytest bench/`); `publish.yml` has `paths-ignore: ['bench/**']`. Baseline at the `dev` head (run 41594305600): **466 passed, 1 skipped**, zero quota — and the Docker-gated WP4 controls are among the passes. |
 
 ### 0.2 What issue #23 actually needs that does not exist yet
 
@@ -63,12 +63,18 @@ and the PR for #23 must target `dev`.
   ⇒ Decision D3 (§3): re-run a small stratified **Pilot B′** (12 instances,
   one per repo, container mode) as the first paid step of #23, or explicitly
   waive it and accept a blind 500-instance launch.
-* **The official eval path has never executed.** WP4's positive/negative/
-  isolation controls skip without Docker; Pilots A and B ran **sandbox mode**
-  (a host "host-check": fresh clone + venv + `pip install` + `pytest -rA`),
-  which is *our* grading leg, not `swebench.harness.run_evaluation` with the
-  repo log parsers. A leaderboard/Cognition submission requires the official
-  harness. ⇒ Decision D1 (§3) is the single biggest scope fork of this issue.
+* **Official grading is proven for one instance, and never with an agent in
+  the container.** The WP4 positive control + corruption guard run for real in
+  CI on `ubuntu-latest` — flask-5014 only, the deliberately smallest image.
+  Pilots A and B ran **sandbox mode** (a host "host-check": fresh clone + venv
+  + `pip install` + `pytest -rA`), i.e. *our* grading leg, not
+  `swebench.harness.run_evaluation` with the repo log parsers ⇒ **11 of 12
+  repos' conda environment + log parser are unvalidated**, and WP0 §9's
+  in-image devin smoke (glibc/CA/HTTPS on the Ubuntu 22.04 eval base with the
+  real binary + `_versions` tree mounted, `PATH=/opt/miniconda3/envs/testbed/bin`)
+  is **still open**: no agent has ever run inside an `sweb.eval` image. A
+  leaderboard / Cognition submission needs the official harness on all 12.
+  ⇒ Decision D1 (§3) is the single biggest scope fork of this issue.
 
 ---
 
@@ -317,9 +323,11 @@ Only for option A/C. Steps, each with a recorded number:
    API, `python -V` under `PATH=/opt/miniconda3/envs/testbed/bin`. Closes the
    glibc/CA risk that WP0 left open — a failure here invalidates container
    mode for the whole 500-run and must be known **before** sessions are spent.
-4. **WP4 real controls**: run the Docker-gated tests that have never executed
-   (`tests/test_evaluate.py`: positive control on a known-resolved patch,
-   negative control, corruption guard, isolation) and record them.
+4. **WP4 real controls, off the flask-only comfort zone**: they are green in
+   CI for `pallets__flask-5014`; re-run `tests/test_evaluate.py` on the
+   provisioned host **and extend it to 2–3 heavier repos** (a django and a
+   sympy image) — the first evidence that official grading survives the repos
+   that dominate the 500 (django alone is 231 of them).
 5. **Container-mode 3-instance smoke** (≤ 3 sessions, reuses the Pilot-A
    instances): full adapter path + `evaluate()` + pruning, then
    `verify_submission.py` over the 3-instance checkpoint.
@@ -429,7 +437,7 @@ Only for option A/C. Steps, each with a recorded number:
 |---|---|---|---|
 | Unit | CI every commit | mock only | pinning validation, `--pilot c` config + validation (incl. the mode-gated import refusal), checklist items 18–23, `verify_submission` every-break case, packaging determinism |
 | Integration (mock) | CI every commit | `mock_devin` | the full `--pilot c` pipeline over a 6-instance manifest incl. a synthetic multi-window checkpoint, the SIGKILL+resume drill, report + verify + package end to end |
-| Integration (docker) | CI daily / the §8 host | no | `test_evaluate.py`'s positive/negative/corruption/isolation controls (never executed to date) |
+| Integration (docker) | CI every commit (`ubuntu-latest` has a daemon) + the §8 host | no | `test_evaluate.py`'s positive control + corruption guard (green today for flask-5014; extended to 2–3 heavier repos by §8.4) |
 | Live (gated) | operator, `BENCH_LIVE=1` | yes | the §8.5 3-instance container smoke, the §9 calibration burst + Pilot B′, the §10 500-run |
 
 CI must still never consume quota (PLAN §6): every new live path stays behind
@@ -469,10 +477,10 @@ run is a free-tier-model run); concurrency > 1 (the overlap guard and
    fixtures green. (§6)
 4. A recorded resume drill (kill mid-instance → resume → correct retry
    classes) and a clean per-window driver log format. (§7)
-5. The official eval leg actually executed: `test_evaluate.py`'s Docker
-   controls + the in-image devin smoke + a 3-instance container-mode run —
-   or an operator-waived D1 deviation recorded verbatim in the submission
-   bundle. (§8)
+5. The official eval leg executed beyond flask: the Docker-gated WP4 controls
+   on ≥ 2 additional repos + the in-image devin smoke + a 3-instance
+   container-mode run — or an operator-waived D1 deviation recorded verbatim
+   in the submission bundle. (§8)
 6. `run-full500.jsonl` with 500 unique finals across ≥ 1 UTC window, all
    within the calibrated cap, no duplicate sessions, `pilot.lock`-guarded.
    (§9–§10)
