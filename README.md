@@ -38,6 +38,20 @@ invalid JSON (… 0 bytes)"*. It now works harder to get the whole document:
   that put a temp file first was misplaced; an unwritable or missing `TMPDIR`
   used to cost two extra `devin` runs, and a missing one even reported *"`devin`
   CLI not found in PATH"*.
+- **It runs the `devin` that is actually the CLI.** A bare `devin` means "the
+  first one on `PATH`", and that is not always the CLI: the Devin desktop app
+  ships an Electron launcher with the same name
+  (`/Applications/Devin.app/Contents/MacOS/devin`) that ignores
+  `models list --format json`, prints a warning about Electron/Chromium and
+  exits 0 with nothing on stdout. If your shell reaches the real CLI through an
+  alias, `devin` works for you while devinp (a child process, which cannot see
+  aliases) runs the launcher. So devinp first asks each candidate `--version`
+  and uses the first that answers like `devin <version> (<build>)`. Candidates are
+  every `PATH` entry in order, then `~/.local/bin` (where the CLI installs
+  itself). A skipped candidate is named in a warning. If none qualifies, the
+  bare `devin` is run as before, and if that then fails the error lists what
+  each candidate printed. To fix it at the source, put the CLI first:
+  `export PATH="$HOME/.local/bin:$PATH"`. (Not probed on Windows.)
 - **Retries that take the terminal away from `devin`.** If an attempt yields no
   usable JSON, `devinp` runs `devin` again, each time stripping more of the
   interactive terminal off it:
@@ -67,8 +81,9 @@ invalid JSON (… 0 bytes)"*. It now works harder to get the whole document:
 - If nothing worked, the error lists all three attempts — bytes, exit code,
   stderr, timeout — and how to feed the data in yourself. That always works,
   because a redirect or a pipe makes `devin` write the whole document in one go:
-  (and if it does not, `command -v devin` tells you whether devinp is even
-  talking to the CLI and not to a shell function or agent wrapper around it).
+  (and if it does not, `type -a devin` lists every `devin` the shell knows —
+  aliases and functions included — so you can see whether devinp is even
+  talking to the CLI and not to a launcher or wrapper around it).
 
   ```sh
   devin models list --format json > models.json && devinp --source models.json

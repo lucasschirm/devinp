@@ -4,6 +4,7 @@ import {homedir, tmpdir} from 'node:os'
 import {join} from 'node:path'
 
 import {recoverTruncatedJson} from './repair-json.js'
+import {resolveDevin} from './resolve-devin.js'
 
 // `devin` can be slow on flaky connections — give each lookup plenty of
 // room, but never let devinp hang forever. The budget is per attempt.
@@ -286,12 +287,27 @@ function describeAttempt(attempt, timeoutMs) {
  * "the JSON never reached stdout" points straight at the pager/interactive
  * view that ate it, and the fix that always works — capture it yourself.
  */
-function describeFailure(attempts, timeoutMs) {
+function describeFailure(attempts, timeoutMs, resolution) {
   const bytes = Math.max(...attempts.map((a) => a.bytes), 0)
   const longest = attempts.find((a) => a.bytes === bytes)
   const tail = longest?.raw?.trimEnd().slice(-200) ?? ''
   const lines = []
-  if (bytes === 0) {
+  // No `devin` on PATH answered `--version` like the CLI *and* what ran wrote
+  // nothing: that is a different program (the desktop app's Electron launcher
+  // is the known case), which no amount of re-capturing can fix. A command
+  // that did write output is more likely the CLI with a changed banner.
+  const shadowed = bytes === 0 && resolution && !resolution.explicit && !resolution.verified && resolution.skipped.length > 0
+  if (shadowed) {
+    lines.push(
+      'Unable to get model prices: the `devin` on PATH does not identify itself as the Devin CLI. ' +
+        `Checked: ${resolution.skipped.map((c) => `${c.path} (${c.reason})`).join('; ')}.`,
+    )
+    lines.push(
+      'Another program named `devin` (such as the Devin desktop app\'s launcher) is probably first on PATH. ' +
+        'devinp only sees PATH — a shell alias or function that reaches the real CLI is invisible to it. ' +
+        'Put the real CLI\'s directory first, usually `export PATH="$HOME/.local/bin:$PATH"`.',
+    )
+  } else if (bytes === 0) {
     lines.push(
       'Unable to get model prices: `devin models list --format json` exited without writing ' +
         'the JSON to stdout (0 bytes). devinp re-ran it with paging disabled and in a ' +
@@ -319,7 +335,7 @@ function describeFailure(attempts, timeoutMs) {
   lines.push('Capture the JSON yourself and hand it to devinp — piping or redirecting makes `devin` write the whole document in one go:')
   lines.push('  devin models list --format json > models.json && devinp --source models.json')
   lines.push('  devin models list --format json | devinp --source=-')
-  lines.push('Check `command -v devin` — if that is not the real CLI, devinp is asking the wrong program. If a plain redirect still prints a paged view, update the CLI (`devin update`).')
+  lines.push('Check `type -a devin` — if the first entry is not the real CLI, devinp may be asking the wrong program. If a plain redirect still prints a paged view, update the CLI (`devin update`).')
   return lines.join('\n')
 }
 
@@ -360,26 +376,35 @@ export async function loadModelData({
     }
   }
 
+  // A bare `devin` runs whatever is first on PATH, which can be the desktop
+  // app's Electron launcher instead of the CLI; pick the one that answers
+  // `--version` like the CLI (or fall back to the bare name).
+  const resolution = await resolveDevin({command})
   let outcome
   try {
-    outcome = await runDevinJson({command, timeoutMs})
+    outcome = await runDevinJson({command: resolution.command, timeoutMs})
   } catch (error) {
     if (error.code === 'ENOENT' && error.devinSpawn) {
       throw new Error('Unable to get model prices: `devin` CLI not found in PATH. Install it, or pass --source <file> / --source=- to supply the JSON yourself.')
     }
-    throw new Error(`Unable to get model prices: ${error.message}`)
+    // A command that failed with an error of its own may still be the wrong
+    // program; keep what the version probe saw so that is not a mystery.
+    const unverified = resolution.explicit || resolution.verified || resolution.skipped.length === 0
+      ? ''
+      : ` (no \`devin\` answered --version like the CLI: ${resolution.skipped.map((c) => `${c.path} (${c.reason})`).join('; ')})`
+    throw new Error(`Unable to get model prices: ${error.message}${unverified}`)
   }
 
   if (outcome.parsed != null) {
     // `retries` and `via` let the CLI be honest about a machine that needed
     // the hardening — surprising output is easier to trust when it is named.
-    return {data: assertFamilies(outcome.parsed, 'devin models list'), retries: outcome.attempts.length - 1, via: outcome.via}
+    return {data: assertFamilies(outcome.parsed, 'devin models list'), retries: outcome.attempts.length - 1, via: outcome.via, resolution}
   }
 
   const recovered = recoverTruncatedJson(outcome.raw)
   if (recovered != null) {
-    return {data: assertFamilies(recovered, 'devin models list (recovered)'), truncated: true, retries: outcome.attempts.length - 1, via: outcome.via ?? 'repaired'}
+    return {data: assertFamilies(recovered, 'devin models list (recovered)'), truncated: true, retries: outcome.attempts.length - 1, via: outcome.via ?? 'repaired', resolution}
   }
 
-  throw new Error(describeFailure(outcome.attempts, outcome.timeoutMs))
+  throw new Error(describeFailure(outcome.attempts, outcome.timeoutMs, resolution))
 }
