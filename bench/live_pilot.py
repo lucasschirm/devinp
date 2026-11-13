@@ -126,11 +126,42 @@ DEFAULT_LARGEST_CHECKOUT_BYTES = 1 * 10**9
 PATCH_SIZE_CAP_BYTES = 1024 * 1024
 DEFAULT_INSTANCES_FILE = str(_BENCH_DIR / "pilot_instances.json")
 DEFAULT_B_INSTANCES_FILE = str(_BENCH_DIR / "pilot_b_instances.json")
+#: The #23 queue: the full 500-instance Verified manifest pinned by
+#: ``scripts/pin_verified_instances.py`` (issue #44 E1).
+DEFAULT_C_INSTANCES_FILE = str(_BENCH_DIR / "verified_instances.json")
 BUDGET_FILE = str(_BENCH_DIR / "live_pilot_budget.json")
 #: The go/no-go record names per pilot kind (the early-exit invariant
-#: removes BOTH — a stale verdict from a previous kind in the same
-#: workdir is never kept).
-RECORD_NAMES = {"a": "wp6a-go-no-go.md", "b": "wp6b-pilot-b.md"}
+#: removes ALL of them — a stale verdict from a previous kind in the
+#: same workdir is never kept).
+RECORD_NAMES = {"a": "wp6a-go-no-go.md", "b": "wp6b-pilot-b.md",
+                "c": "wp6c-full-run.md"}
+#: The default workdir per pilot kind (``--workdir`` overrides).
+WORKDIR_NAMES = {"a": "pilot-a", "b": "pilot-b", "c": "full-run"}
+#: The submission label (PLAN-WP6C §3 D5, issue #44 E3). It is what the
+#: ``all_preds.jsonl`` ``model_name_or_path`` carries (the leaderboard /
+#: Cognition handoff label); ``model`` stays ``swe-2-high`` so the
+#: methodology block remains honest about what actually ran.
+SUBMISSION_LABEL = "Devin (agent) on SWE-bench Verified"
+#: The B2 gate (issue #44 P0): ``--pilot c`` refuses to start until the
+#: budget file carries the operator's quota/deadline authorization.
+#: "budget is config, not code" — the code only refuses to spend the
+#: 500 sessions on an unauthorised budget, it never invents one.
+FULL_RUN_BUDGET_FIELDS = ("max_sessions_per_day", "max_wall_per_session",
+                         "calibrated_at", "basis", "authorized_by",
+                         "completion_deadline")
+#: The report-directory file the run meta is persisted to (issue #44
+#: E3) — the methodology inputs are part of the artifact set, and
+#: ``report.py --meta-file`` / ``scripts/verify_submission.py`` re-read
+#: it from here.
+RUN_META_NAME = "run_meta.json"
+
+
+def default_workdir(pilot: str) -> str:
+    """The default workdir of a pilot kind (``--workdir`` overrides).
+    One helper for ``run_pilot`` and ``main`` so the early-exit record
+    invariant and the run itself can never disagree on the path."""
+    return os.path.join(os.getcwd(),
+                       WORKDIR_NAMES.get(pilot, "pilot-a"))
 # The ``--import-run`` id is interpolated into ``run-<id>.jsonl`` —
 # the same charset contract as the SWE-bench instance id (the WP5
 # ``_IID_CHARSET`` / container-name charset, no ``..``): a run id
@@ -233,6 +264,17 @@ class IntentionalInterrupt(PilotError):
     line and are the resume class (PLAN §2.5)."""
 
 
+class WindowCapReached(PilotError):
+    """The calibrated window budget is spent while the queue still has
+    instances (``--stop-at-window-cap``, issue #44 E5). The WP3 runner's
+    default behavior is to *sleep* to the next UTC window and continue in
+    the same process (the WP6a/WP6b contract); a 10–50-day run is instead
+    **one invocation per window** — the process exits 42 with every
+    outcome already checkpointed, and the next window resumes. The
+    sleeper is called only AFTER the checkpoint (the WP3
+    checkpoint-then-sleep order), so nothing is lost by raising here."""
+
+
 class _HostCheckInfra(Exception):
     """A host-check infrastructure failure (the ``eval_error``
     class). Carries the AC3 root-cause class (issue #22):
@@ -268,14 +310,24 @@ class PilotConfig:
     pilot: str = "a"  # "a" (the WP6a 3-instance gate) | "b" (issue #22)
     import_run: Optional[str] = None  # the source run id (issue #22 AC2)
     import_workdir: Optional[str] = None  # its workdir (default: this run's)
+    #: the B2 authorization file (issue #44). Empty resolves to
+    #: ``BUDGET_FILE`` at construction time — a dataclass default would
+    #: freeze the module constant and a test/operator override could
+    #: never reach the gate
+    budget_file: str = ""
+    #: the E5 per-window operating model: stop at the window cap (exit
+    #: 42, resume in the next window) instead of sleeping in-process
+    stop_at_window_cap: bool = False
 
     def __post_init__(self) -> None:
+        if not self.budget_file:
+            self.budget_file = BUDGET_FILE
         if self.mode not in ("container", "sandbox"):
             raise PilotConfigError(
                 f"mode must be 'container' or 'sandbox' (got {self.mode!r})")
-        if self.pilot not in ("a", "b"):
+        if self.pilot not in ("a", "b", "c"):
             raise PilotConfigError(
-                f"pilot must be 'a' or 'b' (got {self.pilot!r})")
+                f"pilot must be 'a', 'b' or 'c' (got {self.pilot!r})")
         if self.import_run is not None and not isinstance(
                 self.import_run, str):
             raise PilotConfigError(
@@ -321,10 +373,17 @@ class PilotConfig:
                 and self.import_run is None):
             raise PilotConfigError(
                 "--import-workdir requires --import-run")
-        if (self.import_run is not None and self.pilot != "b"):
+        # the pairing (round-2 of issue #44): ``--import-run`` is the
+        # never-rerun reuse. It is verified by items 15–17 under
+        # --pilot b and by the completeness item 18 under --pilot c
+        # (importing the already-spent pilot instances is exactly how
+        # the 500-run avoids re-spending them); under --pilot a neither
+        # renders, so a seeded import would go unverified — refused
+        if (self.import_run is not None and self.pilot == "a"):
             raise PilotConfigError(
-                "--import-run is the pilot-B import (items 15–17 "
-                "verify it — they do not render under --pilot a)")
+                "--import-run is a pilot-B/pilot-C import (items "
+                "15–17 verify it under --pilot b, item 18 under "
+                "--pilot c — neither renders under --pilot a)")
         # ``--host-check`` is a sandbox-mode flag (the documented no-
         # container fallback) — in container mode the eval leg is the
         # official WP4 harness, and the flag would be accepted but
@@ -341,6 +400,10 @@ class PilotConfig:
                 raise PilotConfigError(
                     "interrupt_after must be an int >= 1 "
                     f"(got {self.interrupt_after!r})")
+        if not isinstance(self.stop_at_window_cap, bool):
+            raise PilotConfigError(
+                "stop_at_window_cap must be a bool (got "
+                f"{self.stop_at_window_cap!r})")
         if self.host_check is None:
             self.host_check = self.mode == "sandbox"
         if (isinstance(self.max_sessions_per_day, bool)
@@ -581,6 +644,32 @@ def _validate_imported_line(rec: dict, iid: str,
                 f"workdir)")
 
 
+def source_run_mode(import_workdir: str, run_id: str) -> "Optional[str]":
+    """The grading mode a source run recorded (the ``--import-run``
+    mode gate, issue #44 E2). Two places carry it, newest first: the
+    persisted methodology meta (``report/run_meta.json`` — the WP6c E3
+    artifact) and the run's state file (``pilot-<id>.state.json``).
+    ``None`` = neither records it (a run from before the meta was
+    persisted — the mode of an old checkpoint is genuinely unknown).
+    Unreadable / malformed evidence is "no evidence", never a guess.
+    """
+    for path, key in ((os.path.join(import_workdir, "report",
+                                   RUN_META_NAME), "mode"),
+                     (os.path.join(import_workdir,
+                                  f"pilot-{run_id}.state.json"),
+                      "mode")):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(data, dict):
+            v = data.get(key)
+            if v in ("container", "sandbox"):
+                return v
+    return None
+
+
 def load_imported(config: PilotConfig, workdir: str,
                   insts: list) -> "tuple[dict, dict]":
     """The WP6b checkpoint import (issue #22 AC2 — the 2-run overlap
@@ -626,6 +715,34 @@ def load_imported(config: PilotConfig, workdir: str,
             f"--import-run source not found: {src!r} (the import is "
             "fail-closed — a missing / corrupt source is a config "
             "error before the pre-flight)")
+    # the grading-leg gate (issue #44 E2): a sandbox-mode ``resolved``
+    # (our host check) and a container-mode ``resolved`` (the official
+    # harness) are two DIFFERENT claims. Importing one into the other's
+    # run would silently mix them in one pass@1 — and the imported lines
+    # are never re-run, so nothing later can separate them. The source's
+    # mode is read from its own persisted evidence; --pilot c (the
+    # submission-bound 500-run) additionally refuses a source whose mode
+    # is unknown, because a pass@1 it cannot attribute is not a pass@1
+    # it can publish.
+    src_mode = source_run_mode(config.import_workdir or workdir,
+                              config.import_run)
+    if src_mode is not None and src_mode != config.mode:
+        raise PilotConfigError(
+            f"--import-run {config.import_run!r} ran in "
+            f"{src_mode!r} mode; this run is {config.mode!r} — the two "
+            "grading legs must never be mixed in one pass@1 (a "
+            "sandbox-mode host-check `resolved` is not an official-"
+            "harness `resolved`, and the imported lines are never "
+            "re-run). Import it into a run of the same --mode "
+            "(issue #44 E2)")
+    if src_mode is None and config.pilot == "c":
+        raise PilotConfigError(
+            f"--import-run {config.import_run!r} recorded no grading "
+            "mode (no report/run_meta.json, no mode in its state "
+            "file) — a --pilot c pass@1 may not absorb evidence it "
+            "cannot attribute to a grading leg (issue #44 E2). Re-run "
+            "the source with a harness that persists the run meta "
+            "(WP6c E3), or start --pilot c without the import")
     try:
         src_records, _ = rr.load_checkpoint(src)
     except rr.RunnerProtocolError as exc:
@@ -2432,6 +2549,298 @@ def calibrate(records: list, config: PilotConfig) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# the WP6c full-run items 18–23 (issue #44 E2 / PLAN-WP6C §5)
+# ---------------------------------------------------------------------------
+
+def build_full_run_items(ev: dict, config: PilotConfig) -> list:
+    """The ``--pilot c`` items 18–23 (PLAN-WP6C §5), rendered from the
+    evidence dict :func:`gather_full_run_evidence` produces.
+
+    **Absent evidence is never a pass**: a key the gatherer did not fill
+    renders the item ``n/a`` (``pass=None``) with the missing key named,
+    so a checklist can only GO on evidence that was actually gathered."""
+    items: list = []
+
+    def add(num: str, name: str, expected: str, observed: str,
+           passed: "Optional[bool]") -> None:
+        items.append({"item": f"{num} {name}", "expected": expected,
+                     "observed": observed, "pass": passed})
+
+    def missing(*keys: str) -> "list[str]":
+        return [k for k in keys if ev.get(k) is None]
+
+    # 18 — completeness vs the manifest
+    keys = ("manifest_total", "covered", "missing_ids", "unknown_ids",
+            "retry_pending")
+    if missing(*keys):
+        add("18", "completeness vs the manifest (WP6c)",
+            "every manifest id has exactly one final line, no final id "
+            "outside the manifest, no retry-class final pending",
+            f"n/a (evidence not gathered: {', '.join(missing(*keys))})",
+            None)
+    else:
+        n = ev["manifest_total"]
+        cov = ev["covered"]
+        miss = ev["missing_ids"]
+        unk = ev["unknown_ids"]
+        pend = ev["retry_pending"]
+        add("18", "completeness vs the manifest (WP6c)",
+            f"all {n} manifest instances have a final line; no final "
+            "instance id outside the manifest; no retry-class final "
+            "(quota_limited / eval_error / preflight_failed) left "
+            "pending — resolve by --resume",
+            f"{cov}/{n} covered; {len(miss)} missing"
+            + (f" ({', '.join(sorted(miss)[:5])})" if miss else "")
+            + f"; {len(unk)} id(s) outside the manifest"
+            + (f" ({', '.join(sorted(unk)[:5])})" if unk else "")
+            + f"; {len(pend)} pending retry-class"
+            + (f" ({', '.join(sorted(pend)[:5])})" if pend else ""),
+            cov == n and not unk and not pend)
+
+    # 19 — artifact integrity
+    keys = ("report_violations", "trajs_expected", "trajs_missing")
+    if missing(*keys):
+        add("19", "artifact integrity (WP6c)",
+            "report.check clean (R1 referenced files exist + R2 "
+            "all_preds.jsonl ≡ patch.diff) and trajs/ complete",
+            f"n/a (evidence not gathered: {', '.join(missing(*keys))})",
+            None)
+    else:
+        v = ev["report_violations"]
+        tm = ev["trajs_missing"]
+        add("19", "artifact integrity (WP6c)",
+            "``report.check`` returns no violation (R1 every referenced "
+            "file exists + the resolved/failed_test ⇒ patch.diff rule + "
+            "R2 all_preds.jsonl ≡ patch.diff byte-for-byte) and trajs/ "
+            "holds one file per instance whose line references a "
+            "trajectory",
+            f"report.check: {len(v)} violation(s)"
+            + (f" — {'; '.join(v[:3])}" if v else "")
+            + f"; trajs/ {ev['trajs_expected'] - len(tm)}"
+            f"/{ev['trajs_expected']}"
+            + (f" missing: {', '.join(sorted(tm)[:5])}" if tm else ""),
+            not v and not tm)
+
+    # 20 — methodology completeness
+    keys = ("meth_unknown", "meth_sessions", "attempt_sessions")
+    if missing(*keys):
+        add("20", "methodology completeness (WP6c)",
+            "no methodology field renders 'unknown'; sessions_used == "
+            "the checkpoint attempt count",
+            f"n/a (evidence not gathered: {', '.join(missing(*keys))})",
+            None)
+    else:
+        unk = ev["meth_unknown"]
+        add("20", "methodology completeness (WP6c)",
+            "none of the 11 methodology fields renders ``unknown`` and "
+            "the report's sessions-used equals the checkpoint attempt "
+            "count (the persisted run_meta.json is the methodology's "
+            "input — issue #44 E3)",
+            f"unknown fields: "
+            + (", ".join(unk) if unk else "none")
+            + f"; sessions_used {ev['meth_sessions']} vs attempts "
+              f"{ev['attempt_sessions']}",
+            not unk and ev["meth_sessions"] == ev["attempt_sessions"])
+
+    # 21 — the pass@1 ⟷ per-repo cross-check
+    keys = ("pass1", "md_parsed", "outcome_finals")
+    if missing(*keys):
+        add("21", "pass@1 cross-check (WP6c)",
+            "overall == Σ per-repo == the rendered report; denominator "
+            "== TERMINAL − retry-class",
+            f"n/a (evidence not gathered: {', '.join(missing(*keys))})",
+            None)
+    else:
+        p1 = ev["pass1"]
+        ov = p1["overall"]
+        per = p1["per_repo"]
+        sum_res = sum(c["resolved"] for c in per.values())
+        sum_ter = sum(c["terminal"] for c in per.values())
+        arith = (sum_res == ov["resolved"] and sum_ter == ov["terminal"])
+        md_ov, md_rows = ev["md_parsed"]
+        denom = ov["terminal"] == ev["outcome_finals"]
+        # the rendered view must agree with the recomputation (a render
+        # drift would publish a number the checkpoint does not hold)
+        render_ok = md_ov is not None and (
+            md_ov["resolved"], md_ov["terminal"], md_ov["pct"]) == (
+            ov["resolved"], ov["terminal"], ov["pct"])
+        for repo, c in per.items():
+            row = md_rows.get(repo)
+            render_ok = (render_ok and row is not None
+                        and row == (c["resolved"], c["terminal"],
+                                    c["pct"]))
+        for repo in md_rows:
+            render_ok = render_ok and repo in per
+        add("21", "pass@1 cross-check (WP6c)",
+            "overall resolved/terminal == Σ over the per-repo table == "
+            "the rendered report.md (both the overall line and every "
+            "table row); the denominator is TERMINAL − the retry class "
+            "(PLAN §2.5)",
+            f"overall {ov['resolved']}/{ov['terminal']} ({ov['pct']}); Σ "
+            f"per-repo {sum_res}/{sum_ter}; Σ legitimate outcomes "
+            f"{ev['outcome_finals']}; rendered "
+            + ("AGREES" if render_ok else "DISAGREES")
+            + (f" (md overall {md_ov}, {len(md_rows)} row(s))"),
+            arith and denom and render_ok)
+
+    # 22 — the submission label
+    keys = ("preds_lines", "preds_bad_label", "header_has_label")
+    if missing(*keys):
+        add("22", "submission label (WP6c)",
+            f'every all_preds.jsonl line carries "{SUBMISSION_LABEL}"',
+            f"n/a (evidence not gathered: {', '.join(missing(*keys))})",
+            None)
+    else:
+        bad = ev["preds_bad_label"]
+        add("22", "submission label (WP6c)",
+            f"every ``all_preds.jsonl`` line's ``model_name_or_path`` == "
+            f"\"{SUBMISSION_LABEL}\" (issue #44 E3 / PLAN-WP6C §3 D5) "
+            "and the report header carries the label",
+            f"{ev['preds_lines']} preds line(s), {len(bad)} without the "
+            "label"
+            + (f" ({', '.join(sorted(bad)[:5])})" if bad else "")
+            + f"; report header label: "
+            + ("present" if ev["header_has_label"] else "MISSING"),
+            ev["preds_lines"] > 0 and not bad
+            and bool(ev["header_has_label"]))
+
+    # 23 — batch discipline
+    keys = ("windows", "max_window_sessions", "max_window_wall_s",
+           "single_session_ok")
+    if missing(*keys):
+        add("23", "batch discipline (WP6c)",
+            "≥ 1 UTC window; every window ≤ the caps; never two live "
+            "sessions",
+            f"n/a (evidence not gathered: {', '.join(missing(*keys))})",
+            None)
+    else:
+        wins = ev["windows"]
+        wall_budget = config.max_wall_s * config.max_sessions_per_day
+        add("23", "batch discipline (WP6c)",
+            f"the run spans ≥ 1 UTC window; every window ≤ "
+            f"{config.max_sessions_per_day} sessions and ≤ "
+            f"{wall_budget:.0f}s wall (the item-12 math restated for the "
+            "batch plan); at most one session ever live (the WP3 "
+            "overlap guard + the ``pilot.lock`` process lock — no "
+            "OverlapError / ProcessLockBusy / abort in the invocation)",
+            f"{len(wins)} UTC window(s); max "
+            f"{ev['max_window_sessions']} session(s) and "
+            f"{ev['max_window_wall_s']:.1f}s in one window; single-live-"
+            f"session guard clean: {ev['single_session_ok']}",
+            len(wins) >= 1
+            and ev["max_window_sessions"] <= config.max_sessions_per_day
+            and ev["max_window_wall_s"] <= wall_budget
+            and bool(ev["single_session_ok"]))
+    return items
+
+
+def gather_full_run_evidence(*, config: PilotConfig, jsonl: str,
+                            report_dir: str, meta: dict,
+                            finals: "dict[str, dict]",
+                            records: list, manifest_ids: "list[str]",
+                            buckets: dict,
+                            aborted: bool) -> dict:
+    """The filesystem-side evidence for items 18–23 (the pure renderer
+    is :func:`build_full_run_items`). Never raises: an evidence source
+    that cannot be read is recorded as a violation string / a missing
+    key, so a broken artifact fails the item instead of crashing the
+    verdict (the report step already failed the run if it could not
+    write)."""
+    ev: dict = {}
+    ids = set(manifest_ids)
+    ev["manifest_total"] = len(ids)
+    ev["covered"] = sum(1 for iid in ids if iid in finals)
+    ev["missing_ids"] = sorted(iid for iid in ids if iid not in finals)
+    ev["unknown_ids"] = sorted(iid for iid in finals if iid not in ids)
+    ev["retry_pending"] = sorted(iid for iid, r in finals.items()
+                                if r.get("status")
+                                in rr.RETRY_STATUSES)
+
+    # R1 + R2 through the WP5 checker itself (the same contract the
+    # submission verifier re-runs, not a re-implementation of it)
+    try:
+        ev["report_violations"] = list(rep.check(jsonl, report_dir, meta))
+    except rep.ReportError as exc:
+        ev["report_violations"] = [f"report.check raised "
+                                  f"{type(exc).__name__}: {exc}"]
+    trajs_dir = os.path.join(report_dir, "trajs")
+    expected = [iid for iid, r in finals.items()
+               if _meta_of(r).get("trajectory")]
+    ev["trajs_expected"] = len(expected)
+    ev["trajs_missing"] = [iid for iid in expected
+                          if not os.path.isfile(
+                              os.path.join(trajs_dir, f"{iid}.jsonl"))]
+
+    # the methodology block (re-rendered from the persisted meta) + the
+    # sessions-used reconciliation (the WP5 basis: attempt lines, the
+    # pre-flight class excluded — it started no session)
+    meth = rep.methodology(meta, records)
+    ev["meth_unknown"] = sorted(k for k, v in meth.items()
+                               if v == "unknown")
+    ev["meth_sessions"] = int(re.sub(r"[^0-9]", "", meth["sessions_used"])
+                             or 0)
+    ev["attempt_sessions"] = sum(
+        1 for r in records
+        if r.get("instance_id") and r.get("status") != "preflight_failed")
+
+    # the pass@1 ⟷ per-repo reconciliation, recomputed from the finals
+    # (not from the markdown) + the rendered view
+    p1 = rep.pass1(finals)
+    ev["pass1"] = p1
+    ev["outcome_finals"] = sum(1 for r in finals.values()
+                              if r.get("status") in rep.PASS1_OUTCOMES)
+    md = ""
+    try:
+        with open(os.path.join(report_dir, "report.md"), "r",
+                  encoding="utf-8") as f:
+            md = f.read()
+    except OSError as exc:
+        md = ""
+        ev["report_md_error"] = str(exc)
+    # the rendered view — parsed by the module that renders it (one
+    # parser for one format, so the cross-check cannot drift from the
+    # report it verifies)
+    ev["md_parsed"] = rep.parse_report_pass1(md)
+
+    # the submission label on every preds line + in the header
+    preds = os.path.join(report_dir, "all_preds.jsonl")
+    bad: "list[str]" = []
+    n_lines = 0
+    try:
+        with open(preds, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                n_lines += 1
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    bad.append("<unparseable line>")
+                    continue
+                if rec.get("model_name_or_path") != SUBMISSION_LABEL:
+                    bad.append(str(rec.get("instance_id")))
+    except OSError as exc:
+        bad.append(f"<unreadable: {exc}>")
+    ev["preds_lines"] = n_lines
+    ev["preds_bad_label"] = bad
+    ev["header_has_label"] = (SUBMISSION_LABEL in md) if md else None
+
+    # the batch discipline view
+    ev["windows"] = buckets
+    ev["max_window_sessions"] = max(
+        (w["sessions"] for w in buckets.values()), default=0)
+    ev["max_window_wall_s"] = max(
+        (float(w["wall_s"]) for w in buckets.values()), default=0.0)
+    # the single-live-session contract is enforced live by the WP3
+    # OverlapGuard + the pilot.lock ProcessLock (an overlap raises and
+    # aborts the invocation) — so "no abort" IS the evidence that no
+    # overlap was ever asserted
+    ev["single_session_ok"] = not aborted
+    return ev
+
+
+# ---------------------------------------------------------------------------
 # the go/no-go checklist (issue #21 AC4)
 # ---------------------------------------------------------------------------
 
@@ -2454,7 +2863,9 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
                    import_provenance: str = "",
                    repo_by_iid: "Optional[dict]" = None,
                    arithmetic_total: int = 3,
-                   window_buckets: "Optional[dict]" = None) -> list:
+                   window_buckets: "Optional[dict]" = None,
+                   pilot_c: bool = False,
+                   full_run: "Optional[dict]" = None) -> list:
     """The go/no-go checklist (PLAN-WP6A.md — 14 items; PLAN-WP6B.md
     — 17 for a ``--pilot b`` run: 15 stratification (AC1), 16 the
     2-run overlap/variance (AC2), 17 the root-caused ``eval_error``
@@ -2479,7 +2890,13 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
                      "observed": observed, "pass": passed})
 
     if dry_run:
-        for i in range(1, 15 + (3 if pilot_b else 0)):
+        # the WP6a 1–14 + (pilot b) 15–17 + (pilot c) 18–23 skeleton
+        nums = list(range(1, 15))
+        if pilot_b:
+            nums += [15, 16, 17]
+        if pilot_c:
+            nums += [18, 19, 20, 21, 22, 23]
+        for i in nums:
             add(f"{i} (dry run)", "see PLAN-WP6A.md", "n/a (dry run)",
                 None)
         return items
@@ -2714,7 +3131,7 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
     # prior lines — while resume_after_interrupt was still
     # False)
     elif interrupted_this_run:
-        obs = (f"interrupted after "
+        obs = (f"{interrupted_this_run.get('kind', 'interrupted')} after "
                f"{interrupted_this_run.get('completed')} instance(s); "
                "the resume invocation must follow")
         p = None
@@ -2809,6 +3226,28 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
         "post-session)",
         "; ".join(leak_obs) or "no instances",
         (leak_ok and bool(records)) if records else devin_ok)
+
+    # the WP6c full-run items (issue #44 E2 / PLAN-WP6C §5) — appended
+    # for a ``--pilot c`` run only. The pilot-B AC items 15–17 render an
+    # explicit ``n/a`` here: the 500-run is not a stratified pilot (its
+    # manifest IS all 12 repos) and its completeness statement is item
+    # 18, which is strictly stronger (every manifest id has a final
+    # line). The WP6a/WP6b contracts are untouched.
+    if pilot_c:
+        for num, what in (("15", "stratification (the pilot-B 25-"
+                                 "instance AC1 statement)"),
+                         ("16", "2-run overlap/variance (the pilot-B "
+                                 "AC2 statement)"),
+                         ("17", "eval_error root-caused (the pilot-B "
+                                 "AC3 statement)")):
+            add(f"{num} {what}",
+                "the stratified-pilot evidence set",
+                "n/a (a --pilot c run is the full 500-instance run — "
+                "item 18 (completeness) and item 23 (batch "
+                "discipline) are its stronger, non-pilot forms)",
+                None)
+        items.extend(build_full_run_items(full_run or {}, config))
+        return items
 
     # the WP6b items (issue #22 — appended for a ``--pilot b`` run
     # only; the WP6a 14-item contract + the
@@ -2959,7 +3398,7 @@ def build_checklist(*, config: PilotConfig, dry_run: bool,
     return items
 
 
-def _verdict(items: list, interrupted: bool = False,
+def _verdict(items: list, interrupted=False,
              gating: "Optional[frozenset]" = None) -> "tuple[str, list]":
     """GO ⟺ all gating items pass (the WP6a 14-item set by default —
     1–12 + 14, item 13 non-gating; the ``gating`` parameter extends
@@ -2973,7 +3412,12 @@ def _verdict(items: list, interrupted: bool = False,
     resume invocation would silently supersede. The pair's verdict
     is the resume invocation's."""
     if interrupted:
-        return ("n/a (interrupted — resume to complete)", [])
+        # ``interrupted`` is True for the crash/interrupt class, or the
+        # boundary text for another incomplete-window class (the E5
+        # window-cap stop) — a partial record never decides anything
+        return ("n/a (" + (interrupted if isinstance(interrupted, str)
+                          else "interrupted — resume to complete") + ")",
+                [])
     if gating is None:
         gating = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "10",
                  "11", "12", "14"}  # 13 excluded (non-gating)
@@ -2984,6 +3428,14 @@ def _verdict(items: list, interrupted: bool = False,
         return ("n/a", [])
     failed = [i["item"] for i in decided if i["pass"] is not True]
     return ("NO-GO" if failed else "GO", failed)
+
+
+def _interrupt_note(window_cap: bool) -> str:
+    """The verdict's reason for an incomplete window (issue #44 E5): a
+    window-cap stop is the operator's per-window model, not a crash, and
+    the record says so."""
+    return ("window cap reached — resume in the next window"
+            if window_cap else "interrupted — resume to complete")
 
 
 def _render_pilot_b_sections(wp6b: dict) -> list:
@@ -3099,7 +3551,7 @@ def _render_pilot_b_sections(wp6b: dict) -> list:
 def render_checklist_md(items: list, config: PilotConfig,
                        calibration: "Optional[dict]",
                        meta: dict, title: str,
-                       interrupted: bool = False,
+                       interrupted=False,
                        gating: "Optional[frozenset]" = None) -> str:
     verdict, failed = _verdict(items, interrupted=interrupted,
                               gating=gating)
@@ -3268,8 +3720,11 @@ def _remove_stale_record(workdir: str) -> None:
 
 
 def _pilot_title(config: PilotConfig) -> str:
-    return ("WP6b Pilot B (issue #22)" if config.pilot == "b"
-            else "WP6a Pilot A (issue #21)")
+    return {"b": "WP6b Pilot B (issue #22)",
+            # the #23 record — the WP6c pre-flight (issue #44 E2)
+            "c": "WP6c Full Run — 500 Verified instances "
+                 "(issue #23)"}.get(config.pilot,
+                                    "WP6a Pilot A (issue #21)")
 
 
 def _stratified_repos(config: PilotConfig) -> "Optional[list]":
@@ -3337,12 +3792,65 @@ def _window_day_str(day: int) -> str:
 
 def _pilot_gating(config: PilotConfig) -> frozenset:
     """The gating item set (the WP6a 14-item set; pilot B adds the
-    AC1–AC3 items 15/16/17 — item 13 stays non-gating in both)."""
+    AC1–AC3 items 15/16/17; pilot C adds the full-run items 18–23 —
+    item 13 stays non-gating in all three)."""
     base = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "10",
             "11", "12", "14"}
     if config.pilot == "b":
         base |= {"15", "16", "17"}
+    if config.pilot == "c":
+        base |= {"18", "19", "20", "21", "22", "23"}
     return frozenset(base)
+
+
+def require_full_run_authorization(budget: dict,
+                                  path: str = BUDGET_FILE) -> None:
+    """The B2 gate (issue #44 P0 — "no session may start until every
+    P0 is closed"). ``--pilot c`` is the 500-session spend, so it
+    refuses (config error, exit 2, before any session) unless the
+    calibrated budget file exists and carries the operator's
+    authorization of the quota and the deadline.
+
+    The code never invents a cap: it reads ``max_sessions_per_day`` /
+    ``max_wall_per_session`` from the file like every other pilot, and
+    additionally requires ``authorized_by`` / ``completion_deadline`` /
+    ``basis`` / ``calibrated_at`` to be filled in (a placeholder such as
+    the committed ``PENDING (issue #44 B2)`` is not an authorization).
+    A ``--pilot a``/``--pilot b`` run is unaffected — the gate is on the
+    500-session invocation, not on a 3-instance smoke.
+    """
+    if not budget:
+        raise PilotConfigError(
+            f"--pilot c is the 500-session run and requires the "
+            f"authorized budget file {path!r} (issue #44 B2: "
+            "sessions/window + the completion deadline + the abort rule "
+            "recorded by the operator). It is missing — no session may "
+            "start on an unauthorised budget")
+    def unauthorised(v) -> bool:
+        """Absent, empty, a bool, a non-positive number or a ``PENDING``
+        placeholder — none of them is an authorization."""
+        if isinstance(v, bool):
+            return True
+        if isinstance(v, str):
+            s = v.strip()
+            return not s or s.upper().startswith("PENDING")
+        if isinstance(v, (int, float)):
+            return v <= 0
+        return True
+
+    missing = [k for k in FULL_RUN_BUDGET_FIELDS
+               if unauthorised(budget.get(k))]
+    if missing:
+        raise PilotConfigError(
+            f"--pilot c is the 500-session run: {path} must carry "
+            f"{', '.join(missing)} filled in by the operator (issue "
+            "#44 B2 — the committed file is the UNAUTHORISED template; "
+            "a 'PENDING …' value is not an authorization)")
+    if budget.get("cost_tier") not in (None, "Free"):
+        raise PilotConfigError(
+            f"{path} declares cost_tier {budget.get('cost_tier')!r} — "
+            "the run is a free-tier-model run (the fail-closed model "
+            "gate stays; issue #44 B2.2)")
 
 
 def _pilot_b_sections(config: PilotConfig, insts: list, records: list,
@@ -3696,11 +4204,23 @@ def run_pilot(config: PilotConfig,
     ``make_session`` seam — e.g. the WP2 ``mock_devin``; the CLI calls
     it with the real one). Returns the exit code."""
     require_live(config.dry_run)
+    # the B2 gate (issue #44): the 500-session invocation refuses an
+    # unauthorised budget. A --dry-run is not gated (it spends nothing,
+    # and validating the 500-instance invocation is how the operator
+    # prepares the authorization) — but it says so, in the same words a
+    # live invocation would refuse with.
+    if config.pilot == "c":
+        try:
+            require_full_run_authorization(
+                load_budget_file(config.budget_file), config.budget_file)
+        except PilotConfigError as exc:
+            if not config.dry_run:
+                raise
+            print(f"[pilot] NOTE (dry run only): {exc}")
     insts = load_instances(config.instances_file)
     run_id = config.run_id or time.strftime("pilot-%Y%m%d-%H%M%S")
     config.run_id = run_id
-    workdir = config.workdir or os.path.join(
-        os.getcwd(), "pilot-b" if config.pilot == "b" else "pilot-a")
+    workdir = config.workdir or default_workdir(config.pilot)
     config.workdir = workdir
     os.makedirs(workdir, exist_ok=True)
     jsonl = os.path.join(workdir, f"run-{run_id}.jsonl")
@@ -3788,6 +4308,7 @@ def run_pilot(config: PilotConfig,
             wall_budget_s=config.max_wall_s
             * config.max_sessions_per_day, wall_used_s=0.0,
             pilot_b=config.pilot == "b",
+            pilot_c=config.pilot == "c",
             stratified_repos=_stratified_repos(config),
             imported=imported, repo_by_iid=_repo_by_iid(insts))
         _remove_stale_record(workdir)  # the skeleton replaces the last
@@ -4084,6 +4605,17 @@ def run_pilot(config: PilotConfig,
     ckpt = rr.JsonlCheckpoint(jsonl)
     rep_ = PilotReporter(ckpt, meta_by_instance, on_instance_done=_on_done)
 
+    def _stop_at_cap(seconds: float) -> None:
+        # the E5 per-window model: the WP3 default sleeps to the next UTC
+        # window and CONTINUES in this process (the WP6a/WP6b contract,
+        # right for a 3- or 25-instance pilot). A 500-session run is one
+        # invocation per window (scripts/run_window.sh): the checkpoint is
+        # already written when the sleeper is called (the WP3
+        # checkpoint-then-sleep order), so stopping here loses nothing.
+        raise WindowCapReached(
+            f"the window budget is spent with the queue non-empty; the "
+            f"next UTC window opens in {seconds:.0f}s — resume then")
+
     runner = rr.Runner(
         to_run, _session_factory,
         config=rr.BudgetConfig(
@@ -4092,9 +4624,12 @@ def run_pilot(config: PilotConfig,
             daily_pause=config.daily_pause_s),
         reporter=rep_,
         preflight=pf,
-        lock_file=os.path.join(workdir, "pilot.lock"))
+        lock_file=os.path.join(workdir, "pilot.lock"),
+        sleeper=(_stop_at_cap if config.stop_at_window_cap
+                 else time.sleep))
 
     interrupted = False
+    window_cap = False
     run_failed = False
     aborted = False
     try:
@@ -4107,6 +4642,13 @@ def run_pilot(config: PilotConfig,
             # renders for an aborted run (an abort is the host-crash
             # class: the operator fixes and resumes)
             aborted = True
+    except WindowCapReached as exc:
+        # an incomplete window is the resume class: no verdict is decided
+        # here (the completing invocation decides it), the state records
+        # the boundary, and the operator gets the resume hint
+        interrupted = True
+        window_cap = True
+        print(f"[pilot] WINDOW CAP (exit {EXIT_INTERRUPT}): {exc}")
     except IntentionalInterrupt as exc:
         interrupted = True
         print(f"[pilot] INTERRUPT (exit {EXIT_INTERRUPT}): {exc}")
@@ -4120,6 +4662,10 @@ def run_pilot(config: PilotConfig,
     _write_state(workdir, run_id, {
         "run_id": run_id, "mode": config.mode, "model": config.model,
         "devin_cli_version": ver, "interrupted": interrupted,
+        # the E5 boundary kind: a window-cap stop is an interrupted
+        # invocation that was NOT a crash and NOT the --interrupt-after
+        # drill (the operator's per-window model)
+        "window_cap": window_cap,
         "aborted": aborted,
         "resume_exercised": resume_exercised,
         "final_state": ("aborted" if aborted
@@ -4198,6 +4744,24 @@ def run_pilot(config: PilotConfig,
     cal = calibrate(attempts, config)
     meta = {
         "run_id": run_id,
+        # the submission label + the grading leg (issue #44 E3 / D1 / D5):
+        # report._model_name_or_path picks model_name_or_path for every
+        # all_preds.jsonl line, and `label` is what the report header
+        # renders. `mode` is the D1 honesty record (which leg produced
+        # this number) — verify_submission.py prints it in the bundle
+        "label": SUBMISSION_LABEL,
+        "model_name_or_path": SUBMISSION_LABEL,
+        "mode": config.mode,
+        "grading_leg": (
+            "official swebench.harness.run_evaluation (WP4) in the "
+            "published sweb.eval image"
+            if config.mode == "container" else
+            "host check (fresh clone + venv + pytest -rA) — NOT the "
+            "official harness: an internal estimate, disclose it "
+            "(PLAN-WP6C §3 D1 option B)"),
+        "pilot": config.pilot,
+        "instances_file": os.path.basename(config.instances_file),
+        "manifest_instances": len(insts),
         "devin_cli_version": ver,
         "model": config.model,
         "cost_tier": gate_res.cost_tier,
@@ -4214,9 +4778,20 @@ def run_pilot(config: PilotConfig,
                    "swebench/sweb.eval.x86_64.* (one per instance)"),
     }
     report_failed = False
+    rep_dir = os.path.join(workdir, "report")
     try:
-        rep.generate(jsonl, os.path.join(workdir, "report"), meta)
+        # the methodology meta is PART of the artifact set (issue #44
+        # E3): written before the report so the report's own inputs are
+        # on disk, and re-readable by `report.py --meta-file`,
+        # `scripts/verify_submission.py` and a later window
+        os.makedirs(rep_dir, exist_ok=True)
+        with open(os.path.join(rep_dir, RUN_META_NAME), "w",
+                  encoding="utf-8", newline="") as f:
+            json.dump(meta, f, indent=2, sort_keys=True)
+            f.write("\n")
+        rep.generate(jsonl, rep_dir, meta)
         print("[pilot] WP5 report: ok")
+        print(f"[pilot] run meta: {os.path.join(rep_dir, RUN_META_NAME)}")
     except rep.ReportError as exc:
         # a failed report pipeline (ArtifactCheckError / generate
         # failure) is a run failure — a corrupt report can never yield
@@ -4289,7 +4864,9 @@ def run_pilot(config: PilotConfig,
         records=inst_records, attempt_records=attempts,
         skipped_on_resume=skipped_on_resume,
         interrupted_this_run=None if not interrupted
-        else {"completed": rep_.done_count},
+        else {"completed": rep_.done_count,
+              "kind": ("window cap reached" if window_cap
+                       else "interrupted")},
         resume_after_interrupt=(interrupted_before
                                or resume_exercised_before),
         devin_ok=bool(inst_records) and not run_failed,
@@ -4303,6 +4880,17 @@ def run_pilot(config: PilotConfig,
         wall_budget_s=config.max_wall_s * config.max_sessions_per_day,
         wall_used_s=wall_used_s,
         pilot_b=config.pilot == "b",
+        # the WP6c full-run items 18–23 (issue #44 E2) — the evidence is
+        # gathered AFTER the report (the integrity / label checks read
+        # the report artifacts), so a failed report never reaches them
+        # (the run already exited report_failed)
+        pilot_c=config.pilot == "c",
+        full_run=(gather_full_run_evidence(
+            config=config, jsonl=jsonl, report_dir=rep_dir, meta=meta,
+            finals=finals, records=records,
+            manifest_ids=[i["instance_id"] for i in insts],
+            buckets=buckets, aborted=aborted)
+            if config.pilot == "c" else None),
         stratified_repos=_stratified_repos(config),
         imported=imported,
         # the round-12 Medium fix (issue #22 AC2): item 16 must
@@ -4330,17 +4918,21 @@ def run_pilot(config: PilotConfig,
             import_provenance=import_provenance)
     with open(os.path.join(workdir, record_name), "w",
               encoding="utf-8", newline="") as f:
-        f.write(render_checklist_md(items, config, cal, meta,
-                                   interrupted=interrupted,
+        f.write(render_checklist_md(
+            items, config, cal, meta,
+            interrupted=(_interrupt_note(window_cap) if interrupted
+                         else False),
                                    title=_pilot_title(config),
                                    gating=_pilot_gating(config)))
-    verdict, failed = _verdict(items, interrupted=interrupted,
-                              gating=_pilot_gating(config))
+    verdict, failed = _verdict(
+        items, interrupted=(_interrupt_note(window_cap) if interrupted
+                           else False),
+        gating=_pilot_gating(config))
     print(f"[pilot] go/no-go: {verdict}"
           + (f" (failed: {', '.join(failed)})" if failed else ""))
-    rep_dir = os.path.join(workdir, "report")
     gng = os.path.join(workdir, record_name)
-    print(f"[pilot] artifacts: {jsonl} · {rep_dir} · {gng}")
+    print(f"[pilot] artifacts: {jsonl} · {rep_dir} · "
+          f"{os.path.join(rep_dir, RUN_META_NAME)} · {gng}")
 
     if interrupted:
         # the round-29 Major fix (issue #22, 4451583330): the
@@ -4377,7 +4969,9 @@ def _build_parser() -> argparse.ArgumentParser:
                         f"{os.path.basename(DEFAULT_INSTANCES_FILE)} "
                         "for --pilot a, "
                         f"{os.path.basename(DEFAULT_B_INSTANCES_FILE)} "
-                        "for --pilot b)")
+                        "for --pilot b, "
+                        f"{os.path.basename(DEFAULT_C_INSTANCES_FILE)} "
+                        "for --pilot c)")
     p.add_argument("--devin-bin", default="devin")
     p.add_argument("--model", default=DEFAULT_MODEL)
     p.add_argument("--workdir", default=None)
@@ -4391,13 +4985,35 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-host-check", dest="host_check",
                    action="store_false")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--stop-at-window-cap", dest="stop_at_window_cap",
+                   action="store_true", default=False,
+                   help="issue #44 E5: exit 42 when the window budget is "
+                        "spent with the queue non-empty, instead of "
+                        "sleeping to the next UTC window in-process (the "
+                        "one-invocation-per-window model of "
+                        "scripts/run_window.sh; the checkpoint holds every "
+                        "outcome, the next window resumes)")
     p.add_argument("--largest-bytes", type=float, default=None)
-    p.add_argument("--pilot", choices=("a", "b"), default="a",
-                   help="the pilot kind (issue #22: 'b' = the 25-"
-                        "instance, 12-repo stratified pilot; the "
-                        "default workdir/record naming follows)")
+    p.add_argument("--budget-file", default=None,
+                   help=f"the calibrated budget file (default: "
+                        f"{BUDGET_FILE}); --pilot c refuses it unless it "
+                        "carries the operator's B2 authorization")
+    p.add_argument("--pilot", choices=("a", "b", "c"), default="a",
+                   help="the run kind (issue #22: 'b' = the 25-"
+                        "instance, 12-repo stratified pilot; issue "
+                        "#44 E2: 'c' = the WP6c full 500-instance run "
+                        "over verified_instances.json — its own "
+                        "workdir/record naming, the full-run items "
+                        "18–23, and the B2 budget-authorization gate; "
+                        "the default workdir/record naming follows)")
     p.add_argument("--import-run", default=None,
-               help="the WP6b checkpoint import: the source run's "
+               help="the checkpoint import (issue #22 AC2; a pilot-B "
+                    "or pilot-C flag, MODE-GATED: a source whose "
+                    "recorded grading mode differs from this run's "
+                    "--mode is refused, and --pilot c additionally "
+                    "refuses a source with no recorded mode — the two "
+                    "grading legs must never be mixed in one pass@1): "
+                    "the source run's "
                     "id (issue #22 AC2 — the 3 Pilot A instances "
                     "are reused inside the 25, never re-run; "
                     "a pilot-B flag, verified by items 15–17; "
@@ -4423,18 +5039,31 @@ def main(argv: "Optional[list]" = None) -> int:
         # workdir is resolved exactly as run_pilot does, and the
         # previous run's verdict is removed before the first thing
         # that can fail (a stale verdict is never kept)
-        wd = args.workdir or os.path.join(
-            os.getcwd(),
-            "pilot-b" if args.pilot == "b" else "pilot-a")
+        wd = args.workdir or default_workdir(args.pilot)
         os.makedirs(wd, exist_ok=True)
         _remove_stale_record(wd)
-        budget = load_budget_file()
+        budget_path = args.budget_file or BUDGET_FILE
+        budget = load_budget_file(budget_path)
         msp = args.max_sessions_per_day
         if msp is None:
             msp = budget.get("max_sessions_per_day", 10)
         mw = args.max_wall_per_session
         if mw is None:
             mw = budget.get("max_wall_per_session", DEFAULT_MAX_WALL_S)
+        # a placeholder / non-numeric cap in the budget file is a config
+        # error with the file named (the committed B2 template carries
+        # PENDING strings; failing here with a message beats a TypeError
+        # comparing a string to 0 — and beats silently piloting on a
+        # value nobody authorized)
+        for name, v, from_cli in (("max_sessions_per_day", msp,
+                                   args.max_sessions_per_day),
+                                 ("max_wall_per_session", mw,
+                                  args.max_wall_per_session)):
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                src = "" if from_cli is not None else (
+                    f" in the budget file {budget_path!r}")
+                raise PilotConfigError(
+                    f"{name} must be a number > 0{src} (got {v!r})")
         # an explicit zero/negative cap is a config error, not a
         # silent replacement by the default (the ``or`` fallback
         # covers absence only)
@@ -4450,8 +5079,9 @@ def main(argv: "Optional[list]" = None) -> int:
         config = PilotConfig(
             mode=args.mode, devin_bin=args.devin_bin, model=args.model,
             instances_file=args.instances
-            or (DEFAULT_B_INSTANCES_FILE if args.pilot == "b"
-                else DEFAULT_INSTANCES_FILE),
+            or {"b": DEFAULT_B_INSTANCES_FILE,
+                "c": DEFAULT_C_INSTANCES_FILE}.get(
+                    args.pilot, DEFAULT_INSTANCES_FILE),
             workdir=args.workdir,
             run_id=args.run_id, max_sessions_per_day=msp,
             max_wall_s=mw,
@@ -4461,7 +5091,9 @@ def main(argv: "Optional[list]" = None) -> int:
             interrupt_after=args.interrupt_after, resume=args.resume,
             dry_run=args.dry_run, host_check=args.host_check,
             pilot=args.pilot, import_run=args.import_run,
-            import_workdir=args.import_workdir)
+            import_workdir=args.import_workdir,
+            budget_file=args.budget_file or "",
+            stop_at_window_cap=args.stop_at_window_cap)
         return run_pilot(config)
     except LiveRefused as exc:
         print(f"[pilot] REFUSED: {exc}")
