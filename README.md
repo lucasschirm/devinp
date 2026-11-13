@@ -101,7 +101,7 @@ devinp --json                # emit normalized rows as JSON
 
 ```
 │  # │ Model           │   Ctx │ Input │ Cached │ Output │ Bench % │ Value │ Sidekick i/c/o │
-│  1 │ Gemini 3.8 Flash│ 1.05M │ $0.75 │  $0.08 │  $3.75 │  64.1%  │ 17.10 │ —              │
+│ 10 │ Gemini 3.8 Flash│ 1.05M │ $0.75 │  $0.08 │  $3.75 │  55.3%  │ 14.75 │ —              │
 ```
 
 - Prices are USD per 1M tokens; columns are heat-colored green → red.
