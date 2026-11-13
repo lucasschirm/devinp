@@ -65,6 +65,12 @@ export default class Devinp extends Command {
       if (loaded.truncated) {
         this.warn('devin output was truncated mid-stream — showing partial data, re-run for the full list')
       }
+      const skipped = loaded.resolution?.skipped ?? []
+      if (skipped.length > 0 && loaded.resolution.verified) {
+        // The run worked, but only because devinp looked past a `devin` that
+        // is not the CLI. Say so: the user's own shell tools hit the same trap.
+        this.warn(`skipped ${skipped.map((c) => `${c.path} (${c.reason})`).join(', ')} — not the Devin CLI; using ${loaded.resolution.command}. Put its directory first on PATH to silence this`)
+      }
       if (loaded.retries > 0) {
         // Naming the capture that worked keeps an unwritable TMPDIR from
         // looking like a pager, and vice versa.
