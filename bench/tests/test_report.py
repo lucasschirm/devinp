@@ -952,3 +952,50 @@ def test_cli_midfile_corruption_exits_4(tmp_path):
     jsonl.write_text("\n".join(lines) + "\n", encoding="utf-8")
     proc = _cli(tmp_path, "--jsonl", str(jsonl), "--out", str(out))
     assert proc.returncode == 4
+
+
+# --------------------------------------------------------------------------
+# the submission label (WP6c E3, issue #44 review round 2): the header is
+# a POSITION, not a region
+# --------------------------------------------------------------------------
+
+_LABEL = "Devin (agent) on SWE-bench Verified"
+
+
+def _rendered_with_label() -> str:
+    """The real thing: render_report's title block is ``# title`` / blank /
+    ``**label**`` / blank / ``## Summary``."""
+    return ("# SWE-bench Verified — Devin ACP run report\n\n"
+            f"**{_LABEL}**\n\n## Summary\n\n- pass@1 …\n")
+
+
+def test_label_in_header_accepts_the_rendered_title_block():
+    assert report.label_in_header(_rendered_with_label(), _LABEL)
+
+
+def test_label_in_header_rejects_prose_and_absence():
+    body = ("# SWE-bench Verified — Devin ACP run report\n\n## Summary\n\n"
+            f"- methodology: this is {_LABEL}\n")
+    assert not report.label_in_header(body, _LABEL)
+    assert not report.label_in_header(_rendered_with_label(), "Other")
+    assert not report.label_in_header("", _LABEL)
+    assert not report.label_in_header(_rendered_with_label(), "")
+
+
+def test_label_in_header_needs_no_sections_to_be_strict(tmp_path):
+    """A report with **no** ``##`` section at all used to put its whole
+    body in the header, so a ``**label**`` line buried anywhere in that
+    body passed — the one drift this check exists to catch. The label is
+    the last line of the title block, and nothing else is (reviewed)."""
+    buried = ("# SWE-bench Verified — Devin ACP run report\n\n"
+              "Some prose.\n\n"
+              f"**{_LABEL}**\n\n"
+              "More prose after it, and no section anywhere.\n")
+    assert _LABEL in buried
+    assert "## " not in buried
+    assert not report.label_in_header(buried, _LABEL)
+    # and the label as the last line of a section-less title block is
+    # still the header it is supposed to be
+    assert report.label_in_header(
+        "# SWE-bench Verified — Devin ACP run report\n\n"
+        f"**{_LABEL}**\n", _LABEL)

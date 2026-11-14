@@ -85,9 +85,27 @@ HAS_STOP_CAP=0
 for a in ${EFF[@]+"${EFF[@]}"}; do
 	[ "$a" = "--stop-at-window-cap" ] && HAS_STOP_CAP=1
 done
+ADDED_STOP_CAP=0
 if [ "$HAS_STOP_CAP" = 0 ] && [ -z "${WP6C_KEEP_RUNNING:-}" ]; then
 	EFF+=(--stop-at-window-cap)
+	HAS_STOP_CAP=1
+	ADDED_STOP_CAP=1
 fi
+
+# how to print an invocation back at the operator: any argument holding
+# whitespace is single-quoted, so the resume command below is the command
+# they can paste (a workdir path with a space would otherwise print a
+# line that runs a different one)
+printable() {
+	local out="" a
+	for a in "$@"; do
+		case "$a" in
+		*[[:space:]]*) a="'${a//\'/\'\\\'\'}'" ;;
+		esac
+		out+="$a "
+	done
+	printf '%s' "${out% }"
+}
 
 # the workdir/run id are parsed out of the args purely to place the log
 # and the archive — the harness remains the only reader of the run itself
@@ -127,19 +145,28 @@ while [ -e "$LOG" ]; do
 	n=$((n + 1))
 done
 
-echo "run_window: $PYTHON $HARNESS ${EFF[*]}"
+# what the run looks like from the outside = what the harness actually
+# receives: the banner states the model of the EFFECTIVE argv (an operator
+# who sets WP6C_KEEP_RUNNING *and* passes the cap flag gets the cap, so
+# saying "in-process sleep" there would describe a run that is not
+# happening — issue #44 E5, reviewed)
+ARGS="$(printable ${EFF[@]+"${EFF[@]}"})"
+echo "run_window: $PYTHON $HARNESS $ARGS"
 echo "run_window: log $LOG"
-if [ -n "${WP6C_KEEP_RUNNING:-}" ]; then
+if [ "$HAS_STOP_CAP" = 1 ]; then
+	echo "run_window: window model: one window, stop at the cap (exit 42)"
+	if [ "$ADDED_STOP_CAP" = 1 ]; then
+		echo "              (added --stop-at-window-cap)"
+	elif [ -n "${WP6C_KEEP_RUNNING:-}" ]; then
+		echo "              (WP6C_KEEP_RUNNING is set but the arguments"
+		echo "              ask for the cap: the arguments win, so this"
+		echo "              window DOES end at the cap and IS archived)"
+	fi
+else
 	echo "run_window: window model: in-process sleep between windows"
 	echo "              (WP6C_KEEP_RUNNING=1: this process stays alive"
 	echo "              across UTC days — WP6b's contract; no exit 42,"
 	echo "              so no per-window archive either)"
-elif [ "$HAS_STOP_CAP" = 0 ]; then
-	echo "run_window: window model: one window, stop at the cap"
-	echo "              (added --stop-at-window-cap)"
-else
-	echo "run_window: window model: one window, stop at the cap"
-	echo "              (--stop-at-window-cap was already in the args)"
 fi
 echo "run_window: ----"
 
@@ -159,9 +186,10 @@ case "$rc" in
 	echo "run_window: exit 42 — WINDOW CAP reached (the daily budget is"
 	echo "              spent; the checkpoint holds every outcome)."
 	echo "              Next window, same command:"
-	echo "                $0 ${EFF[*]}"
+	echo "                $0 $ARGS"
 	echo "              Status any time (read-only):"
-	echo "                $PYTHON $SELF_DIR/run_status.py --workdir $WORKDIR"
+	echo "                $PYTHON $SELF_DIR/run_status.py "
+	echo "                    --workdir $(printable "$WORKDIR")"
 	;;
 4)
 	echo "run_window: exit 4 — RUN FAILED. **STOP.** Do not loop-retry:"

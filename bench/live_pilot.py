@@ -440,8 +440,18 @@ def _load_json_file(path: str) -> object:
 
 def load_budget_file(path: str = BUDGET_FILE) -> dict:
     """The optional calibrated budget file (PLAN §2: "budget is config,
-    not code") — ``{"max_sessions_per_day", "max_wall_per_session",
-    "calibrated_at", "basis"}``."""
+    not code"). Two shapes of consumer, one file:
+
+    * every pilot reads the numeric caps ``max_sessions_per_day`` /
+      ``max_wall_per_session``;
+    * ``--pilot c`` additionally requires the five B2 authorization
+      fields — ``calibrated_at``, ``basis``, ``authorized_by``,
+      ``completion_deadline``, ``abort_rule`` — i.e. everything in
+      :data:`FULL_RUN_BUDGET_FIELDS`, none of them still ``PENDING``
+      (issue #44 B2; :func:`require_full_run_authorization`).
+
+    A missing file is ``{}`` ("no calibration", the WP6a behaviour); a
+    file that is not a JSON object is a configuration error."""
     if not os.path.isfile(path):
         return {}
     data = _load_json_file(path)
@@ -663,8 +673,10 @@ IMPORT_PROVENANCE = (
 
 def source_provenance(import_workdir: str, run_id: str) -> dict:
     """What a source run recorded about its own methodology (the
-    ``--import-run`` gate, issue #44 E2): ``{mode, model, cost_tier}``,
-    each key present only where there is evidence. Two places carry it,
+    ``--import-run`` gate, issue #44 E2): a dict keyed by
+    :data:`IMPORT_PROVENANCE` — ``mode`` and ``model`` — each key present
+    only where there is evidence (the cost tier is not part of the gate:
+    see the note on that tuple). Two places carry it,
     newest first, and a later source never overwrites an earlier one:
     the persisted methodology meta (``report/run_meta.json`` — the WP6c
     E3 artifact) and the run's state file

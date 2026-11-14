@@ -1127,3 +1127,70 @@ def test_archive_latest_is_a_pointer_and_a_corrupt_manifest_is_clean(
     err = capsys.readouterr().err
     assert rc == ar.EXIT_INPUT, (rc, err[-400:])
     assert "malformed byte count" in err and "Traceback" not in err, err
+
+
+# --------------------------------------------------------------------------
+# issue #44 review round 2 (Devin on #47): the exit code that regressed,
+# the banner that described the wrong run, the cap that fell back silently
+# --------------------------------------------------------------------------
+
+def test_verify_a_bundle_without_a_manifest_is_exit_3(tmp_path, capsys):
+    """`--verify` on a directory that is not a bundle (no MANIFEST.tsv,
+    or a mistyped --bundle) is a DURABILITY failure — the same statement
+    as a byte mismatch — and never a traceback. Moving read_manifest
+    above the problems check made this crash with exit 1 (reviewed)."""
+    empty = tmp_path / "not-a-bundle"
+    empty.mkdir()
+    assert ar.main(["--verify", "--bundle", str(empty)]) == ar.EXIT_VERIFY
+    out = capsys.readouterr()
+    assert "no MANIFEST.tsv" in out.out and "Traceback" not in out.err
+    assert ar.main(["--verify", "--bundle",
+                    str(tmp_path / "does-not-exist")]) == ar.EXIT_VERIFY
+
+
+def test_status_an_impossible_cap_falls_back_loudly_too(tmp_path, capsys):
+    """0 and -5 are as unusable as PENDING: 'which cap did the ETA use'
+    must never be the one question the dashboard answers silently."""
+    work = _mk_run(tmp_path, [_rec(f"a__a-{i}", "resolved", T0 + i * 60)
+                             for i in range(3)])
+    for bad in ("0", "-5"):
+        assert run_status.main(["--workdir", str(work), "--manifest", "",
+                              "--cap", bad]) == run_status.EXIT_OK
+        out = capsys.readouterr()
+        assert "NOTE" in out.err and "max_sessions_per_day" in out.err, \
+            (bad, out.err[-300:])
+        assert "cap 10/window" in out.out, (bad, out.out[-300:])
+
+
+def test_run_window_args_beat_keep_running_in_the_banner(tmp_path):
+    """WP6C_KEEP_RUNNING plus an explicit cap flag: the flag is in the
+    argv, so the harness exits 42 and the archive runs — a banner that
+    still said 'in-process sleep, no exit 42' described a run that was
+    not happening (reviewed)."""
+    p, calls = _window(tmp_path, rc=42,
+                       args=["--workdir", str(tmp_path / "wd"),
+                             "--stop-at-window-cap"],
+                       env={"WP6C_KEEP_RUNNING": "1"})
+    assert p.returncode == 42, p.stdout + p.stderr
+    argv = json.loads(calls.read_text())["argv"]
+    assert "--stop-at-window-cap" in argv
+    assert "stop at the cap" in p.stdout, p.stdout
+    assert "in-process sleep" not in p.stdout, p.stdout
+    assert "the arguments win" in p.stdout, p.stdout
+
+
+def test_run_window_prints_a_command_that_runs_that_command(tmp_path):
+    """A workdir with a space is legal; the resume hint and the status
+    hint are copy-paste artefacts, so they must survive it (the argv
+    itself always did — the printed line was the broken half)."""
+    wd = tmp_path / "my run dir"
+    p, calls = _window(tmp_path, rc=42, args=["--workdir", str(wd)])
+    assert p.returncode == 42, p.stdout + p.stderr
+    argv = json.loads(calls.read_text())["argv"]
+    assert argv[:2] == ["--workdir", str(wd)], argv     # passed intact
+    hint = [l for l in p.stdout.splitlines()
+            if "run_window.sh" in l and "--workdir" in l]
+    assert hint and "'%s'" % wd in hint[-1], p.stdout
+    status = [l for l in p.stdout.splitlines()
+              if "run_status.py" in l or "--workdir" in l]
+    assert any("'%s'" % wd in l for l in status), p.stdout

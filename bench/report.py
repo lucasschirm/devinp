@@ -764,12 +764,22 @@ def label_in_header(md: str, label: str) -> bool:
     methodology prose is body text, not the heading the published report
     stands under, so a render drift that dropped the header while
     mentioning the label elsewhere must not read as labelled
-    (issue #44 E3, reviewed)."""
+    (issue #44 E3, reviewed).
+
+    "In the title block" is therefore read positionally, not as
+    "anywhere above the first section": a report with **no** ``##``
+    section at all would otherwise put its whole body in the header, and
+    a ``**label**`` line buried in that body would pass the one check
+    that exists to catch exactly that drift. The rendered title block is
+    ``# <title>`` / blank / ``**<label>**`` / blank / ``## Summary``, so
+    the label must be the last non-empty line before the first
+    section."""
     if not md or not label:
         return False
     want = f"**{label}**"
     head = md.split("\n## ", 1)[0]
-    return any(line.strip() == want for line in head.splitlines())
+    lines = [ln.strip() for ln in head.splitlines() if ln.strip()]
+    return bool(lines) and lines[-1] == want
 
 
 # ---------------------------------------------------------------------------

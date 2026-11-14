@@ -249,7 +249,6 @@ def main(argv: "list[str] | None" = None) -> int:
             return EXIT_INPUT
         try:
             problems = verify(args.bundle)
-            ents = read_manifest(os.path.join(args.bundle, MANIFEST_NAME))
         except SystemExit as exc:
             # a MANIFEST.tsv that cannot be parsed is BAD INPUT (exit 2),
             # which is a different statement from "this bundle is not
@@ -258,11 +257,17 @@ def main(argv: "list[str] | None" = None) -> int:
             print(f"INPUT: {exc}", file=sys.stderr)
             return EXIT_INPUT
         if problems:
+            # including "no MANIFEST.tsv here" / a mistyped --bundle:
+            # verify() REPORTS that, and it is a durability failure (3),
+            # not an input error — and never a traceback
             for x in problems[:20]:
                 print(f"[FAIL] {x}")
             print(f"NOT DURABLE: {len(problems)} problem(s) in "
                   f"{args.bundle}", file=sys.stderr)
             return EXIT_VERIFY
+        # verify() already re-hashed every listed entry, so this second
+        # read cannot fail; it exists only to total the line below
+        ents = read_manifest(os.path.join(args.bundle, MANIFEST_NAME))
         print(f"VERIFIED {args.bundle}: {len(ents)} file(s), "
               f"{sum(e[1] for e in ents)} bytes, byte-identical to the "
               "manifest")

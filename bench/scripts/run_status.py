@@ -127,6 +127,32 @@ def measure(records: list) -> dict:
             "median_s": med}
 
 
+#: the WP6a default per-window session cap — used only when nothing
+#: usable is configured, and always said out loud (an ETA is a plan, and
+#: a plan built on a guessed number has to say which number it guessed)
+DEFAULT_CAP = 10
+
+
+def usable_cap(value) -> "tuple[int, str]":
+    """The ETA's per-window cap, plus the reason a configured value was
+    refused (empty when it was fine).
+
+    A ``PENDING`` placeholder, a stray string, a ``0`` and a negative
+    number all mean the same thing to the operator: the number the ETA
+    used is not their authorization, so all four earn the NOTE — while a
+    value that was simply never configured (the normal state before B2)
+    does not, or every dashboard would open with a warning nobody can
+    act on (issue #44 E5/B2, reviewed).
+    """
+    if value is None:
+        return DEFAULT_CAP, ""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return DEFAULT_CAP, f"{value!r} is not a number"
+    if value <= 0:
+        return DEFAULT_CAP, f"{value!r} is not a positive number"
+    return int(value), ""
+
+
 def status(jsonl: str, manifest_ids: "list[str] | None",
           cap: int, now: "float | None" = None) -> dict:
     """The status dict (the human report renders exactly this, and
@@ -442,15 +468,12 @@ def main(argv: "list[str] | None" = None) -> int:
             # must still leave the operator a dashboard) — the ETA falls
             # back to a stated cap, printed below
             cap = None
-    if isinstance(cap, bool) or not isinstance(cap, (int, float)):
-        # a PENDING placeholder in the budget file says "not authorized
-        # yet"; the ETA is still printed, on a stated fallback cap
-        print(f"NOTE: budget cap {cap!r} is not a number — the ETA below "
-              "uses the WP6a default cap (fill in "
+    cap, why = usable_cap(cap)
+    if why:
+        print(f"NOTE: the configured per-window cap "
+              f"(max_sessions_per_day) {why} — the ETA below uses the "
+              f"WP6a default of {DEFAULT_CAP} instead (fill in "
               "live_pilot_budget.json, issue #44 B2)", file=sys.stderr)
-        cap = None
-    if not cap or cap <= 0:
-        cap = 10  # the WP6a default; the output says which cap was used
     try:
         s = status(jsonl, manifest_ids, cap)
     except rep.ReportError as exc:
