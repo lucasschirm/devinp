@@ -885,3 +885,47 @@ def test_item22_needs_the_header_not_a_prose_mention(tmp_path):
     assert lp.SUBMISSION_LABEL in (md_path.read_text())  # substring: not
     assert ev["header_has_label"] is False              # enough
     assert _by_num(_items(ev), 22)["pass"] is False
+
+
+# --------------------------------------------------------------------------
+# issue #44 review round 2 (Devin on #47): an authorization has to be the
+# sentence itself, not a value of the right shape
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("bad", [42, 0, -1, 3.5, True, [], {}, None])
+@pytest.mark.parametrize("field", ["abort_rule", "authorized_by", "basis",
+                                   "completion_deadline",
+                                   "calibrated_at"])
+def test_an_authorization_field_must_be_written_not_just_filled(tmp_path,
+                                                               field, bad):
+    """``abort_rule: 42`` is not the sentence B7 asks for and
+    ``authorized_by: 7`` names nobody — the five B2 fields are prose and
+    dates, so a non-string is as unauthorised as a blank (the caps stay
+    numeric, below)."""
+    with pytest.raises(lp.PilotConfigError, match=field):
+        lp.require_full_run_authorization(_authorized_budget(**{field: bad}),
+                                         "budget.json")
+
+
+@pytest.mark.parametrize("field", ["max_sessions_per_day",
+                                   "max_wall_per_session"])
+def test_the_caps_stay_numbers(field):
+    """"10" is not calibration: the gate that reads the caps is the one
+    place a string must not pass (issue #44 B2)."""
+    with pytest.raises(lp.PilotConfigError, match=field):
+        lp.require_full_run_authorization(
+            _authorized_budget(**{field: "10"}), "budget.json")
+
+
+def test_the_committed_template_is_still_unauthorised_after_the_change():
+    """The gate tightening must not have made the shipped template pass —
+    it is the file the operator edits, and it still says PENDING."""
+    with open(lp.BUDGET_FILE, encoding="utf-8") as f:
+        committed = json.load(f)
+    with pytest.raises(lp.PilotConfigError) as e:
+        lp.require_full_run_authorization(committed, lp.BUDGET_FILE)
+    for field in ("calibrated_at", "basis", "authorized_by",
+                  "completion_deadline", "abort_rule"):
+        assert field in str(e.value)
+    # and its own _comment tells the operator the truth about the set
+    assert "FIVE authorization fields" in " ".join(committed["_comment"])

@@ -1194,3 +1194,93 @@ def test_run_window_prints_a_command_that_runs_that_command(tmp_path):
     status = [l for l in p.stdout.splitlines()
               if "run_status.py" in l or "--workdir" in l]
     assert any("'%s'" % wd in l for l in status), p.stdout
+
+
+# --------------------------------------------------------------------------
+# issue #44 review round 2 (Devin on #47): the cap's remaining shapes, and
+# the hints that have to survive a paste
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_status_a_non_finite_cap_is_reported_not_crashed(tmp_path, capsys,
+                                                        monkeypatch, bad):
+    """json.loads accepts NaN/Infinity, and int() on them raises — so the
+    read-only dashboard would have answered a broken config with exit 1
+    and a traceback, the very contract this PR is polishing."""
+    monkeypatch.setattr(lp, "load_budget_file",
+                        lambda _p: {"max_sessions_per_day": bad})
+    work = _mk_run(tmp_path, [_rec(f"a__a-{i}", "resolved", T0 + i * 60)
+                             for i in range(3)])
+    assert run_status.main(["--workdir", str(work), "--manifest", ""]) \
+        == run_status.EXIT_OK
+    out = capsys.readouterr()
+    assert "NOTE" in out.err and "not a finite number" in out.err, out.err
+    assert "cap 10/window" in out.out and "Traceback" not in out.err
+
+
+def test_status_an_unreadable_budget_file_says_so(tmp_path, capsys,
+                                                 monkeypatch):
+    """A file the operator DID configure, and broke, is the same class of
+    answer as a PENDING cap: the ETA uses a number that is not theirs. It
+    names the file to fix (issue #44 review round 2)."""
+    def boom(_path):
+        raise SystemExit("budget file must be a JSON object")
+    monkeypatch.setattr(lp, "load_budget_file", boom)
+    work = _mk_run(tmp_path, [_rec(f"a__a-{i}", "resolved", T0 + i * 60)
+                             for i in range(3)])
+    assert run_status.main(["--workdir", str(work), "--manifest", ""]) \
+        == run_status.EXIT_OK
+    err = capsys.readouterr().err
+    assert "NOTE" in err and "cannot be read" in err, err[-300:]
+    assert "live_pilot_budget.json" in err, err[-300:]
+
+
+def test_status_the_note_blames_the_flag_when_the_flag_is_wrong(
+        tmp_path, capsys):
+    """--cap 0 is not the budget file's fault; telling the operator to
+    edit the file would send them to the wrong place."""
+    work = _mk_run(tmp_path, [_rec("a__a-1", "resolved", T0)])
+    assert run_status.main(["--workdir", str(work), "--manifest", "",
+                          "--cap", "0"]) == run_status.EXIT_OK
+    err = capsys.readouterr().err
+    assert "fix --cap" in err and "live_pilot_budget.json" not in err, \
+        err[-300:]
+
+
+def test_run_window_quotes_what_the_shell_would_act_on(tmp_path):
+    """The resume/status hints exist to be pasted. An argument with no
+    whitespace can still stop being itself (`&`, `"`, `$`, a newline in a
+    path), and an empty one vanishes entirely — so printable() quotes
+    anything outside the shell's safe set."""
+    for tricky in ["foo&bar", 'we"ird', "$HOME", "a;b", ""]:
+        wd = tmp_path / f"wd-{abs(hash(tricky))}"
+        p, calls = _window(tmp_path, rc=42, args=["--workdir", str(wd),
+                                                 "--instances", tricky])
+        argv = json.loads(calls.read_text())["argv"]
+        assert argv[:4] == ["--workdir", str(wd), "--instances",
+                            tricky], (tricky, argv)
+        hint = [l for l in p.stdout.splitlines()
+                if "run_window.sh" in l and "--workdir" in l]
+        assert hint, (tricky, p.stdout)
+        line = hint[-1]
+        if tricky:
+            assert repr(tricky) in line or f"'{tricky}'" in line, \
+                (tricky, line)
+        else:
+            assert "--instances ''" in line, (tricky, line)
+
+
+@pytest.mark.parametrize("value,added", [("0", True), ("false", True),
+                                         ("no", True), ("1", False),
+                                         ("true", False)])
+def test_run_window_keep_running_is_a_flag_not_a_string(tmp_path, value,
+                                                       added):
+    """WP6C_KEEP_RUNNING=0 must mean "do not keep running" — the same
+    reading every other flag in the repo gets (issue #44 review r2)."""
+    p, calls = _window(tmp_path, rc=42,
+                       args=["--workdir", str(tmp_path / "wd")],
+                       env={"WP6C_KEEP_RUNNING": value})
+    argv = json.loads(calls.read_text())["argv"]
+    assert ("--stop-at-window-cap" in argv) is added, (value, argv)
+    model = "stop at the cap" if added else "in-process sleep"
+    assert model in p.stdout, (value, p.stdout)

@@ -3864,7 +3864,11 @@ def require_full_run_authorization(budget: dict,
     additionally requires ``authorized_by`` / ``completion_deadline`` /
     ``abort_rule`` / ``basis`` / ``calibrated_at`` to be filled in (a
     placeholder such as the committed ``PENDING (issue #44 B2)`` is not an
-    authorization). ``abort_rule`` is in the enforced set because the
+    authorization). Those five are the operator's **sentences and dates**,
+    so they must be non-empty strings: ``abort_rule: 42`` is not the
+    sentence B7 asks for, and a number where a name belongs is not a
+    signature either. The two caps stay numeric.
+    ``abort_rule`` is in the enforced set because the
     window wrapper's discipline ("a failed window stops, it does not
     retry") is only a convention until the run plan says what it stops
     for — B7 is the operator's sentence, and the 500-session invocation
@@ -3879,20 +3883,27 @@ def require_full_run_authorization(budget: dict,
             "sessions/window + the completion deadline + the abort rule "
             "recorded by the operator). It is missing — no session may "
             "start on an unauthorised budget")
-    def unauthorised(v) -> bool:
-        """Absent, empty, a bool, a non-positive number or a ``PENDING``
-        placeholder — none of them is an authorization."""
-        if isinstance(v, bool):
+    caps = ("max_sessions_per_day", "max_wall_per_session")
+
+    def uncalibrated(v) -> bool:
+        """A cap that is absent, a bool, not a number or not positive."""
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
             return True
-        if isinstance(v, str):
-            s = v.strip()
-            return not s or s.upper().startswith("PENDING")
-        if isinstance(v, (int, float)):
-            return v <= 0
-        return True
+        return v <= 0
+
+    def unauthorised(v) -> bool:
+        """Anything but a non-empty string that does not start with
+        ``PENDING``. A number is refused on purpose (issue #44 review
+        round 2): ``abort_rule: 42`` is not the sentence B7 asks for, and
+        ``authorized_by: 7`` signs nothing."""
+        if not isinstance(v, str):
+            return True
+        s = v.strip()
+        return not s or s.upper().startswith("PENDING")
 
     missing = [k for k in FULL_RUN_BUDGET_FIELDS
-               if unauthorised(budget.get(k))]
+               if (uncalibrated(budget.get(k)) if k in caps
+                   else unauthorised(budget.get(k)))]
     if missing:
         raise PilotConfigError(
             f"--pilot c is the 500-session run: {path} must carry "

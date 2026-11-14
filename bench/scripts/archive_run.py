@@ -265,8 +265,11 @@ def main(argv: "list[str] | None" = None) -> int:
             print(f"NOT DURABLE: {len(problems)} problem(s) in "
                   f"{args.bundle}", file=sys.stderr)
             return EXIT_VERIFY
-        # verify() already re-hashed every listed entry, so this second
-        # read cannot fail; it exists only to total the line below
+        # verify() already re-hashed every listed entry; this second read
+        # only totals the line below. It is a check-then-act, so a file
+        # swapped in between the two is a window this shares with any
+        # archiver — the bundle is append-only and the next verify (or
+        # the operator's own, off-host) re-reads and re-hashes it
         ents = read_manifest(os.path.join(args.bundle, MANIFEST_NAME))
         print(f"VERIFIED {args.bundle}: {len(ents)} file(s), "
               f"{sum(e[1] for e in ents)} bytes, byte-identical to the "

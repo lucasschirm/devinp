@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shutil
 import sys
@@ -147,9 +148,17 @@ def usable_cap(value) -> "tuple[int, str]":
     if value is None:
         return DEFAULT_CAP, ""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return DEFAULT_CAP, f"{value!r} is not a number"
+        return DEFAULT_CAP, f"max_sessions_per_day {value!r} is not a " \
+            "number"
+    if not math.isfinite(value):
+        # json.loads accepts NaN and Infinity, and int() on them raises —
+        # the read-only dashboard must not answer a bad config with exit 1
+        # (issue #44 review round 2)
+        return DEFAULT_CAP, f"max_sessions_per_day {value!r} is not a " \
+            "finite number"
     if value <= 0:
-        return DEFAULT_CAP, f"{value!r} is not a positive number"
+        return DEFAULT_CAP, f"max_sessions_per_day {value!r} is not a " \
+            "positive number"
     return int(value), ""
 
 
@@ -454,6 +463,8 @@ def main(argv: "list[str] | None" = None) -> int:
                   f"(an object with an \"instances\" list of objects "
                   f"carrying instance_id): {exc}", file=sys.stderr)
             return EXIT_INPUT
+    source = "--cap" if cap is not None else "live_pilot_budget.json"
+    why_read = ""
     if cap is None:
         # the operator's authorized per-window cap, not the pilot default
         # — a 500-run ETA computed from a 10-session pilot cap would be
@@ -462,18 +473,21 @@ def main(argv: "list[str] | None" = None) -> int:
             import live_pilot as lp
             cap = lp.load_budget_file(lp.BUDGET_FILE).get(
                 "max_sessions_per_day")
-        except (Exception, SystemExit):
-            # a budget file that cannot be read or parsed says nothing
-            # (SystemExit included: a budget loader that refuses loudly
-            # must still leave the operator a dashboard) — the ETA falls
-            # back to a stated cap, printed below
+        except (Exception, SystemExit) as exc:
+            # a budget loader that refuses loudly must still leave the
+            # operator a dashboard — but a file they DID configure and
+            # that cannot be read belongs with PENDING/0/-5: the ETA is
+            # about to use a number that is not theirs, so it says so,
+            # and says which file to fix (issue #44 review round 2)
             cap = None
+            why_read = ("the budget file's max_sessions_per_day cannot be "
+                        f"read ({type(exc).__name__}: {exc})")
     cap, why = usable_cap(cap)
+    why = why or why_read
     if why:
-        print(f"NOTE: the configured per-window cap "
-              f"(max_sessions_per_day) {why} — the ETA below uses the "
-              f"WP6a default of {DEFAULT_CAP} instead (fill in "
-              "live_pilot_budget.json, issue #44 B2)", file=sys.stderr)
+        print(f"NOTE: {why} — the ETA below uses the WP6a default of "
+              f"{DEFAULT_CAP} instead (fix {source}, issue #44 B2)",
+              file=sys.stderr)
     try:
         s = status(jsonl, manifest_ids, cap)
     except rep.ReportError as exc:

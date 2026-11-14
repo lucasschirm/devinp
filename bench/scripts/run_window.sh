@@ -85,8 +85,15 @@ HAS_STOP_CAP=0
 for a in ${EFF[@]+"${EFF[@]}"}; do
 	[ "$a" = "--stop-at-window-cap" ] && HAS_STOP_CAP=1
 done
+# WP6C_KEEP_RUNNING is a flag, not a string: "0"/"false"/"no" mean "do
+# not", exactly as on the command line everywhere else in this repo
+KEEP_RUNNING=0
+case "${WP6C_KEEP_RUNNING:-}" in
+"" | 0 | [Ff]alse | [Nn]o) ;;
+*) KEEP_RUNNING=1 ;;
+esac
 ADDED_STOP_CAP=0
-if [ "$HAS_STOP_CAP" = 0 ] && [ -z "${WP6C_KEEP_RUNNING:-}" ]; then
+if [ "$HAS_STOP_CAP" = 0 ] && [ "$KEEP_RUNNING" = 0 ]; then
 	EFF+=(--stop-at-window-cap)
 	HAS_STOP_CAP=1
 	ADDED_STOP_CAP=1
@@ -100,7 +107,13 @@ printable() {
 	local out="" a
 	for a in "$@"; do
 		case "$a" in
-		*[[:space:]]*) a="'${a//\'/\'\\\'\'}'" ;;
+		# quote the empty (it would vanish) and anything holding a
+		# character the shell would act on — the hint's whole job is to
+		# be pasted, and `foo&bar` / `we"ird` / `$x` need no space to
+		# stop being the argument they print as (issue #44 review r2)
+		"") a="''" ;;
+		*[!A-Za-z0-9_@%+=:,./-]*)
+			a="'${a//\'/\'\\\'\'}'" ;;
 		esac
 		out+="$a "
 	done
@@ -157,7 +170,7 @@ if [ "$HAS_STOP_CAP" = 1 ]; then
 	echo "run_window: window model: one window, stop at the cap (exit 42)"
 	if [ "$ADDED_STOP_CAP" = 1 ]; then
 		echo "              (added --stop-at-window-cap)"
-	elif [ -n "${WP6C_KEEP_RUNNING:-}" ]; then
+	elif [ "$KEEP_RUNNING" = 1 ]; then
 		echo "              (WP6C_KEEP_RUNNING is set but the arguments"
 		echo "              ask for the cap: the arguments win, so this"
 		echo "              window DOES end at the cap and IS archived)"

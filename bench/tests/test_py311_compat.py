@@ -69,6 +69,9 @@ LEGAL = [
     'x = f"""{\n    v\n}"""\n',                   # multiline is fine here
     'x = f"""{"# not a comment"}"""\n',           # inside a nested string
     'x = f"""{"a"} and {b}"""\n',                 # lone quotes in triple
+    'x = f"{x:#>5}"\n',                          # '#' is fill, not comment
+    'x = f"{v:#010x}"\n',
+    'x = f"{x:{y}#{20}}"\n',                     # and inside a nested field
     'x = f"""{d["key"]}"""\n',                   # the pre-3.12 workaround:
     #   the literal ends at the whole run, so a lone " inside a triple-
     #   quoted f-string always worked — which is why the rule compares
@@ -110,10 +113,16 @@ def _literal_end_311(src: str, i: int, quotes: str) -> int:
 def _fields_312(src: str, i: int, end: int, triple: bool):
     """Yield ``(kind, pos)`` for constructs PEP 701 added inside
     replacement fields: ``"comment"`` / ``"newline"`` (the latter only
-    when the literal is single-quoted). ``in_str`` keeps a ``#`` inside a
-    nested string from looking like a comment."""
+    when the literal is single-quoted).
+
+    Two things must not be mistaken for a comment: a ``#`` inside a nested
+    string, and a ``#`` after the field's ``:`` — in a format spec ``#``
+    is a fill/align character, and ``f"{x:#>5}"`` / ``f"{v:#010x}"`` are
+    as old as f-strings (issue #44 review round 2 caught exactly this).
+    ``spec`` tracks, per open field, whether its ``:`` has been passed."""
     depth = 0
     in_str = None
+    spec: "list[bool]" = []
     while i < end:
         c = src[i]
         if c == "\\":
@@ -125,34 +134,40 @@ def _fields_312(src: str, i: int, end: int, triple: bool):
                     i += 2
                     continue
                 depth = 1
+                spec.append(False)
             elif c == "}":
                 if src[i + 1:i + 2] == "}":
                     i += 2
             i += 1
             continue
         if in_str:
-            if c == "\n":
-                return              # a broken nested string: not our rule
             if src.startswith(in_str, i):
                 step = len(in_str)
                 in_str = None
                 i += step
                 continue
-            i += 1
-            continue
+            if c == "\n" and len(in_str) == 1:
+                return              # an unterminated nested string: there
+            i += 1                  # is no literal left here to judge
+            continue                # (a triple one may span lines: fine)
         if c in ("'", '"'):
             run = src[i:i + 3]
             in_str = run if run in ('"""', "'''") else c
             i += len(in_str)
             continue
-        if c == "#":
+        if c == ":" and not spec[-1]:
+            spec[-1] = True         # format-spec text from here on
+        elif c == "#" and not spec[-1]:
             yield ("comment", i)
         elif c == "\n" and not triple:
             yield ("newline", i)
         if c == "{":
             depth += 1
+            spec.append(False)
         elif c == "}":
             depth -= 1
+            if spec:
+                spec.pop()
         i += 1
 
 
@@ -253,21 +268,34 @@ def test_the_guard_lets_what_3_11_allows_through():
         assert pep701_hits(sample) == [], pep701_hits(sample)
 
 
-def test_the_guard_finds_the_line_that_broke_ci():
-    """End to end, straight out of git when the history still holds it:
-    the file that broke CI must be reported, and the file that fixed it
-    must not. Skipped elsewhere (a squash merge rewrites these commits)
-    — the synthetic breaker above is the part that always runs."""
-    import pytest
-    breaker = _git_show("HEAD~1:bench/scripts/verify_submission.py")
-    if breaker is None or 'f"({' not in breaker:
-        pytest.skip("the commit that carried the breaker is not in this "
-                    "history")
-    hits = pep701_hits(breaker)
-    assert any("PEP 701" in h for h in hits), hits
-    fixed = _git_show("HEAD:bench/scripts/verify_submission.py")
-    if fixed is not None:
-        assert pep701_hits(fixed) == []
+#: present in the breaker's line, absent from the fix (which escapes the
+#: quotes) and from every other revision of that file
+_BREAKER_MARKER = '{{"instances"'
+
+
+def _breaker_from_history():
+    """The content of ``verify_submission.py`` as it stood when it carried
+    the PEP 701 line — found by **content**, not by ``HEAD~n``.
+
+    ``HEAD~1`` is not a stable address: the fix commit moved the breaker
+    one revision back and the commit after it moved it again, so a test
+    that names a revision passes exactly once, on the machine that wrote
+    it — and goes red on every clone afterwards (and CI cannot see that:
+    ``actions/checkout`` fetches depth 1, so the git call fails and the
+    test skips). Issue #44 review round 2; this function is the fix.
+    """
+    import subprocess
+    log = subprocess.run(["git", "log", "--format=%H", "--",
+                          "bench/scripts/verify_submission.py"],
+                         cwd=str(_BENCH.parent), capture_output=True,
+                         text=True)
+    if log.returncode != 0:
+        return None
+    for rev in log.stdout.split():
+        shown = _git_show(f"{rev}:bench/scripts/verify_submission.py")
+        if shown is not None and _BREAKER_MARKER in shown:
+            return shown
+    return None
 
 
 def _git_show(rev: str):
@@ -275,6 +303,24 @@ def _git_show(rev: str):
     r = subprocess.run(["git", "show", rev], cwd=str(_BENCH.parent),
                        capture_output=True, text=True)
     return r.stdout if r.returncode == 0 else None
+
+
+def test_the_guard_finds_the_line_that_broke_ci():
+    """End to end: the file that actually broke CI must be reported by the
+    guard, and the file as it now stands must be clean. Skipped only where
+    the history is not reachable (CI's depth-1 checkout) — and the
+    breaker's own text is pinned above, so the rule is tested either way.
+    """
+    import pytest
+    breaker = _breaker_from_history()
+    if breaker is None:
+        pytest.skip("the commit that carried the breaker is not reachable "
+                    "from here (a shallow checkout)")
+    hits = pep701_hits(breaker)
+    assert any("PEP 701" in h for h in hits), hits
+    current = (_BENCH / "scripts" / "verify_submission.py").read_text(
+        encoding="utf-8")
+    assert pep701_hits(current) == []
 
 
 def test_every_bench_module_parses_on_the_ci_interpreter():
