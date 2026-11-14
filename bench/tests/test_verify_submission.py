@@ -551,7 +551,8 @@ def test_label_constant_matches_the_harness():
 
 def test_run_id_derivation(tmp_path):
     assert vs.bundle_run_id("/x/work/run-full500.jsonl") == "full500"
-    with pytest.raises(SystemExit):
+    # an input problem, not a crash: it maps to the documented exit 2
+    with pytest.raises(vs.InputError):
         vs.bundle_run_id("/x/work/checkpoint.json")
 
 
@@ -578,3 +579,171 @@ def test_report_md_parser_malformed_row_is_not_silently_dropped():
          "|---|---|---|---|\n| a/b | x | 1 | n/a |\n")
     _ov, rows = rep.parse_report_pass1(md)
     assert rows == {"a/b": (None, None, "n/a")}
+
+
+# --------------------------------------------------------------------------
+# issue #44 review round 1: the documented exit codes must be the ones the
+# runbook sees — and a dropped checkpoint line is never silently accepted
+# --------------------------------------------------------------------------
+
+def test_clean_checkpoint_is_itself_a_check(tmp_path, capsys):
+    f = build(tmp_path)
+    assert vmain("--jsonl", f["jsonl"], "--manifest",
+                f["manifest"]) == vs.EXIT_OK
+    assert "[PASS] CHECKPOINT" in capsys.readouterr().out
+
+
+def test_a_dropped_line_fails_the_verification(tmp_path, capsys):
+    """The loader's torn-last-line rule makes that instance's outcome
+    UNKNOWN, and WP5 excludes it from the pass@1 denominator — so a
+    verifier that ignored `dropped` would certify a submission whose
+    submitted number silently shrank (issue #44 E4)."""
+    f = build(tmp_path)
+    with open(f["jsonl"], "a", encoding="utf-8") as fh:
+        fh.write('{"instance_id": "psf__requests-1142", "stat')  # torn
+    assert vmain("--jsonl", f["jsonl"], "--manifest",
+                f["manifest"]) == vs.EXIT_INTEGRITY
+    out = capsys.readouterr().out
+    assert "[FAIL] CHECKPOINT" in out, out
+    assert "DROPPED" in out
+
+
+def test_a_corrupt_checkpoint_is_an_input_error_not_a_traceback(
+        tmp_path, capsys):
+    """Mid-file corruption is fail-loud in the WP5 loader; the verifier's
+    contract is the documented exit 2 (bad input), not exit 1 with a
+    stack trace the runbook cannot interpret."""
+    f = build(tmp_path)
+    lines = Path(f["jsonl"]).read_text().splitlines()
+    lines.insert(1, "{ this is not json")
+    Path(f["jsonl"]).write_text("\n".join(lines) + "\n")
+    assert vmain("--jsonl", f["jsonl"], "--manifest",
+                f["manifest"]) == vs.EXIT_INPUT
+    err = capsys.readouterr().err
+    assert err.startswith("INPUT:") and "Traceback" not in err, err
+
+
+def test_a_malformed_manifest_is_an_input_error(tmp_path, capsys):
+    """Completeness against the pinned manifest is the check that gives
+    the submission its 'all 500' claim — a file that is not a manifest
+    must stop the run, never degrade into 'verified'."""
+    f = build(tmp_path)
+    bad = tmp_path / "bad-manifest.json"
+    for content in ('{"instances": [{"id": "x"}]}',   # KeyError shape
+                   "[]",                              # empty
+                   "{not json",                       # not JSON
+                   '{"instances": "nope"}'):          # wrong type
+        bad.write_text(content)
+        assert vmain("--jsonl", f["jsonl"], "--manifest",
+                    str(bad)) == vs.EXIT_INPUT, content
+        err = capsys.readouterr().err
+        assert err.startswith("INPUT:") and "Traceback" not in err, err
+
+
+def test_the_label_must_be_the_header(tmp_path, capsys):
+    """A substring test would PASS a report that mentions the label in
+    prose while its header renders without it — the reviewer reads the
+    header (issue #44 E3)."""
+    f = build(tmp_path)
+    md_path = Path(f["report"]) / "report.md"
+    md = md_path.read_text()
+    want = f"**{vs.DEFAULT_LABEL}**"
+    assert want in md
+    drift = "\n".join(l for l in md.splitlines() if l.strip() != want)
+    drift += f"\n- methodology note: this is {vs.DEFAULT_LABEL}\n"
+    md_path.write_text(drift)
+    assert vs.DEFAULT_LABEL in md_path.read_text()   # substring: present
+    assert vmain("--jsonl", f["jsonl"], "--manifest",
+                f["manifest"]) == vs.EXIT_INTEGRITY
+    out = capsys.readouterr().out
+    assert "[FAIL] LABEL" in out, out
+
+
+# --------------------------------------------------------------------------
+# issue #44 review round 3 (Devin on #47): swapping SystemExit for
+# vs.InputError must not cost package_submission its documented exit 2
+# --------------------------------------------------------------------------
+
+def test_package_reports_a_checkpoint_name_with_no_run_id_as_input(
+        tmp_path, capsys):
+    """``vs.bundle_run_id`` is called in main() too, before package(). It
+    used to raise SystemExit, which main's handler turned into "INPUT:" +
+    exit 2; as an InputError it escaped as a traceback and exit 1."""
+    f = build(tmp_path)
+    renamed = Path(f["jsonl"]).with_name("preds.jsonl")
+    Path(f["jsonl"]).rename(renamed)
+    out = str(tmp_path / "sub")
+    rc = pmain("--jsonl", str(renamed), "--out", out, "--manifest",
+               f["manifest"])
+    err = capsys.readouterr().err
+    assert rc == ps.EXIT_INPUT, (rc, err)
+    assert err.startswith("INPUT:") and "Traceback" not in err, err
+    assert not Path(out).exists()
+
+
+def test_package_reports_a_malformed_manifest_as_input(tmp_path, capsys):
+    """vs.verify() raises InputError for a manifest that is not a pinned
+    instance list — the same escape, through package() this time."""
+    f = build(tmp_path)
+    bad = tmp_path / "manifest.json"
+    bad.write_text('{"instances": "not-a-list"}')
+    out = str(tmp_path / "sub")
+    rc = pmain("--jsonl", f["jsonl"], "--out", out, "--manifest", str(bad))
+    err = capsys.readouterr().err
+    assert rc == ps.EXIT_INPUT, (rc, err)
+    assert "INPUT:" in err and "Traceback" not in err, err
+
+
+@pytest.mark.parametrize("doc", [
+    '{"instances": [{"instance_id": null}]}',
+    '{"instances": [5]}',
+    '{"instances": [{"other": 1}]}',
+    '{"instances": []}',
+    '"not a document"',
+])
+def test_verify_refuses_a_hollow_manifest_with_exit_2(tmp_path, capsys,
+                                                     doc):
+    """The completeness check is only as good as the id list: a null or
+    non-string id must stop the run here, not arrive downstream as a
+    TypeError from ``sorted`` (exit 1, undocumented)."""
+    f = build(tmp_path)
+    man = tmp_path / "hollow.json"
+    man.write_text(doc)
+    rc = vmain("--jsonl", f["jsonl"], "--manifest", str(man))
+    err = capsys.readouterr().err
+    assert rc == vs.EXIT_INPUT, (doc, rc, err)
+    assert "INPUT:" in err and "Traceback" not in err, (doc, err)
+
+
+def test_package_reports_a_corrupt_run_meta_as_input(tmp_path, capsys):
+    """package() reads run_meta.json before vs.verify() reaches its META
+    check, so a malformed one escaped as a JSONDecodeError traceback and
+    exit 1 — the same class this PR fixes everywhere else (r4)."""
+    f = build(tmp_path)
+    meta = Path(f["report"], "run_meta.json")
+    meta.write_text('{"run_id": "r1", ')          # truncated JSON
+    out = str(tmp_path / "sub")
+    rc = pmain("--jsonl", f["jsonl"], "--out", out, "--manifest",
+               f["manifest"])
+    err = capsys.readouterr().err
+    assert rc == ps.EXIT_INPUT, (rc, err)
+    assert err.startswith("INPUT:") and "Traceback" not in err, err
+    assert "run_meta.json" in err, err
+
+
+@pytest.mark.parametrize("doc", [
+    '{"instances": [{"instance_id": "a"}, {"instance_id": "a"}]}',
+    '{"instances": [{"instance_id": "a"}, {"instance_id": "b"}, '
+    '{"instance_id": "a"}]}',
+])
+def test_a_manifest_with_a_duplicate_id_is_input(tmp_path, capsys, doc):
+    """A 500-entry manifest holding 480 distinct ids would otherwise report
+    a complete run at 480: every consumer dedupes, so the denominator
+    shrinks in silence (issue #44 review round 5)."""
+    f = build(tmp_path)
+    man = tmp_path / "dupes.json"
+    man.write_text(doc)
+    rc = vmain("--jsonl", f["jsonl"], "--manifest", str(man))
+    err = capsys.readouterr().err
+    assert rc == vs.EXIT_INPUT, (rc, err)
+    assert "repeats instance_id" in err and "Traceback" not in err, err

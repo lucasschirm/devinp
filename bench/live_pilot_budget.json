@@ -2,9 +2,10 @@
   "_comment": [
     "WP6c budget file (issue #44, blocker B2). PLAN §2: 'budget is config,",
     "not code'. Every pilot reads the two numeric caps; --pilot c ALSO",
-    "requires the four authorization fields below to be filled in, and",
-    "refuses to spend a single session while any of them is missing or",
-    "still says PENDING (live_pilot.require_full_run_authorization).",
+    "requires the FIVE authorization fields below to be filled in, and",
+    "refuses to spend a single session while any of them is missing,",
+    "still says PENDING, or is not the sentence/date it names (a number",
+    "signs nothing) — live_pilot.require_full_run_authorization.",
     "",
     "The caps below are the WP6a defaults, so pilots a and b behave exactly",
     "as they did before this file existed. Filling this file in is the",

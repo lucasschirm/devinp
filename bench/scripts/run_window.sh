@@ -29,10 +29,18 @@
 #   scripts/run_window.sh --pilot c --mode container --run-id full500 \
 #       --workdir ./full-run --resume
 #
+# This script SUPPLIES ``--stop-at-window-cap`` (issue #44 E5): the WP3
+# runner's default is to sleep to the next UTC window inside the process,
+# which would leave this script running for days, never printing the
+# resume line, never archiving. Set WP6C_KEEP_RUNNING=1 for that
+# (in-process) model.
+#
 # Environment (all optional):
 #   PYTHON              the interpreter (default: python3)
 #   LIVE_PILOT          the harness path (default: ../live_pilot.py)
 #   LOG_DIR             window logs (default: <workdir>/logs)
+#   WP6C_KEEP_RUNNING   don't add --stop-at-window-cap (the WP6b
+#                       in-process sleep model: one long-lived process)
 #   WP6C_ARCHIVE_DEST   a path off the run's own disk: every window ends by
 #                       archiving its artifacts there and VERIFYING the copy
 #                       byte-for-byte (scripts/archive_run.py); a failed
@@ -53,19 +61,94 @@ HARNESS="${LIVE_PILOT:-$SELF_DIR/../live_pilot.py}"
 	die "no interpreter at PYTHON=$PYTHON"
 [ -f "$HARNESS" ] || die "no harness at $HARNESS"
 
-# the workdir is parsed out of the passthrough args purely to place the
-# log — the harness remains the only reader of the invocation itself
+# ---- the effective invocation ------------------------------------------
+#
+# 1. the operator's argv is forwarded EXACTLY as typed. It used to be
+#    "normalised" here (``--workdir=X`` → ``--workdir X``), which changed
+#    the command rather than the spelling: argparse takes the glued form
+#    as it stands — ``--workdir=--x`` means the value ``--x`` — while the
+#    split form hands it an option where the value was, so rewriting it
+#    substituted a different outcome for the one asked for. The scans
+#    below read both forms instead (issue #44 review round 4).
+# 2. the window model is THIS script's whole reason to exist, so it
+#    supplies ``--stop-at-window-cap`` itself: without it the WP3 runner
+#    sleeps to the next UTC window INSIDE the process, this script never
+#    returns, exit 42 never happens and the per-window archive below never
+#    runs. An operator who wants the in-process model (a long-lived
+#    screen session, the WP6b contract) sets WP6C_KEEP_RUNNING=1.
+# 3. ``--workdir=X`` is the same flag to argparse as ``--workdir X``, and
+#    the scan below looks at separate tokens — so the glued form is split.
+#    A value that itself starts with ``-`` is left glued: that is what
+#    argparse was given, argparse rejects it, and silently un-gluing it
+#    would turn the operator's own command into a different refusal
+#    (issue #44 review r4).
+EFF=("$@")
+HAS_STOP_CAP=0
+for a in ${EFF[@]+"${EFF[@]}"}; do
+	[ "$a" = "--stop-at-window-cap" ] && HAS_STOP_CAP=1
+done
+# WP6C_KEEP_RUNNING is a flag, not a string: "0"/"false"/"no"/"off" mean
+# "do not", exactly as on the command line everywhere else in this repo —
+# and case-insensitively, because WP6C_KEEP_RUNNING=FALSE is a person
+# saying "no" in the caps their shell typed (issue #44 review r3)
+KEEP_RUNNING=0
+case "${WP6C_KEEP_RUNNING-}" in
+"" | 0 | [Ff][Aa][Ll][Ss][Ee] | [Nn][Oo] | [Oo][Ff][Ff]) ;;
+*) KEEP_RUNNING=1 ;;
+esac
+ADDED_STOP_CAP=0
+if [ "$HAS_STOP_CAP" = 0 ] && [ "$KEEP_RUNNING" = 0 ]; then
+	EFF+=(--stop-at-window-cap)
+	HAS_STOP_CAP=1
+	ADDED_STOP_CAP=1
+fi
+
+# how to print an invocation back at the operator: any argument holding
+# whitespace is single-quoted, so the resume command below is the command
+# they can paste (a workdir path with a space would otherwise print a
+# line that runs a different one)
+printable() {
+	local out="" a
+	for a in "$@"; do
+		case "$a" in
+		# quote the empty (it would vanish) and anything holding a
+		# character the shell would act on — the hint's whole job is to
+		# be pasted, and `foo&bar` / `we"ird` / `$x` need no space to
+		# stop being the argument they print as (issue #44 review r2)
+		"") a="''" ;;
+		*[!A-Za-z0-9_@%+=:,./-]*)
+			a="'${a//\'/\'\\\'\'}'" ;;
+		esac
+		out+="$a "
+	done
+	printf '%s' "${out% }"
+}
+
+# the workdir/run id are parsed out of the args purely to place the log
+# and the archive — the harness remains the only reader of the run itself
 WORKDIR=""
 RUN_ID=""
 prev=""
-for a in "$@"; do
+# the operator's OWN argv, not EFF: EFF already carries the
+# --stop-at-window-cap this script injects, and a trailing flag-without-a-
+# value ("--run-id" typed on its own) would have the scan eat the injected
+# flag — archive_run then got --run-id --stop-at-window-cap and the wrapper
+# reported exit 5 "fix the destination" for what is a bad invocation
+# (documented exit 2) — issue #44 review round 5
+for a in ${1+"$@"}; do
 	case "$prev" in
 	--workdir) WORKDIR="$a" ;;
 	--run-id) RUN_ID="$a" ;;
 	esac
+	# the glued spelling, so a normalised argv is not required for the
+	# log and the archive to land in the run's own directory
+	case "$a" in
+	--workdir=*) WORKDIR="${a#*=}" ;;
+	--run-id=*) RUN_ID="${a#*=}" ;;
+	esac
 	prev="$a"
 done
-case "$1" in
+case "${1:-}" in
 -h | --help)
 	# the whole header, whatever length it grows to (a fixed line range
 	# silently truncates the moment somebody documents another exit code)
@@ -91,13 +174,34 @@ while [ -e "$LOG" ]; do
 	n=$((n + 1))
 done
 
-echo "run_window: $PYTHON $HARNESS $*"
+# what the run looks like from the outside = what the harness actually
+# receives: the banner states the model of the EFFECTIVE argv (an operator
+# who sets WP6C_KEEP_RUNNING *and* passes the cap flag gets the cap, so
+# saying "in-process sleep" there would describe a run that is not
+# happening — issue #44 E5, reviewed)
+ARGS="$(printable ${EFF[@]+"${EFF[@]}"})"
+echo "run_window: $PYTHON $HARNESS $ARGS"
 echo "run_window: log $LOG"
+if [ "$HAS_STOP_CAP" = 1 ]; then
+	echo "run_window: window model: one window, stop at the cap (exit 42)"
+	if [ "$ADDED_STOP_CAP" = 1 ]; then
+		echo "              (added --stop-at-window-cap)"
+	elif [ "$KEEP_RUNNING" = 1 ]; then
+		echo "              (WP6C_KEEP_RUNNING is set but the arguments"
+		echo "              ask for the cap: the arguments win, so this"
+		echo "              window DOES end at the cap and IS archived)"
+	fi
+else
+	echo "run_window: window model: in-process sleep between windows"
+	echo "              (WP6C_KEEP_RUNNING=1: this process stays alive"
+	echo "              across UTC days — WP6b's contract; no exit 42,"
+	echo "              so no per-window archive either)"
+fi
 echo "run_window: ----"
 
 # one invocation, no retry, the exit code preserved through the tee
 # (PIPESTATUS, not $? — the operator needs the harness' code, not tee's)
-"$PYTHON" "$HARNESS" "$@" 2>&1 | tee "$LOG"
+"$PYTHON" "$HARNESS" ${EFF[@]+"${EFF[@]}"} 2>&1 | tee "$LOG"
 rc=${PIPESTATUS[0]}
 
 echo "run_window: ----"
@@ -111,9 +215,20 @@ case "$rc" in
 	echo "run_window: exit 42 — WINDOW CAP reached (the daily budget is"
 	echo "              spent; the checkpoint holds every outcome)."
 	echo "              Next window, same command:"
-	echo "                $0 $*"
+	# $0 too, not only the arguments: a checkout under a path with a space
+	# would break the very line this exists to be pasted as
+	echo "                $(printable "$0") $ARGS"
 	echo "              Status any time (read-only):"
-	echo "                $PYTHON $SELF_DIR/run_status.py --workdir $WORKDIR"
+	# ONE line: a hint wrapped after the program name runs run_status.py
+	# bare (argparse exit 2) and then tries to execute '--workdir'
+	# (issue #44 review r3 — the round-2 quoting fix introduced this)
+	# every token of it, not just the arguments: under a checkout like
+	# "/tmp/spaced dir/", an unquoted $SELF_DIR printed a command that runs
+	# /tmp/spaced (issue #44 review round 4 — the round-3 fix quoted $0 and
+	# the workdir but not the program, so the sibling hint was still wrong)
+	STATUS_CMD="$(printable "$PYTHON" "$SELF_DIR/run_status.py") \
+--workdir $(printable "$WORKDIR")"
+	echo "                $STATUS_CMD"
 	;;
 4)
 	echo "run_window: exit 4 — RUN FAILED. **STOP.** Do not loop-retry:"

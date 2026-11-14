@@ -289,7 +289,7 @@ def test_status_at_500_instance_scale(tmp_path):
     assert s["sessions_total"] == 472
     # ETA: 40 remaining / 10 per window = 4 windows, from measured walls
     assert s["eta"]["windows"] == 4
-    assert s["eta"]["basis"].startswith("mean measured session wall")
+    assert s["eta"]["basis"].startswith("median measured session wall")
     assert s["eta"]["session_hours"] == round(40 * 1200 / 3600, 1)
     out = run_status.render(s, run_status.disk_view(str(work)))
     assert "pass@1 SO FAR" in out and "provisional" in out
@@ -500,6 +500,10 @@ AUTHORIZED_BUDGET = {
     "basis": "drill fixture (the real file is issue #44 B2)",
     "authorized_by": "Operator Name <op@example.com>",
     "completion_deadline": "2027-06-30",
+    # issue #44 B7/B2: the gate enforces this field too, so an
+    # "authorized" fixture has to state it
+    "abort_rule": "two consecutive RUN FAILED windows stop the run "
+                  "(drill fixture)",
 }
 
 
@@ -968,3 +972,573 @@ def test_run_window_refuses_to_call_a_window_durable_when_archive_fails(
                    env={"WP6C_ARCHIVE_DEST": str(blocker)})
     assert p.returncode == 5, p.stdout + p.stderr
     assert "NOT durable" in p.stderr, p.stderr
+
+
+# ---------------------------------------------------------------------------
+# issue #44 review round 1: the wrapper's window contract, the ETA's
+# statistic, and the read-only tool's documented exit code
+# ---------------------------------------------------------------------------
+
+def test_run_window_supplies_the_window_cap_flag(tmp_path):
+    """A wrapper that documents the per-window model while leaving
+    ``--stop-at-window-cap`` to the operator sleeps for days inside the
+    process — the resume line never prints and the archive step below it
+    never runs (issue #44 E5)."""
+    args = ["--pilot", "c", "--mode", "container", "--run-id", "full500",
+            "--workdir", str(tmp_path / "wd"), "--resume"]
+    p, calls = _window(tmp_path, rc=42, args=args)
+    assert p.returncode == 42, p.stdout + p.stderr
+    argv = json.loads(calls.read_text())["argv"]
+    assert argv == args + ["--stop-at-window-cap"], argv
+    assert list((tmp_path / "wd" / "logs").glob("window-*.log"))
+    # the printed resume command is the one that ends the window again
+    hint = [l for l in p.stdout.splitlines() if "run_window.sh" in l
+            and "--workdir" in l]
+    assert hint and "--stop-at-window-cap" in hint[-1], p.stdout
+
+
+def test_run_window_never_doubles_the_flag(tmp_path):
+    p, calls = _window(tmp_path, rc=42, args=["--workdir",
+                                              str(tmp_path / "wd"),
+                                              "--stop-at-window-cap"])
+    argv = json.loads(calls.read_text())["argv"]
+    assert argv.count("--stop-at-window-cap") == 1, argv
+
+
+def test_run_window_keep_running_opts_back_into_the_process(tmp_path):
+    """WP6b's contract (one long-lived process that sleeps between
+    windows) stays available: the wrapper states its model, it does not
+    impose it."""
+    p, calls = _window(tmp_path, rc=0, env={"WP6C_KEEP_RUNNING": "1"})
+    assert p.returncode == 0, p.stdout + p.stderr
+    argv = json.loads(calls.read_text())["argv"]
+    assert "--stop-at-window-cap" not in argv, argv
+    assert "WP6C_KEEP_RUNNING" in p.stdout
+
+
+def test_run_window_accepts_the_equals_form(tmp_path):
+    """``--workdir=path`` is argparse-legal. The wrapper parses the args
+    only to place the window log and name the archive, and a parser that
+    missed the glued form would write the log somewhere else while the
+    harness ran the right run (issue #44 E5)."""
+    wd = tmp_path / "wd"
+    p, calls = _window(tmp_path, rc=0, args=[f"--workdir={wd}",
+                                            "--run-id=full500"])
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert list((wd / "logs").glob("window-*.log")), p.stdout
+    assert not (tmp_path / "logs").exists()
+    argv = json.loads(calls.read_text())["argv"]
+    # …and what the harness receives is what the operator typed: argparse
+    # reads both spellings, and rewriting the glued form makes
+    # ``--workdir=--x`` (the value ``--x``) into an option error
+    # (issue #44 review round 4)
+    assert argv == [f"--workdir={wd}", "--run-id=full500",
+                    "--stop-at-window-cap"], argv
+
+
+def test_run_window_no_args_is_the_documented_config_error(tmp_path):
+    """exit 2 + the message — not bash's unbound-variable exit 1, which
+    the runbook's exit-code table has no row for."""
+    p, _calls = _window(tmp_path, args=[])
+    assert p.returncode == 2, (p.returncode, p.stdout, p.stderr)
+    assert "--workdir" in p.stdout + p.stderr
+    assert "unbound variable" not in p.stderr
+
+
+def test_eta_uses_the_median_when_a_session_wedged(tmp_path):
+    """One wedged session at the wall cap is exactly the case the ETA
+    exists to survive. The mean projects the run out by days on it; the
+    median (also what checklist item 10 calibrates on) does not
+    (issue #44 E5)."""
+    walls = [1200.0] * 50 + [36000.0, 36000.0]   # two 10h wedges
+    ids = [f"a__a-{i}" for i in range(len(walls) + 20)]  # 20 still queued
+    lines = [_rec(iid, "failed_test", T0 + i * 60, wall=w)
+             for i, (iid, w) in enumerate(zip(ids, walls))]
+    work = _mk_run(tmp_path, lines)
+    s = run_status.status(str(work / "run-full500.jsonl"), ids, 10)
+    assert s["measure"]["median_s"] == 1200.0
+    assert s["measure"]["mean_s"] > 2000
+    assert s["eta"]["basis"].startswith("median measured session wall")
+    assert "mean" in s["eta"]["basis"]          # both, so it's auditable
+    assert s["eta"]["windows"] == 2             # 20 queued / cap 10
+
+
+def test_status_a_malformed_manifest_is_an_input_error(tmp_path, capsys):
+    """The manifest is what makes '472/500' mean something; a file that
+    is not a manifest must exit 2, not render a dashboard of dashes."""
+    work = _mk_run(tmp_path, [_rec("a__a-1", "resolved", T0)])
+    bad = tmp_path / "bad.json"
+    for content in ('{"instances": [{"id": "x"}]}', "[]", "{not json"):
+        bad.write_text(content)
+        rc = run_status.main(["--workdir", str(work), "--manifest",
+                             str(bad)])
+        err = capsys.readouterr().err
+        assert rc == run_status.EXIT_INPUT, (content, rc, err[-400:])
+        assert err.startswith("INPUT:") and "Traceback" not in err, err
+
+
+def test_status_a_non_numeric_cap_falls_back_loudly(tmp_path, monkeypatch,
+                                                   capsys):
+    """A budget file whose caps still say PENDING says 'not authorized
+    yet' — the read-only dashboard must still answer, and must say which
+    cap it invented (issue #44 B2/B7)."""
+    monkeypatch.setattr(lp, "load_budget_file",
+                        lambda _p: {"max_sessions_per_day": "PENDING",
+                                    "max_wall_per_session": "PENDING"})
+    work = _mk_run(tmp_path, [_rec(f"a__a-{i}", "resolved", T0 + i * 60)
+                             for i in range(3)])
+    assert run_status.main(["--workdir", str(work), "--manifest", ""]) \
+        == run_status.EXIT_OK
+    out = capsys.readouterr()
+    assert "NOTE" in out.err and "PENDING" in out.err, out.err
+    assert "cap 10/window" in out.out, out.out
+
+
+def test_archive_latest_is_a_pointer_and_a_corrupt_manifest_is_clean(
+        tmp_path, capsys):
+    """LATEST.tsv names the newest window's manifest (so a hand-checked
+    backup has one file to open), and a manifest with a corrupt byte
+    count must exit 2 with a sentence — not a ValueError in the middle of
+    the durability check the operator is relying on (issue #44 B4)."""
+    wd = tmp_path / "wd"
+    wd.mkdir()
+    (wd / "run-full500.jsonl").write_text(
+        _rec("test__repo0-1", "resolved", T0) + "\n")
+    (wd / "report").mkdir()
+    (wd / "report" / "report.md").write_text("# report\n")
+    dest = tmp_path / "offhost"
+    rc = ar.main(["--workdir", str(wd), "--dest", str(dest),
+                 "--stamp", "20260101T000000Z"])
+    assert rc == ar.EXIT_OK
+    latest = (dest / "full500" / "LATEST.tsv").read_text().strip()
+    target = Path(latest)
+    assert target.is_file() and target.name == "MANIFEST.tsv"
+    assert target.parent.name.startswith("20260101T000000Z")
+    # (a) the bundle itself is corrupt → 3: the backup is wrong
+    bundle = target.parent
+    (bundle / "report" / "report.md").write_text("# tampered\n")
+    assert ar.main(["--verify", "--bundle", str(bundle)]) == ar.EXIT_VERIFY
+    (bundle / "report" / "report.md").write_text("# report\n")
+    assert ar.main(["--verify", "--bundle", str(bundle)]) == ar.EXIT_OK
+    # (b) the manifest METADATA is unparseable → 2: the invocation/file
+    # is wrong, which is a different statement about the backup
+    rows = target.read_text().splitlines()
+    assert rows[0].startswith("# sha256")     # the header is a comment
+    f = rows[1].split("\t")
+    assert len(f) == 4, rows[1]
+    rows[1] = "\t".join([f[0], "not-a-number", f[2], f[3]])
+    target.write_text("\n".join(rows) + "\n")
+    rc = ar.main(["--verify", "--bundle", str(bundle)])
+    err = capsys.readouterr().err
+    assert rc == ar.EXIT_INPUT, (rc, err[-400:])
+    assert "malformed byte count" in err and "Traceback" not in err, err
+
+
+# --------------------------------------------------------------------------
+# issue #44 review round 2 (Devin on #47): the exit code that regressed,
+# the banner that described the wrong run, the cap that fell back silently
+# --------------------------------------------------------------------------
+
+def test_verify_a_bundle_without_a_manifest_is_exit_3(tmp_path, capsys):
+    """`--verify` on a directory that is not a bundle (no MANIFEST.tsv,
+    or a mistyped --bundle) is a DURABILITY failure — the same statement
+    as a byte mismatch — and never a traceback. Moving read_manifest
+    above the problems check made this crash with exit 1 (reviewed)."""
+    empty = tmp_path / "not-a-bundle"
+    empty.mkdir()
+    assert ar.main(["--verify", "--bundle", str(empty)]) == ar.EXIT_VERIFY
+    out = capsys.readouterr()
+    assert "no MANIFEST.tsv" in out.out and "Traceback" not in out.err
+    assert ar.main(["--verify", "--bundle",
+                    str(tmp_path / "does-not-exist")]) == ar.EXIT_VERIFY
+
+
+def test_status_an_impossible_cap_falls_back_loudly_too(tmp_path, capsys):
+    """0 and -5 are as unusable as PENDING: 'which cap did the ETA use'
+    must never be the one question the dashboard answers silently."""
+    work = _mk_run(tmp_path, [_rec(f"a__a-{i}", "resolved", T0 + i * 60)
+                             for i in range(3)])
+    for bad in ("0", "-5"):
+        assert run_status.main(["--workdir", str(work), "--manifest", "",
+                              "--cap", bad]) == run_status.EXIT_OK
+        out = capsys.readouterr()
+        assert "NOTE" in out.err and "max_sessions_per_day" in out.err, \
+            (bad, out.err[-300:])
+        assert "cap 10/window" in out.out, (bad, out.out[-300:])
+
+
+def test_run_window_args_beat_keep_running_in_the_banner(tmp_path):
+    """WP6C_KEEP_RUNNING plus an explicit cap flag: the flag is in the
+    argv, so the harness exits 42 and the archive runs — a banner that
+    still said 'in-process sleep, no exit 42' described a run that was
+    not happening (reviewed)."""
+    p, calls = _window(tmp_path, rc=42,
+                       args=["--workdir", str(tmp_path / "wd"),
+                             "--stop-at-window-cap"],
+                       env={"WP6C_KEEP_RUNNING": "1"})
+    assert p.returncode == 42, p.stdout + p.stderr
+    argv = json.loads(calls.read_text())["argv"]
+    assert "--stop-at-window-cap" in argv
+    assert "stop at the cap" in p.stdout, p.stdout
+    assert "in-process sleep" not in p.stdout, p.stdout
+    assert "the arguments win" in p.stdout, p.stdout
+
+
+def test_run_window_prints_a_command_that_runs_that_command(tmp_path):
+    """A workdir with a space is legal; the resume hint and the status
+    hint are copy-paste artefacts, so they must survive it (the argv
+    itself always did — the printed line was the broken half)."""
+    wd = tmp_path / "my run dir"
+    p, calls = _window(tmp_path, rc=42, args=["--workdir", str(wd)])
+    assert p.returncode == 42, p.stdout + p.stderr
+    argv = json.loads(calls.read_text())["argv"]
+    assert argv[:2] == ["--workdir", str(wd)], argv     # passed intact
+    hint = [l for l in p.stdout.splitlines()
+            if "run_window.sh" in l and "--workdir" in l]
+    assert hint and "'%s'" % wd in hint[-1], p.stdout
+    status = [l for l in p.stdout.splitlines()
+              if "run_status.py" in l or "--workdir" in l]
+    assert any("'%s'" % wd in l for l in status), p.stdout
+
+
+# --------------------------------------------------------------------------
+# issue #44 review round 2 (Devin on #47): the cap's remaining shapes, and
+# the hints that have to survive a paste
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_status_a_non_finite_cap_is_reported_not_crashed(tmp_path, capsys,
+                                                        monkeypatch, bad):
+    """json.loads accepts NaN/Infinity, and int() on them raises — so the
+    read-only dashboard would have answered a broken config with exit 1
+    and a traceback, the very contract this PR is polishing."""
+    monkeypatch.setattr(lp, "load_budget_file",
+                        lambda _p: {"max_sessions_per_day": bad})
+    work = _mk_run(tmp_path, [_rec(f"a__a-{i}", "resolved", T0 + i * 60)
+                             for i in range(3)])
+    assert run_status.main(["--workdir", str(work), "--manifest", ""]) \
+        == run_status.EXIT_OK
+    out = capsys.readouterr()
+    assert "NOTE" in out.err and "not a finite number" in out.err, out.err
+    assert "cap 10/window" in out.out and "Traceback" not in out.err
+
+
+def test_status_an_unreadable_budget_file_says_so(tmp_path, capsys,
+                                                 monkeypatch):
+    """A file the operator DID configure, and broke, is the same class of
+    answer as a PENDING cap: the ETA uses a number that is not theirs. It
+    names the file to fix (issue #44 review round 2)."""
+    def boom(_path):
+        raise SystemExit("budget file must be a JSON object")
+    monkeypatch.setattr(lp, "load_budget_file", boom)
+    work = _mk_run(tmp_path, [_rec(f"a__a-{i}", "resolved", T0 + i * 60)
+                             for i in range(3)])
+    assert run_status.main(["--workdir", str(work), "--manifest", ""]) \
+        == run_status.EXIT_OK
+    err = capsys.readouterr().err
+    assert "NOTE" in err and "cannot be read" in err, err[-300:]
+    assert "live_pilot_budget.json" in err, err[-300:]
+
+
+def test_status_the_note_blames_the_flag_when_the_flag_is_wrong(
+        tmp_path, capsys):
+    """--cap 0 is not the budget file's fault; telling the operator to
+    edit the file would send them to the wrong place."""
+    work = _mk_run(tmp_path, [_rec("a__a-1", "resolved", T0)])
+    assert run_status.main(["--workdir", str(work), "--manifest", "",
+                          "--cap", "0"]) == run_status.EXIT_OK
+    err = capsys.readouterr().err
+    assert "fix --cap" in err and "live_pilot_budget.json" not in err, \
+        err[-300:]
+
+
+def test_run_window_quotes_what_the_shell_would_act_on(tmp_path):
+    """The resume/status hints exist to be pasted. An argument with no
+    whitespace can still stop being itself (`&`, `"`, `$`, a newline in a
+    path), and an empty one vanishes entirely — so printable() quotes
+    anything outside the shell's safe set."""
+    for tricky in ["foo&bar", 'we"ird', "$HOME", "a;b", ""]:
+        wd = tmp_path / f"wd-{abs(hash(tricky))}"
+        p, calls = _window(tmp_path, rc=42, args=["--workdir", str(wd),
+                                                 "--instances", tricky])
+        argv = json.loads(calls.read_text())["argv"]
+        assert argv[:4] == ["--workdir", str(wd), "--instances",
+                            tricky], (tricky, argv)
+        hint = [l for l in p.stdout.splitlines()
+                if "run_window.sh" in l and "--workdir" in l]
+        assert hint, (tricky, p.stdout)
+        line = hint[-1]
+        if tricky:
+            assert repr(tricky) in line or f"'{tricky}'" in line, \
+                (tricky, line)
+        else:
+            assert "--instances ''" in line, (tricky, line)
+
+
+@pytest.mark.parametrize("value,added", [("0", True), ("false", True),
+                                         ("no", True), ("1", False),
+                                         ("true", False)])
+def test_run_window_keep_running_is_a_flag_not_a_string(tmp_path, value,
+                                                       added):
+    """WP6C_KEEP_RUNNING=0 must mean "do not keep running" — the same
+    reading every other flag in the repo gets (issue #44 review r2)."""
+    p, calls = _window(tmp_path, rc=42,
+                       args=["--workdir", str(tmp_path / "wd")],
+                       env={"WP6C_KEEP_RUNNING": value})
+    argv = json.loads(calls.read_text())["argv"]
+    assert ("--stop-at-window-cap" in argv) is added, (value, argv)
+    model = "stop at the cap" if added else "in-process sleep"
+    assert model in p.stdout, (value, p.stdout)
+
+
+# --------------------------------------------------------------------------
+# issue #44 review round 3 (Devin on #47): the paste target, the unreadable
+# bundle, and the cap that is a number but not a count
+# --------------------------------------------------------------------------
+
+def test_status_hint_is_one_pasteable_command(tmp_path):
+    """A hint wrapped after the program name is not a command: pasting it
+    runs run_status.py bare (argparse exit 2) and then tries to execute
+    '--workdir'. Round 2's quoting fix introduced exactly this, and the
+    round-2 test only asked that the quoted workdir appear SOMEWHERE."""
+    import shlex
+    wd = "/tmp/we ird"
+    p, _ = _window(tmp_path, rc=42, args=["--workdir", wd])
+    lines = p.stdout.splitlines()
+    at = [n for n, l in enumerate(lines) if "Status any time" in l]
+    assert at, p.stdout
+    cmd = lines[at[0] + 1].strip()
+    assert "run_status.py" in cmd, cmd
+    assert shlex.split(cmd)[-2:] == ["--workdir", wd], cmd
+    # and the line parses as a shell command, on its own, in one piece
+    chk = subprocess.run(["bash", "-n", "-c", cmd], capture_output=True)
+    assert chk.returncode == 0, (cmd, chk.stderr)
+
+
+@pytest.mark.parametrize("value,follows", [("FALSE", True), ("Off", True),
+                                           ("NO", True), ("yes", False),
+                                           ("1", False)])
+def test_run_window_keep_running_reads_the_word_not_the_case(tmp_path,
+                                                            value, follows):
+    """WP6C_KEEP_RUNNING=FALSE is a person saying no in the caps their
+    shell typed (issue #44 review round 3)."""
+    p, calls = _window(tmp_path, rc=42,
+                       args=["--workdir", str(tmp_path / "wd")],
+                       env={"WP6C_KEEP_RUNNING": value})
+    argv = json.loads(calls.read_text())["argv"]
+    assert ("--stop-at-window-cap" in argv) is follows, (value, argv)
+
+
+def test_verify_an_unreadable_manifest_is_input_not_a_traceback(tmp_path,
+                                                               capsys):
+    """A MANIFEST.tsv that exists but cannot be opened (mode 000, a dead
+    mount) is a statement about the host, not about the bundle's
+    durability — exit 2, no traceback (issue #44 review round 3)."""
+    wd = _mk_workdir(tmp_path)
+    dest = tmp_path / "offhost"
+    ar.main(["--workdir", str(wd), "--dest", str(dest), "--stamp", "W1"])
+    bundle = dest / "full500" / "windows" / "W1"
+    man = bundle / "MANIFEST.tsv"
+    os.chmod(man, 0)
+    try:
+        rc = ar.main(["--verify", "--bundle", str(bundle)])
+    finally:
+        os.chmod(man, 0o644)
+    err = capsys.readouterr().err
+    assert rc == ar.EXIT_INPUT, (rc, err)
+    assert "INPUT:" in err and "Traceback" not in err, err
+
+
+def test_usable_cap_says_so_for_a_fractional_cap():
+    """3.7 is a cap the harness itself would refuse; truncating it to 3 in
+    silence would make the ETA's denominator a private decision
+    (issue #44 review round 3)."""
+    cap, why = run_status.usable_cap(3.7)
+    assert cap == 3
+    assert "not a whole number" in why and "3/window" in why, why
+    assert run_status.usable_cap(4) == (4, "")
+    assert run_status.usable_cap(None) == (run_status.DEFAULT_CAP, "")
+
+
+def test_status_a_manifest_with_a_hollow_entry_is_input_too(tmp_path,
+                                                           capsys):
+    """Every queue number on the dashboard comes from the manifest, and a
+    null id used to pass the container check (issue #44 review r3)."""
+    work = _mk_run(tmp_path, [_rec("a__a-1", "resolved", T0)])
+    for doc in ('{"instances": [{"instance_id": null}]}',
+                '{"instances": [5]}',
+                '{"instances": [{"other": 1}]}'):
+        man = tmp_path / "m.json"
+        man.write_text(doc)
+        rc = run_status.main(["--workdir", str(work), "--manifest",
+                              str(man)])
+        err = capsys.readouterr().err
+        assert rc == run_status.EXIT_INPUT, (doc, rc, err)
+        assert "instance_id" in err and "Traceback" not in err, (doc, err)
+
+
+# --------------------------------------------------------------------------
+# issue #44 review round 4 (Devin on #47): the tokens of the hint that were
+# still bare, and two numbers that were not the numbers used
+# --------------------------------------------------------------------------
+
+def _run_from(tmp_path, spaced=True):
+    """Run the wrapper from a checkout whose path contains a space — the
+    condition every printed hint has to survive."""
+    where = tmp_path / ("a copy" if spaced else "plain")
+    where.mkdir(parents=True, exist_ok=True)
+    target = where / "run_window.sh"
+    target.write_text((_SCRIPTS / "run_window.sh").read_text())
+    stub = tmp_path / "stub_harness.py"
+    stub.write_text(STUB)
+    env = dict(os.environ)
+    env.update({"PYTHON": sys.executable, "LIVE_PILOT": str(stub),
+                "STUB_RC": "42", "STUB_CALLS": str(tmp_path / "c.json")})
+    p = subprocess.run(["bash", str(target), "--workdir",
+                        str(tmp_path / "wd")], capture_output=True,
+                       text=True, env=env, timeout=120, cwd=str(tmp_path))
+    return p, target
+
+
+def test_status_hint_survives_a_checkout_with_a_space(tmp_path):
+    """Round 3 quoted $0 and the workdir but left ``$PYTHON`` and
+    ``$SELF_DIR/run_status.py`` bare, so under '/tmp/spaced dir/' the hint
+    printed a command that runs '/tmp/spaced'. Both hints are one shlex
+    round-trip from being the real argv now."""
+    import shlex
+    p, target = _run_from(tmp_path)
+    lines = p.stdout.splitlines()
+    wd = str(tmp_path / "wd")
+
+    def hint(marker):
+        at = [n for n, l in enumerate(lines) if marker in l]
+        assert at, (marker, p.stdout)
+        cmd = lines[at[0] + 1].strip()
+        chk = subprocess.run(["bash", "-n", "-c", cmd],
+                             capture_output=True)
+        assert chk.returncode == 0, (cmd, chk.stderr)
+        return shlex.split(cmd)
+
+    resume = hint("Next window")
+    assert resume[0] == str(target), resume        # $0, quoted
+    # …followed by the EFFECTIVE argv, which is the operator's own argv
+    # plus the --stop-at-window-cap this script supplies
+    assert resume[1:3] == ["--workdir", wd], resume
+    assert resume[-1] == "--stop-at-window-cap", resume
+    status = hint("Status any time")
+    assert status[0] == sys.executable, status     # $PYTHON
+    assert status[1] == str(target.parent / "run_status.py"), status
+    assert status[-2:] == ["--workdir", wd], status
+
+
+@pytest.mark.parametrize("arg", ["--workdir={wd}", "--workdir {wd}"])
+def test_the_operator_argv_reaches_the_harness_exactly_as_typed(tmp_path,
+                                                               arg):
+    """The wrapper used to rewrite ``--workdir=X`` into ``--workdir X``,
+    which is a DIFFERENT command to argparse: the glued form carries a
+    value beginning with ``-`` (``--workdir=--x`` is the value ``--x``),
+    the split form hands argparse an option where the value was. So argv
+    goes through untouched, and the wrapper reads both spellings itself
+    for the one thing it needs — where the log and the archive go
+    (issue #44 review round 4)."""
+    wd = str(tmp_path / "wd")
+    p, calls = _window(tmp_path, rc=42, args=arg.format(wd=wd).split())
+    argv = json.loads(calls.read_text())["argv"]
+    assert " ".join(argv).startswith(arg.format(wd=wd)), argv
+    assert "--stop-at-window-cap" in argv, argv
+    assert list((tmp_path / "wd" / "logs").glob("window-*.log")), \
+        p.stdout
+
+
+def test_status_a_missing_workdir_is_exit_2(tmp_path, capsys):
+    """"no workdir"/"two checkpoints, pass --run-id" is unreadable input,
+    which this script documents as exit 2 — it left with exit 1 and a
+    bare message (pre-existing, in the contract this PR polishes)."""
+    for args in ([str(tmp_path / "absent"), None],):
+        rc = run_status.main(["--workdir", args[0], "--manifest", ""])
+        err = capsys.readouterr().err
+        assert rc == run_status.EXIT_INPUT, (rc, err)
+        assert err.startswith("INPUT:"), err
+    # an ambiguous workdir says the same thing
+    work = tmp_path / "two"
+    work.mkdir()
+    for name in ("run-a.jsonl", "run-b.jsonl"):
+        (work / name).write_text("")
+    assert run_status.main(["--workdir", str(work), "--manifest",
+                          ""]) == run_status.EXIT_INPUT
+
+
+def test_usable_cap_names_the_cap_the_eta_uses():
+    """status() computes with max(1, cap), so a 0.5 announced as
+    '0/window' would name a number the ETA never used (r4)."""
+    for value, expected in [(0.5, 1), (3.7, 3), (1.2, 1)]:
+        cap, why = run_status.usable_cap(value)
+        assert cap == expected, (value, cap)
+        assert f"uses {expected}/window" in why, (value, why)
+
+
+# --------------------------------------------------------------------------
+# issue #44 review round 5 (Devin on #47): the injected flag was scannable
+# argv, and a name that carries no run id invented one
+# --------------------------------------------------------------------------
+
+def test_a_trailing_flag_never_eats_the_injected_one(tmp_path):
+    """``--run-id`` typed without its value used to make the scan read the
+    ``--stop-at-window-cap`` this script injects, so archive_run got
+    ``--run-id --stop-at-window-cap`` and the wrapper answered a bad
+    invocation with exit 5, "fix the destination"."""
+    work = _mk_run(tmp_path, [_rec(f"a__a-{i}", "resolved", T0 + i * 60)
+                             for i in range(2)])
+    p, _ = _window(tmp_path, rc=42, args=["--workdir", str(work),
+                                         "--run-id"],
+                   env={"WP6C_ARCHIVE_DEST": str(tmp_path / "offhost")})
+    assert "fix the destination" not in p.stdout, p.stdout
+    assert p.returncode == 42, (p.returncode, p.stdout[-600:])
+
+
+def test_a_trailing_workdir_is_the_documented_config_error(tmp_path):
+    """Same class: the value it never had must not become the injected
+    flag, which then turned into a bogus log-directory name."""
+    p, _ = _window(tmp_path, rc=42, args=["--run-id", "x", "--workdir"])
+    assert p.returncode == 2, (p.returncode, p.stdout, p.stderr)
+    assert "pass --workdir" in p.stderr, p.stderr
+
+
+@pytest.mark.parametrize("name,warns", [
+    ("run-full500.jsonl", ""),
+    ("run-x.jsonl", ""),
+    ("checkpoint.jsonl", "not run-<id>.jsonl"),
+    ("run-.jsonl", "not run-<id>.jsonl"),
+    ("jsonl", "not run-<id>.jsonl"),
+])
+def test_jsonl_run_id_refuses_to_guess(name, warns):
+    """Slicing ``checkpoint.jsonl`` into ``kpoint`` was a run id that
+    looked real, missed the state file, and silently dropped the previous
+    window's flags from the dashboard (issue #44 review round 5)."""
+    rid, why = run_status.jsonl_run_id(f"/some/dir/{name}")
+    if warns:
+        assert rid == "" and warns in why, (name, rid, why)
+    else:
+        assert rid == name[4:-len(".jsonl")] and why == "", (name, rid, why)
+
+
+def test_status_says_aloud_when_it_has_no_run_id(tmp_path, capsys):
+    """The refusal must be visible, not a run id that quietly reads as a
+    real one three screens down."""
+    work = _mk_run(tmp_path, [_rec("a__a-1", "resolved", T0)],
+                   name="checkpoint.jsonl")
+    (work / "pilot-kpoint.state.json").write_text(json.dumps(
+        {"final_state": "WINDOW_CAP", "window_cap": True}))
+    rc = run_status.main(["--jsonl", str(work / "checkpoint.jsonl"),
+                        "--manifest", ""])
+    out = capsys.readouterr()
+    assert rc == run_status.EXIT_OK, (rc, out.err)
+    assert "NOTE" in out.out and "not run-<id>.jsonl" in out.out, out.out
+    assert "WINDOW_CAP" not in out.out, out.out
+    # the --json form carries the same statement
+    proc = subprocess.run([sys.executable, str(_SCRIPTS / "run_status.py"),
+                           "--jsonl", str(work / "checkpoint.jsonl"),
+                           "--manifest", "", "--json"],
+                          capture_output=True, text=True,
+                          env=dict(os.environ, PYTHONPATH=str(_BENCH)))
+    assert json.loads(proc.stdout)["id_warning"], proc.stdout

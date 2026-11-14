@@ -173,8 +173,16 @@ def package(jsonl: str, report_dir: str, out: str, *,
     meta_path = os.path.join(report_dir, "run_meta.json")
     if not os.path.isfile(meta_path):
         raise SystemExit(f"no run_meta.json in {report_dir!r}")
-    with open(meta_path, "r", encoding="utf-8") as f:
-        meta = json.load(f)
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+    except (ValueError, OSError) as exc:
+        # a corrupt run_meta.json used to escape as a JSONDecodeError
+        # traceback (exit 1) because this read happens before vs.verify()
+        # gets to report the same file as a failed META check — the whole
+        # point of this PR's error-handling pass (issue #44 review r4)
+        raise vs.InputError(f"{meta_path!r} is not readable JSON: {exc}"
+                            ) from exc
 
     # a stale bundle must never be published beside a changed checkpoint:
     # re-packaging is allowed only when the destination is empty (or the
@@ -296,13 +304,21 @@ def main(argv: "list[str] | None" = None) -> int:
     if manifest and not os.path.isfile(manifest):
         print(f"INPUT: no manifest at {manifest!r}", file=sys.stderr)
         return EXIT_INPUT
-    out = args.out or os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(jsonl))),
-        "submission", vs.bundle_run_id(jsonl))
     try:
+        # bundle_run_id() raises vs.InputError — and it is called HERE too,
+        # before package(). It used to raise SystemExit, which the handler
+        # below turned into "INPUT:" + the documented exit 2; swapping the
+        # exception type silently turned that path into a traceback and
+        # exit 1 (issue #44 review round 3, confirmed at runtime).
+        out = args.out or os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(jsonl))),
+            "submission", vs.bundle_run_id(jsonl))
         summary = package(jsonl, report_dir, out, manifest=manifest,
                          allow_incomplete=args.allow_incomplete,
                          force=args.force, label=args.label)
+    except vs.InputError as exc:
+        print(f"INPUT: {exc}", file=sys.stderr)
+        return EXIT_INPUT
     except SystemExit as exc:  # the refuse paths inside package()
         code = exc.code
         if isinstance(code, int) and code in (EXIT_INTEGRITY,):

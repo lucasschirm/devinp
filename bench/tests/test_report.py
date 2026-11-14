@@ -952,3 +952,109 @@ def test_cli_midfile_corruption_exits_4(tmp_path):
     jsonl.write_text("\n".join(lines) + "\n", encoding="utf-8")
     proc = _cli(tmp_path, "--jsonl", str(jsonl), "--out", str(out))
     assert proc.returncode == 4
+
+
+# --------------------------------------------------------------------------
+# the submission label (WP6c E3, issue #44 review round 2): the header is
+# a POSITION, not a region
+# --------------------------------------------------------------------------
+
+_LABEL = "Devin (agent) on SWE-bench Verified"
+
+
+def _rendered_with_label() -> str:
+    """The real thing: render_report's title block is ``# title`` / blank /
+    ``**label**`` / blank / ``## Summary``."""
+    return ("# SWE-bench Verified — Devin ACP run report\n\n"
+            f"**{_LABEL}**\n\n## Summary\n\n- pass@1 …\n")
+
+
+def test_label_in_header_accepts_the_rendered_title_block():
+    assert report.label_in_header(_rendered_with_label(), _LABEL)
+
+
+def test_label_in_header_rejects_prose_and_absence():
+    body = ("# SWE-bench Verified — Devin ACP run report\n\n## Summary\n\n"
+            f"- methodology: this is {_LABEL}\n")
+    assert not report.label_in_header(body, _LABEL)
+    assert not report.label_in_header(_rendered_with_label(), "Other")
+    assert not report.label_in_header("", _LABEL)
+    assert not report.label_in_header(_rendered_with_label(), "")
+
+
+def test_label_in_header_needs_no_sections_to_be_strict(tmp_path):
+    """A report with **no** ``##`` section at all used to put its whole
+    body in the header, so a ``**label**`` line buried anywhere in that
+    body passed — the one drift this check exists to catch. The label is
+    the last line of the title block, and nothing else is (reviewed)."""
+    buried = ("# SWE-bench Verified — Devin ACP run report\n\n"
+              "Some prose.\n\n"
+              f"**{_LABEL}**\n\n"
+              "More prose after it, and no section anywhere.\n")
+    assert _LABEL in buried
+    assert "## " not in buried
+    assert not report.label_in_header(buried, _LABEL)
+    # and the label as the last line of a section-less title block is
+    # still the header it is supposed to be
+    assert report.label_in_header(
+        "# SWE-bench Verified — Devin ACP run report\n\n"
+        f"**{_LABEL}**\n", _LABEL)
+
+
+def test_label_in_header_needs_a_title_block_at_all():
+    """A document whose FIRST line is already ``## `` has no title block —
+    the split looks for ``\\n## `` — so a trailing ``**label**`` in it must
+    not read as labelled. Same for a fenced block that swallows the title
+    (issue #44 review round 3)."""
+    no_title = (f"## Summary\n\n- pass@1 …\n\n**{_LABEL}**\n")
+    assert not report.label_in_header(no_title, _LABEL)
+    fenced = ("# SWE-bench Verified — Devin ACP run report\n\n"
+              "```markdown\n## not a section\n```\n\n"
+              f"**{_LABEL}**\n\n## Summary\n")
+    # the fence truncates the block early, so the label is NOT the last
+    # line of what the parser calls the title: refused, and that is the
+    # safe direction for a check that only ever says yes to a header
+    assert not report.label_in_header(fenced, _LABEL)
+
+
+# --------------------------------------------------------------------------
+# manifest_ids (issue #44 review round 3): both readers of the pinned
+# manifest take their numbers from one shape rule
+# --------------------------------------------------------------------------
+
+def test_manifest_ids_accepts_the_pinned_shape():
+    doc = {"instances": [{"instance_id": "a__b-1"},
+                         {"instance_id": "c__d-2"}]}
+    assert report.manifest_ids(doc) == ["a__b-1", "c__d-2"]
+    # a bare list is the other shape run_status has always taken
+    assert report.manifest_ids([{"instance_id": "a__b-1"}]) == ["a__b-1"]
+
+
+@pytest.mark.parametrize("doc,why", [
+    ({"instances": [{"instance_id": None}]}, "instance_id"),
+    ({"instances": [{"instance_id": 5}]}, "instance_id"),
+    ({"instances": [{"instance_id": ""}]}, "instance_id"),
+    ({"instances": [5]}, "instance_id"),
+    ({"instances": [None]}, "instance_id"),
+    ({"instances": []}, "empty"),
+    ({"instances": "a__b-1"}, "list"),
+    ({"nope": []}, "list"),
+    ("not a document", "list"),
+])
+def test_manifest_ids_refuses_a_hollow_document(doc, why):
+    """``{"instances": [{"instance_id": null}]}`` used to pass the
+    container check and blow up later in a consumer's ``sorted``/``join``
+    — exit 1 where the documented answer is "bad input"."""
+    with pytest.raises(ValueError) as e:
+        report.manifest_ids(doc)
+    assert why in str(e.value)
+
+
+def test_manifest_ids_rejects_a_duplicate():
+    """Uniqueness is part of the shape, not a nicety: the pin script
+    guarantees it for the committed file, and --manifest takes any path."""
+    with pytest.raises(ValueError, match="repeats instance_id"):
+        report.manifest_ids({"instances": [{"instance_id": "a"},
+                                           {"instance_id": "a"}]})
+    assert report.manifest_ids(
+        [{"instance_id": "a"}, {"instance_id": "b"}]) == ["a", "b"]

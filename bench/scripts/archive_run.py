@@ -11,7 +11,8 @@ This script snapshots a workdir **off the run path**, content-addressed:
 
     <dest>/<run_id>/windows/<UTC>/MANIFEST.tsv    sha256 · bytes · path
     <dest>/<run_id>/windows/<UTC>/…               the artifacts themselves
-    <dest>/<run_id>/LATEST.tsv                    the newest window's manifest
+    <dest>/<run_id>/LATEST.tsv                    the PATH of the newest
+                                                  window's manifest
 
 and then **verifies the copy** (a backup nobody re-reads is a rumor — the
 same rule WP5's R1/R2 checks apply to the patch artifacts). A window's
@@ -130,7 +131,15 @@ def read_manifest(path: str) -> "list[tuple[str, int, str]]":
             parts = line.split("\t")
             if len(parts) < 3:
                 raise SystemExit(f"{path!r}: malformed manifest line")
-            out.append((parts[0], int(parts[1]), parts[2]))
+            try:
+                size = int(parts[1])
+            except ValueError as exc:
+                # a corrupt manifest is an input problem with a name,
+                # not a traceback in the middle of a --verify
+                raise SystemExit(
+                    f"{path!r}: malformed byte count {parts[1]!r} for "
+                    f"{parts[2]!r}") from exc
+            out.append((parts[0], size, parts[2]))
     return out
 
 
@@ -238,14 +247,47 @@ def main(argv: "list[str] | None" = None) -> int:
         if not args.bundle:
             print("INPUT: --verify needs --bundle", file=sys.stderr)
             return EXIT_INPUT
-        problems = verify(args.bundle)
+        try:
+            problems = verify(args.bundle)
+        except SystemExit as exc:
+            # a MANIFEST.tsv that cannot be parsed is BAD INPUT (exit 2),
+            # which is a different statement from "this bundle is not
+            # byte-identical" (exit 3): one means fix the invocation or
+            # the file, the other means the backup is wrong
+            print(f"INPUT: {exc}", file=sys.stderr)
+            return EXIT_INPUT
+        except OSError as exc:
+            # a MANIFEST.tsv that exists but cannot be opened (mode 000,
+            # a dangling mount, an entry file vanishing mid-walk) is a
+            # statement about the invocation/host, not about the bundle's
+            # durability — and never a traceback (review r3)
+            print(f"INPUT: cannot read {args.bundle!r}: {exc}",
+                  file=sys.stderr)
+            return EXIT_INPUT
         if problems:
+            # including "no MANIFEST.tsv here" / a mistyped --bundle:
+            # verify() REPORTS that, and it is a durability failure (3),
+            # not an input error — and never a traceback
             for x in problems[:20]:
                 print(f"[FAIL] {x}")
             print(f"NOT DURABLE: {len(problems)} problem(s) in "
                   f"{args.bundle}", file=sys.stderr)
             return EXIT_VERIFY
-        ents = read_manifest(os.path.join(args.bundle, MANIFEST_NAME))
+        # verify() already re-hashed every listed entry; this second read
+        # only totals the line below. It is a check-then-act, so a file
+        # swapped in between the two is a window this shares with any
+        # archiver — the bundle is append-only and the next verify (or
+        # the operator's own, off-host) re-reads and re-hashes it
+        try:
+            ents = read_manifest(os.path.join(args.bundle, MANIFEST_NAME))
+        except (SystemExit, OSError) as exc:
+            # verify() said the bytes match, then the manifest went away
+            # or became unreadable: "not verifiable" is exit 3, since
+            # nothing about the invocation changed
+            print(f"NOT VERIFIABLE: {args.bundle!r} changed while it was "
+                  f"being read: {exc}", file=sys.stderr)
+            return EXIT_VERIFY
+
         print(f"VERIFIED {args.bundle}: {len(ents)} file(s), "
               f"{sum(e[1] for e in ents)} bytes, byte-identical to the "
               "manifest")

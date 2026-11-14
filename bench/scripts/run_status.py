@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shutil
 import sys
@@ -69,6 +70,24 @@ def find_jsonl(workdir: str, run_id: "str | None") -> "tuple[str, str]":
                         f"({', '.join(found[:5])}) — pass --run-id")
     base = found[0]
     return os.path.join(workdir, base), base[4:-len(".jsonl")]
+
+
+def jsonl_run_id(path: str) -> "tuple[str, str]":
+    """``(run id, warning)`` read from a checkpoint's own name.
+
+    The layout is ``run-<id>.jsonl`` and the state file beside it is
+    ``pilot-<id>.state.json``. Slicing the name blindly invented an id for
+    any other file — ``checkpoint.jsonl`` yielded ``kpoint``, the state
+    lookup missed, and the dashboard silently dropped the previous
+    window's flags while still printing a run id that looked real (issue
+    #44 review round 5). No id, and a warning, instead of a guess.
+    """
+    name = Path(path).name
+    if (name.startswith("run-") and name.endswith(".jsonl")
+            and len(name) > len("run-.jsonl")):
+        return name[4:-len(".jsonl")], ""
+    return "", (f"{name!r} is not run-<id>.jsonl: no run id, so the "
+                "previous window's state file is not consulted")
 
 
 def window_stats(records: list) -> dict:
@@ -113,8 +132,62 @@ def measure(records: list) -> dict:
                     and v > 0:
                 walls.append(float(v))
                 break
+    ordered = sorted(walls)
+    med = None
+    if ordered:
+        mid = len(ordered) // 2
+        med = (ordered[mid] if len(ordered) % 2
+              else (ordered[mid - 1] + ordered[mid]) / 2.0)
     return {"n": len(walls), "total_s": sum(walls),
-           "mean_s": (sum(walls) / len(walls)) if walls else None}
+            "mean_s": (sum(walls) / len(walls)) if walls else None,
+            # the ETA rests on the MEDIAN: one wedged session that hit
+            # the wall cap would otherwise drag the projection out by
+            # days, and item 10's calibration prints the median too
+            "median_s": med}
+
+
+#: the WP6a default per-window session cap — used only when nothing
+#: usable is configured, and always said out loud (an ETA is a plan, and
+#: a plan built on a guessed number has to say which number it guessed)
+DEFAULT_CAP = 10
+
+
+def usable_cap(value) -> "tuple[int, str]":
+    """The ETA's per-window cap, plus the reason a configured value was
+    refused (empty when it was fine).
+
+    A ``PENDING`` placeholder, a stray string, a ``0`` and a negative
+    number all mean the same thing to the operator: the number the ETA
+    used is not their authorization, so all four earn the NOTE — while a
+    value that was simply never configured (the normal state before B2)
+    does not, or every dashboard would open with a warning nobody can
+    act on (issue #44 E5/B2, reviewed).
+    """
+    if value is None:
+        return DEFAULT_CAP, ""      # nothing configured: a quiet fallback
+    fallback = (f"the ETA below uses the WP6a default of "
+                f"{DEFAULT_CAP}/window instead")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return DEFAULT_CAP, (f"max_sessions_per_day {value!r} is not a "
+                             f"number — {fallback}")
+    if not math.isfinite(value):
+        # json.loads accepts NaN and Infinity, and int() on them raises —
+        # the read-only dashboard must not answer a bad config with exit 1
+        # (issue #44 review round 2)
+        return DEFAULT_CAP, (f"max_sessions_per_day {value!r} is not a "
+                             f"finite number — {fallback}")
+    if value <= 0:
+        return DEFAULT_CAP, (f"max_sessions_per_day {value!r} is not a "
+                             f"positive number — {fallback}")
+    if int(value) != value:
+        # 3.7 is a cap the harness itself would refuse; saying so beats
+        # truncating it to 3 in silence (review r3). And the number named
+        # must be the number used: status() computes with max(1, cap), so
+        # 0.5 must not be announced as 0/window (review r4)
+        eff = max(1, int(value))
+        return eff, (f"max_sessions_per_day {value!r} is not a whole "
+                     f"number — the ETA below uses {eff}/window")
+    return int(value), ""
 
 
 def status(jsonl: str, manifest_ids: "list[str] | None",
@@ -136,13 +209,15 @@ def status(jsonl: str, manifest_ids: "list[str] | None",
     pending_retry = sorted(iid for iid, r in finals.items()
                           if r.get("status") in rr.RETRY_STATUSES)
     workdir = os.path.dirname(os.path.abspath(jsonl))
-    run_id = Path(jsonl).name[4:-len(".jsonl")]
+    run_id, id_warning = jsonl_run_id(jsonl)
     # the state file: the previous window's flags (it carries no queue —
     # the checkpoint does), so it is reported, never trusted for the math
     state: dict = {}
     state_error = ""
     state_path = os.path.join(workdir, f"pilot-{run_id}.state.json")
     try:
+        if not run_id:
+            raise OSError("no run id in the file name")
         with open(state_path, "r", encoding="utf-8") as f:
             loaded = json.load(f)
         state = loaded if isinstance(loaded, dict) else {}
@@ -179,12 +254,16 @@ def status(jsonl: str, manifest_ids: "list[str] | None",
                 "finish_date": None, "basis": "no measurement yet"}
     if manifest_ids is not None and remaining:
         eta["windows"] = -(-remaining // max(1, cap))
-        if measured["mean_s"]:
+        if measured["median_s"]:
             eta["session_hours"] = round(
-                remaining * measured["mean_s"] / 3600.0, 1)
-            eta["basis"] = (f"mean measured session wall "
-                           f"{measured['mean_s']:.0f}s over "
-                           f"{measured['n']} session(s)")
+                remaining * measured["median_s"] / 3600.0, 1)
+            eta["basis"] = (f"median measured session wall "
+                           f"{measured['median_s']:.0f}s over "
+                           f"{measured['n']} session(s)"
+                           + (f" (mean {measured['mean_s']:.0f}s — the "
+                              "median ignores a wedged session's "
+                              "wall-cap outlier)"
+                              if measured["n"] >= 3 else ""))
         # one window per UTC day is the quota ceiling, so the date
         # projection is windows, not hours
         eta["finish_date"] = time.strftime(
@@ -192,6 +271,7 @@ def status(jsonl: str, manifest_ids: "list[str] | None",
     used = sum(w["sessions"] for w in windows.values())
     return {
         "run_id": run_id,
+        "id_warning": id_warning,
         "jsonl": jsonl,
         "workdir": workdir,
         "lines": len(records),
@@ -271,7 +351,9 @@ def disk_view(workdir: str) -> dict:
 
 
 def render(s: dict, disk: "dict | None") -> str:
-    out = [f"# run {s['run_id']} — {s['jsonl']}", ""]
+    out = [f"# run {s['run_id'] or '(unknown)'} — {s['jsonl']}", ""]
+    if s.get("id_warning"):
+        out.append(f"NOTE: {s['id_warning']}")
     if s["dropped_line"]:
         out.append("WARNING: a malformed line was dropped reading the "
                   "checkpoint (the torn-last-line class of a SIGKILL — "
@@ -386,9 +468,16 @@ def main(argv: "list[str] | None" = None) -> int:
 
     if args.jsonl:
         jsonl = args.jsonl
-        run_id = Path(jsonl).name[4:-len(".jsonl")]
     else:
-        jsonl, run_id = find_jsonl(args.workdir, args.run_id)
+        try:
+            jsonl, _run_id = find_jsonl(args.workdir, args.run_id)
+        except SystemExit as exc:
+            # the documented contract of this script is 0 = readable and
+            # 2 = unreadable input; "no workdir"/"two checkpoints, pass
+            # --run-id" is exactly that, and used to leave with exit 1
+            # (issue #44 review round 4, pre-existing line)
+            print(f"INPUT: {exc}", file=sys.stderr)
+            return EXIT_INPUT
     if not os.path.isfile(jsonl):
         print(f"INPUT: no checkpoint at {jsonl!r}", file=sys.stderr)
         return EXIT_INPUT
@@ -400,9 +489,19 @@ def main(argv: "list[str] | None" = None) -> int:
                   "--manifest '' to skip the queue view)",
                   file=sys.stderr)
             return EXIT_INPUT
-        with open(args.manifest, "r", encoding="utf-8") as f:
-            manifest_ids = [i["instance_id"]
-                           for i in json.load(f)["instances"]]
+        try:
+            with open(args.manifest, "r", encoding="utf-8") as f:
+                doc = json.load(f)
+            manifest_ids = rep.manifest_ids(doc)
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            # every queue number on the dashboard comes from this file;
+            # a wrong shape must stop the report, not corrupt it
+            print(f"INPUT: {args.manifest!r} is not an instance manifest "
+                  f"(an object with an \"instances\" list of objects "
+                  f"carrying instance_id): {exc}", file=sys.stderr)
+            return EXIT_INPUT
+    source = "--cap" if cap is not None else "live_pilot_budget.json"
+    why_read = ""
     if cap is None:
         # the operator's authorized per-window cap, not the pilot default
         # — a 500-run ETA computed from a 10-session pilot cap would be
@@ -411,10 +510,20 @@ def main(argv: "list[str] | None" = None) -> int:
             import live_pilot as lp
             cap = lp.load_budget_file(lp.BUDGET_FILE).get(
                 "max_sessions_per_day")
-        except SystemExit:
+        except (Exception, SystemExit) as exc:
+            # a budget loader that refuses loudly must still leave the
+            # operator a dashboard — but a file they DID configure and
+            # that cannot be read belongs with PENDING/0/-5: the ETA is
+            # about to use a number that is not theirs, so it says so,
+            # and says which file to fix (issue #44 review round 2)
             cap = None
-    if not cap or cap <= 0:
-        cap = 10  # the WP6a default; the output says which cap was used
+            why_read = ("the budget file's max_sessions_per_day cannot be "
+                        f"read ({type(exc).__name__}: {exc})")
+    cap, why = usable_cap(cap)
+    why = why or why_read
+    if why:
+        print(f"NOTE: {why} (fix {source}, issue #44 B2)",
+              file=sys.stderr)
     try:
         s = status(jsonl, manifest_ids, cap)
     except rep.ReportError as exc:
