@@ -21,8 +21,8 @@ interpreter's f-string tokenizer, and it accepts the line above on 3.12
 (verified). So the scan below reimplements the pre-3.11 rule — **the
 literal ends at the first unescaped occurrence of its own quote run,
 because ``{{`` escapes a brace and hides nothing** — and compares that
-extent with where 3.12 says the literal really ended. Two extra rules
-cover the other PEP 701 relaxations: a comment, or a newline in a
+extent with where 3.12 says the literal really ended. Three extra rules
+cover the other relaxations: a comment, a backslash, or a newline in a
 single-quoted literal, inside a replacement field.
 
 Literals are taken from the running tokenizer, not from a line scan: a
@@ -46,6 +46,7 @@ _WORKFLOW = _BENCH.parent / ".github" / "workflows" / "ci.yml"
 _NESTED_QUOTE = ("a quote run of the same kind as the f-string's own "
                  "inside a replacement field")
 _COMMENT = "a comment inside a replacement field"
+_BACKSLASH = "a backslash inside a replacement field"
 _NEWLINE = "a newline inside a single-quoted replacement field"
 
 #: the line that broke CI on PR #47, as the source text of a module
@@ -70,6 +71,8 @@ LEGAL = [
     'x = f"""{"# not a comment"}"""\n',           # inside a nested string
     'x = f"""{"a"} and {b}"""\n',                 # lone quotes in triple
     'x = f"{x:#>5}"\n',                          # '#' is fill, not comment
+    'x = f"{d[0:1]}"\n',
+    'x = f"{(lambda v: v)(x)}"\n',
     'x = f"{v:#010x}"\n',
     'x = f"{x:{y}#{20}}"\n',                     # and inside a nested field
     'x = f"""{d["key"]}"""\n',                   # the pre-3.12 workaround:
@@ -81,6 +84,8 @@ LEGAL = [
 #: parses on 3.12, is a SyntaxError on 3.11
 ILLEGAL_BEFORE_3_12 = [
     CI_BREAKER,
+    '''x = f"{'a\\'b'}"\n''',        # 3.11: no backslash in a field
+    'x = f"""{d[0:1]  # comment after a slice\n}"""\n',
     'x = f"{d["k"]}"\n',
     "x = f'{d['k']}'\n",
     'x = f"{ \'a"b\' }"\n',
@@ -111,21 +116,37 @@ def _literal_end_311(src: str, i: int, quotes: str) -> int:
 
 
 def _fields_312(src: str, i: int, end: int, triple: bool):
-    """Yield ``(kind, pos)`` for constructs PEP 701 added inside
-    replacement fields: ``"comment"`` / ``"newline"`` (the latter only
-    when the literal is single-quoted).
+    """Yield ``(kind, pos)`` for constructs 3.12 allows inside a
+    replacement field and 3.11 cannot parse: ``"comment"``, ``"backslash"``
+    and ``"newline"`` (the last only when the literal is single-quoted).
 
     Two things must not be mistaken for a comment: a ``#`` inside a nested
-    string, and a ``#`` after the field's ``:`` — in a format spec ``#``
-    is a fill/align character, and ``f"{x:#>5}"`` / ``f"{v:#010x}"`` are
-    as old as f-strings (issue #44 review round 2 caught exactly this).
-    ``spec`` tracks, per open field, whether its ``:`` has been passed."""
+    string, and a ``#`` after the field's **own** ``:`` — in a format spec
+    ``#`` is a fill/align character, and ``f"{x:#>5}"`` / ``f"{v:#010x}"``
+    are as old as f-strings (issue #44 review round 2 caught exactly
+    this). ``spec`` tracks, per open field, whether that colon has been
+    passed, and ``brk`` keeps the field's own colon apart from the colon
+    of a slice, a lambda or a call, which does not start spec text (caught
+    in review round 3, together with the backslash rule above).
+
+    Deliberate limit: a dict *literal* written inside a field (``f"{ {'a':
+    1}['a'] }"``) reads as a nested field here, so a comment after its
+    colon would be missed. Nothing in this repo writes one, the tokenizer
+    rule that would settle it is exactly what 3.12 changed, and CI's 3.11
+    job remains the backstop."""
     depth = 0
     in_str = None
-    spec: "list[bool]" = []
+    spec: "list[bool]" = []   # per open field: past its own ":"?
+    brk: "list[int]" = []     # per open field: open "(" / "[" count
     while i < end:
         c = src[i]
         if c == "\\":
+            # pre-3.12: "f-string expression part cannot include a
+            # backslash". In f"{'a\'}" the backslash sits inside the field
+            # even though it escapes a nested string, so 3.11 rejects the
+            # line and 3.12 accepts it (issue #44 review round 3)
+            if depth:
+                yield ("backslash", i)
             i += 2
             continue
         if depth == 0:
@@ -135,6 +156,7 @@ def _fields_312(src: str, i: int, end: int, triple: bool):
                     continue
                 depth = 1
                 spec.append(False)
+                brk.append(0)
             elif c == "}":
                 if src[i + 1:i + 2] == "}":
                     i += 2
@@ -155,8 +177,15 @@ def _fields_312(src: str, i: int, end: int, triple: bool):
             in_str = run if run in ('"""', "'''") else c
             i += len(in_str)
             continue
-        if c == ":" and not spec[-1]:
-            spec[-1] = True         # format-spec text from here on
+        if c in "([":
+            brk[-1] += 1
+        elif c in ")]":
+            brk[-1] = max(0, brk[-1] - 1)
+        elif c == ":" and not spec[-1] and not brk[-1]:
+            # a ":" inside () or [] belongs to a slice, a lambda or a call,
+            # not to the format spec: only the field's own colon starts
+            # spec text, where "#" is a fill character
+            spec[-1] = True
         elif c == "#" and not spec[-1]:
             yield ("comment", i)
         elif c == "\n" and not triple:
@@ -164,10 +193,12 @@ def _fields_312(src: str, i: int, end: int, triple: bool):
         if c == "{":
             depth += 1
             spec.append(False)
+            brk.append(0)
         elif c == "}":
             depth -= 1
             if spec:
                 spec.pop()
+                brk.pop()
         i += 1
 
 
@@ -234,7 +265,9 @@ def pep701_hits(src: str, path: str = "<string>") -> "list[str]":
             continue
         for kind, at in _fields_312(src, body, close_at,
                                     len(quotes) == 3):
-            what = _COMMENT if kind == "comment" else _NEWLINE
+            what = {"comment": _COMMENT,
+                    "newline": _NEWLINE,
+                    "backslash": _BACKSLASH}[kind]
             hits.append(f"{path}:{_line_of(src, at)}: PEP 701 "
                         f"(3.12 only): {what}")
     return hits
@@ -285,10 +318,13 @@ def _breaker_from_history():
     test skips). Issue #44 review round 2; this function is the fix.
     """
     import subprocess
-    log = subprocess.run(["git", "log", "--format=%H", "--",
-                          "bench/scripts/verify_submission.py"],
-                         cwd=str(_BENCH.parent), capture_output=True,
-                         text=True)
+    try:
+        log = subprocess.run(["git", "log", "--format=%H", "--",
+                              "bench/scripts/verify_submission.py"],
+                             cwd=str(_BENCH.parent),
+                             capture_output=True, text=True)
+    except OSError:
+        return None        # no git / no repo: skip, do not error out
     if log.returncode != 0:
         return None
     for rev in log.stdout.split():

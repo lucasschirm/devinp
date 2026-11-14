@@ -375,9 +375,10 @@ def verify(jsonl: str, report_dir: str,
         try:
             with open(manifest_path, "r", encoding="utf-8") as f:
                 doc = json.load(f)
-            ids = [i["instance_id"] for i in doc["instances"]]
-            if not ids:
-                raise ValueError("the 'instances' list is empty")
+            # one shape rule for both readers of the manifest, checked
+            # element-wise: a null/non-string id must be exit 2 here, not
+            # a TypeError from check_queue's sorted() (review r3)
+            ids = rep.manifest_ids(doc)
         except (OSError, ValueError, TypeError, KeyError) as exc:
             # the completeness check is meaningless without a manifest,
             # and "meaningless" must not read as "verified"

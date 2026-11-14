@@ -256,6 +256,14 @@ def main(argv: "list[str] | None" = None) -> int:
             # the file, the other means the backup is wrong
             print(f"INPUT: {exc}", file=sys.stderr)
             return EXIT_INPUT
+        except OSError as exc:
+            # a MANIFEST.tsv that exists but cannot be opened (mode 000,
+            # a dangling mount, an entry file vanishing mid-walk) is a
+            # statement about the invocation/host, not about the bundle's
+            # durability — and never a traceback (review r3)
+            print(f"INPUT: cannot read {args.bundle!r}: {exc}",
+                  file=sys.stderr)
+            return EXIT_INPUT
         if problems:
             # including "no MANIFEST.tsv here" / a mistyped --bundle:
             # verify() REPORTS that, and it is a durability failure (3),
@@ -270,7 +278,16 @@ def main(argv: "list[str] | None" = None) -> int:
         # swapped in between the two is a window this shares with any
         # archiver — the bundle is append-only and the next verify (or
         # the operator's own, off-host) re-reads and re-hashes it
-        ents = read_manifest(os.path.join(args.bundle, MANIFEST_NAME))
+        try:
+            ents = read_manifest(os.path.join(args.bundle, MANIFEST_NAME))
+        except (SystemExit, OSError) as exc:
+            # verify() said the bytes match, then the manifest went away
+            # or became unreadable: "not verifiable" is exit 3, since
+            # nothing about the invocation changed
+            print(f"NOT VERIFIABLE: {args.bundle!r} changed while it was "
+                  f"being read: {exc}", file=sys.stderr)
+            return EXIT_VERIFY
+
         print(f"VERIFIED {args.bundle}: {len(ents)} file(s), "
               f"{sum(e[1] for e in ents)} bytes, byte-identical to the "
               "manifest")

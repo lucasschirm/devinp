@@ -657,3 +657,59 @@ def test_the_label_must_be_the_header(tmp_path, capsys):
                 f["manifest"]) == vs.EXIT_INTEGRITY
     out = capsys.readouterr().out
     assert "[FAIL] LABEL" in out, out
+
+
+# --------------------------------------------------------------------------
+# issue #44 review round 3 (Devin on #47): swapping SystemExit for
+# vs.InputError must not cost package_submission its documented exit 2
+# --------------------------------------------------------------------------
+
+def test_package_reports_a_checkpoint_name_with_no_run_id_as_input(
+        tmp_path, capsys):
+    """``vs.bundle_run_id`` is called in main() too, before package(). It
+    used to raise SystemExit, which main's handler turned into "INPUT:" +
+    exit 2; as an InputError it escaped as a traceback and exit 1."""
+    f = build(tmp_path)
+    renamed = Path(f["jsonl"]).with_name("preds.jsonl")
+    Path(f["jsonl"]).rename(renamed)
+    out = str(tmp_path / "sub")
+    rc = pmain("--jsonl", str(renamed), "--out", out, "--manifest",
+               f["manifest"])
+    err = capsys.readouterr().err
+    assert rc == ps.EXIT_INPUT, (rc, err)
+    assert err.startswith("INPUT:") and "Traceback" not in err, err
+    assert not Path(out).exists()
+
+
+def test_package_reports_a_malformed_manifest_as_input(tmp_path, capsys):
+    """vs.verify() raises InputError for a manifest that is not a pinned
+    instance list — the same escape, through package() this time."""
+    f = build(tmp_path)
+    bad = tmp_path / "manifest.json"
+    bad.write_text('{"instances": "not-a-list"}')
+    out = str(tmp_path / "sub")
+    rc = pmain("--jsonl", f["jsonl"], "--out", out, "--manifest", str(bad))
+    err = capsys.readouterr().err
+    assert rc == ps.EXIT_INPUT, (rc, err)
+    assert "INPUT:" in err and "Traceback" not in err, err
+
+
+@pytest.mark.parametrize("doc", [
+    '{"instances": [{"instance_id": null}]}',
+    '{"instances": [5]}',
+    '{"instances": [{"other": 1}]}',
+    '{"instances": []}',
+    '"not a document"',
+])
+def test_verify_refuses_a_hollow_manifest_with_exit_2(tmp_path, capsys,
+                                                     doc):
+    """The completeness check is only as good as the id list: a null or
+    non-string id must stop the run here, not arrive downstream as a
+    TypeError from ``sorted`` (exit 1, undocumented)."""
+    f = build(tmp_path)
+    man = tmp_path / "hollow.json"
+    man.write_text(doc)
+    rc = vmain("--jsonl", f["jsonl"], "--manifest", str(man))
+    err = capsys.readouterr().err
+    assert rc == vs.EXIT_INPUT, (doc, rc, err)
+    assert "INPUT:" in err and "Traceback" not in err, (doc, err)

@@ -929,3 +929,26 @@ def test_the_committed_template_is_still_unauthorised_after_the_change():
         assert field in str(e.value)
     # and its own _comment tells the operator the truth about the set
     assert "FIVE authorization fields" in " ".join(committed["_comment"])
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"),
+                                float("-inf")])
+@pytest.mark.parametrize("field", ["max_sessions_per_day",
+                                   "max_wall_per_session"])
+def test_the_b2_gate_refuses_a_non_finite_cap(field, bad):
+    """``NaN <= 0`` is False, so a budget file saying
+    ``max_wall_per_session: NaN`` was "calibrated", reached
+    ``SessionSpec.wall_s`` and switched the per-session wall cap off in
+    the very run this gate authorized (issue #44 review round 3;
+    run_status.usable_cap had already been fixed for the same reason)."""
+    with pytest.raises(lp.PilotConfigError, match=field):
+        lp.require_full_run_authorization(
+            _authorized_budget(**{field: bad}), "budget.json")
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+@pytest.mark.parametrize("field", ["max_wall_s", "daily_pause_s",
+                                   "largest_bytes"])
+def test_the_config_refuses_a_non_finite_number(field, bad):
+    with pytest.raises(lp.PilotConfigError, match=field):
+        lp.PilotConfig(**{field: bad})

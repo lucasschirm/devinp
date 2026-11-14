@@ -147,18 +147,28 @@ def usable_cap(value) -> "tuple[int, str]":
     """
     if value is None:
         return DEFAULT_CAP, ""
+    fallback = (f"the ETA below uses the WP6a default of "
+                f"{DEFAULT_CAP}/window instead")
+    if value is None:
+        return DEFAULT_CAP, ""      # nothing configured: a quiet fallback
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return DEFAULT_CAP, f"max_sessions_per_day {value!r} is not a " \
-            "number"
+        return DEFAULT_CAP, (f"max_sessions_per_day {value!r} is not a "
+                             f"number — {fallback}")
     if not math.isfinite(value):
         # json.loads accepts NaN and Infinity, and int() on them raises —
         # the read-only dashboard must not answer a bad config with exit 1
         # (issue #44 review round 2)
-        return DEFAULT_CAP, f"max_sessions_per_day {value!r} is not a " \
-            "finite number"
+        return DEFAULT_CAP, (f"max_sessions_per_day {value!r} is not a "
+                             f"finite number — {fallback}")
     if value <= 0:
-        return DEFAULT_CAP, f"max_sessions_per_day {value!r} is not a " \
-            "positive number"
+        return DEFAULT_CAP, (f"max_sessions_per_day {value!r} is not a "
+                             f"positive number — {fallback}")
+    if int(value) != value:
+        # 3.7 is a cap the harness itself would refuse; saying so beats
+        # truncating it to 3 in silence (review r3)
+        return int(value), (f"max_sessions_per_day {value!r} is not a whole "
+                            f"number — the ETA below uses {int(value)}"
+                            f"/window")
     return int(value), ""
 
 
@@ -452,10 +462,7 @@ def main(argv: "list[str] | None" = None) -> int:
         try:
             with open(args.manifest, "r", encoding="utf-8") as f:
                 doc = json.load(f)
-            rows = doc["instances"] if isinstance(doc, dict) else doc
-            manifest_ids = [i["instance_id"] for i in rows]
-            if not manifest_ids:
-                raise ValueError("the instance list is empty")
+            manifest_ids = rep.manifest_ids(doc)
         except (OSError, ValueError, TypeError, KeyError) as exc:
             # every queue number on the dashboard comes from this file;
             # a wrong shape must stop the report, not corrupt it
@@ -485,8 +492,7 @@ def main(argv: "list[str] | None" = None) -> int:
     cap, why = usable_cap(cap)
     why = why or why_read
     if why:
-        print(f"NOTE: {why} — the ETA below uses the WP6a default of "
-              f"{DEFAULT_CAP} instead (fix {source}, issue #44 B2)",
+        print(f"NOTE: {why} (fix {source}, issue #44 B2)",
               file=sys.stderr)
     try:
         s = status(jsonl, manifest_ids, cap)

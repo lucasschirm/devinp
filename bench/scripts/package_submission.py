@@ -296,13 +296,21 @@ def main(argv: "list[str] | None" = None) -> int:
     if manifest and not os.path.isfile(manifest):
         print(f"INPUT: no manifest at {manifest!r}", file=sys.stderr)
         return EXIT_INPUT
-    out = args.out or os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(jsonl))),
-        "submission", vs.bundle_run_id(jsonl))
     try:
+        # bundle_run_id() raises vs.InputError — and it is called HERE too,
+        # before package(). It used to raise SystemExit, which the handler
+        # below turned into "INPUT:" + the documented exit 2; swapping the
+        # exception type silently turned that path into a traceback and
+        # exit 1 (issue #44 review round 3, confirmed at runtime).
+        out = args.out or os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(jsonl))),
+            "submission", vs.bundle_run_id(jsonl))
         summary = package(jsonl, report_dir, out, manifest=manifest,
                          allow_incomplete=args.allow_incomplete,
                          force=args.force, label=args.label)
+    except vs.InputError as exc:
+        print(f"INPUT: {exc}", file=sys.stderr)
+        return EXIT_INPUT
     except SystemExit as exc:  # the refuse paths inside package()
         code = exc.code
         if isinstance(code, int) and code in (EXIT_INTEGRITY,):

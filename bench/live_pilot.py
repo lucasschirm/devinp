@@ -415,7 +415,7 @@ class PilotConfig:
         for name in ("max_wall_s", "daily_pause_s", "largest_bytes"):
             v = getattr(self, name)
             if isinstance(v, bool) or not isinstance(v, (int, float)) \
-                    or v <= 0:
+                    or not math.isfinite(v) or v <= 0:
                 raise PilotConfigError(
                     f"{name} must be a number > 0 (got {v!r})")
 
@@ -3886,10 +3886,16 @@ def require_full_run_authorization(budget: dict,
     caps = ("max_sessions_per_day", "max_wall_per_session")
 
     def uncalibrated(v) -> bool:
-        """A cap that is absent, a bool, not a number or not positive."""
+        """A cap that is absent, a bool, not a number, not finite or not
+        positive. NaN/Infinity are numbers and json.loads accepts both,
+        and ``NaN <= 0`` is False — so without the finiteness test a
+        budget file saying ``max_wall_per_session: NaN`` would be
+        “calibrated”, reach SessionSpec.wall_s and switch the per-session
+        wall cap off in the very run this gate authorized (issue #44
+        review round 3; run_status.usable_cap already refused it)."""
         if isinstance(v, bool) or not isinstance(v, (int, float)):
             return True
-        return v <= 0
+        return not math.isfinite(v) or v <= 0
 
     def unauthorised(v) -> bool:
         """Anything but a non-empty string that does not start with
@@ -5076,11 +5082,14 @@ def _build_parser() -> argparse.ArgumentParser:
                         "the default workdir/record naming follows)")
     p.add_argument("--import-run", default=None,
                help="the checkpoint import (issue #22 AC2; a pilot-B "
-                    "or pilot-C flag, MODE-GATED: a source whose "
-                    "recorded grading mode differs from this run's "
-                    "--mode is refused, and --pilot c additionally "
-                    "refuses a source with no recorded mode — the two "
-                    "grading legs must never be mixed in one pass@1): "
+                    "or pilot-C flag, PROVENANCE-GATED "
+                    "(live_pilot.IMPORT_PROVENANCE): a source whose "
+                    "recorded grading MODE or MODEL differs from this "
+                    "run's --mode/--model "
+                    "is refused — the two grading legs must never be "
+                    "mixed in one pass@1 — and --pilot c requires BOTH "
+                    "fields to have been recorded, since a half-recorded "
+                    "methodology is as unattributable as none): "
                     "the source run's "
                     "id (issue #22 AC2 — the 3 Pilot A instances "
                     "are reused inside the 25, never re-run; "
@@ -5135,12 +5144,14 @@ def main(argv: "Optional[list]" = None) -> int:
         # an explicit zero/negative cap is a config error, not a
         # silent replacement by the default (the ``or`` fallback
         # covers absence only)
-        if msp <= 0:
+        if not math.isfinite(msp) or msp <= 0:
             raise PilotConfigError(
-                "max_sessions_per_day must be > 0")
-        if mw <= 0:
+                "max_sessions_per_day must be a finite number > 0")
+        if not math.isfinite(mw) or mw <= 0:
             raise PilotConfigError(
-                "max_wall_per_session must be > 0")
+                "max_wall_per_session must be a finite number > 0 "
+                "(NaN would disable the wall cap, Infinity make it "
+                "unbounded)")
         if (args.largest_bytes is not None
                 and args.largest_bytes <= 0):
             raise PilotConfigError("--largest-bytes must be > 0")

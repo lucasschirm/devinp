@@ -779,7 +779,48 @@ def label_in_header(md: str, label: str) -> bool:
     want = f"**{label}**"
     head = md.split("\n## ", 1)[0]
     lines = [ln.strip() for ln in head.splitlines() if ln.strip()]
-    return bool(lines) and lines[-1] == want
+    # A document whose FIRST line is already "## " has no title block at
+    # all (the split above looks for "\n## "), and a fenced block holding
+    # a "## " line would truncate the block early. Requiring the title
+    # line render_report writes makes both misreadings fail in the safe
+    # direction (issue #44 review r3).
+    if not lines or not lines[0].startswith("# "):
+        return False
+    return lines[-1] == want
+
+
+def manifest_ids(doc: object) -> "list[str]":
+    """The instance ids of a pinned manifest document, shape-checked.
+
+    Both readers of ``verified_instances.json`` — verify_submission's
+    completeness check and run_status's queue dashboard — take their
+    numbers from this list, so a document that merely *parses* is not
+    enough. ``{\"instances\": [{\"instance_id\": null}]}`` used to sail
+    through the container check and fail later inside a consumer's
+    ``sorted``/``join`` with a ``TypeError`` — exit 1 where the documented
+    answer is “bad input” (issue #44 review round 3).
+
+    Accepts ``{\"instances\": [...]}`` or a bare list of objects.
+
+    Raises:
+        ValueError: the container is wrong, an entry is not an object, an
+            ``instance_id`` is missing or is not a non-empty string, or
+            the list is empty.
+    """
+    rows = doc.get("instances") if isinstance(doc, dict) else doc
+    if not isinstance(rows, list):
+        raise ValueError("expected an object with an \"instances\" list "
+                         "of objects carrying instance_id")
+    ids: "list[str]" = []
+    for n, item in enumerate(rows):
+        iid = item.get("instance_id") if isinstance(item, dict) else None
+        if not isinstance(iid, str) or not iid:
+            raise ValueError(f"instances[{n}] has no non-empty string "
+                             f"instance_id (entry {item!r})")
+        ids.append(iid)
+    if not ids:
+        raise ValueError("the \"instances\" list is empty")
+    return ids
 
 
 # ---------------------------------------------------------------------------

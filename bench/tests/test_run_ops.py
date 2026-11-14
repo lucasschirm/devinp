@@ -1284,3 +1284,115 @@ def test_run_window_keep_running_is_a_flag_not_a_string(tmp_path, value,
     assert ("--stop-at-window-cap" in argv) is added, (value, argv)
     model = "stop at the cap" if added else "in-process sleep"
     assert model in p.stdout, (value, p.stdout)
+
+
+# --------------------------------------------------------------------------
+# issue #44 review round 3 (Devin on #47): the paste target, the unreadable
+# bundle, and the cap that is a number but not a count
+# --------------------------------------------------------------------------
+
+def test_status_hint_is_one_pasteable_command(tmp_path):
+    """A hint wrapped after the program name is not a command: pasting it
+    runs run_status.py bare (argparse exit 2) and then tries to execute
+    '--workdir'. Round 2's quoting fix introduced exactly this, and the
+    round-2 test only asked that the quoted workdir appear SOMEWHERE."""
+    import shlex
+    wd = "/tmp/we ird"
+    p, _ = _window(tmp_path, rc=42, args=["--workdir", wd])
+    lines = p.stdout.splitlines()
+    at = [n for n, l in enumerate(lines) if "Status any time" in l]
+    assert at, p.stdout
+    cmd = lines[at[0] + 1].strip()
+    assert "run_status.py" in cmd, cmd
+    assert shlex.split(cmd)[-2:] == ["--workdir", wd], cmd
+    # and the line parses as a shell command, on its own, in one piece
+    chk = subprocess.run(["bash", "-n", "-c", cmd], capture_output=True)
+    assert chk.returncode == 0, (cmd, chk.stderr)
+
+
+def test_resume_hint_quotes_its_own_program(tmp_path):
+    """$0 is part of the pasted command too: a checkout under a path with
+    a space would otherwise stop being the command it prints (issue #44
+    review round 3 nit)."""
+    import shlex
+    spaced = tmp_path / "a copy"
+    spaced.mkdir()
+    target = spaced / "run_window.sh"
+    target.write_text((_SCRIPTS / "run_window.sh").read_text())
+    stub = tmp_path / "stub_harness.py"
+    stub.write_text(STUB)
+    env = dict(os.environ)
+    env.update({"PYTHON": sys.executable, "LIVE_PILOT": str(stub),
+                "STUB_RC": "42", "STUB_CALLS": str(tmp_path / "c.json")})
+    p = subprocess.run(["bash", str(target), "--workdir",
+                        str(tmp_path / "wd")], capture_output=True,
+                       text=True, env=env, timeout=120, cwd=str(tmp_path))
+    lines = p.stdout.splitlines()
+    at = [n for n, l in enumerate(lines) if "Next window" in l]
+    assert at, p.stdout + p.stderr
+    cmd = lines[at[0] + 1].strip()
+    assert shlex.split(cmd)[0] == str(target), cmd
+    chk = subprocess.run(["bash", "-n", "-c", cmd], capture_output=True)
+    assert chk.returncode == 0, (cmd, chk.stderr)
+
+
+@pytest.mark.parametrize("value,follows", [("FALSE", True), ("Off", True),
+                                           ("NO", True), ("yes", False),
+                                           ("1", False)])
+def test_run_window_keep_running_reads_the_word_not_the_case(tmp_path,
+                                                            value, follows):
+    """WP6C_KEEP_RUNNING=FALSE is a person saying no in the caps their
+    shell typed (issue #44 review round 3)."""
+    p, calls = _window(tmp_path, rc=42,
+                       args=["--workdir", str(tmp_path / "wd")],
+                       env={"WP6C_KEEP_RUNNING": value})
+    argv = json.loads(calls.read_text())["argv"]
+    assert ("--stop-at-window-cap" in argv) is follows, (value, argv)
+
+
+def test_verify_an_unreadable_manifest_is_input_not_a_traceback(tmp_path,
+                                                               capsys):
+    """A MANIFEST.tsv that exists but cannot be opened (mode 000, a dead
+    mount) is a statement about the host, not about the bundle's
+    durability — exit 2, no traceback (issue #44 review round 3)."""
+    wd = _mk_workdir(tmp_path)
+    dest = tmp_path / "offhost"
+    ar.main(["--workdir", str(wd), "--dest", str(dest), "--stamp", "W1"])
+    bundle = dest / "full500" / "windows" / "W1"
+    man = bundle / "MANIFEST.tsv"
+    os.chmod(man, 0)
+    try:
+        rc = ar.main(["--verify", "--bundle", str(bundle)])
+    finally:
+        os.chmod(man, 0o644)
+    err = capsys.readouterr().err
+    assert rc == ar.EXIT_INPUT, (rc, err)
+    assert "INPUT:" in err and "Traceback" not in err, err
+
+
+def test_usable_cap_says_so_for_a_fractional_cap():
+    """3.7 is a cap the harness itself would refuse; truncating it to 3 in
+    silence would make the ETA's denominator a private decision
+    (issue #44 review round 3)."""
+    cap, why = run_status.usable_cap(3.7)
+    assert cap == 3
+    assert "not a whole number" in why and "3/window" in why, why
+    assert run_status.usable_cap(4) == (4, "")
+    assert run_status.usable_cap(None) == (run_status.DEFAULT_CAP, "")
+
+
+def test_status_a_manifest_with_a_hollow_entry_is_input_too(tmp_path,
+                                                           capsys):
+    """Every queue number on the dashboard comes from the manifest, and a
+    null id used to pass the container check (issue #44 review r3)."""
+    work = _mk_run(tmp_path, [_rec("a__a-1", "resolved", T0)])
+    for doc in ('{"instances": [{"instance_id": null}]}',
+                '{"instances": [5]}',
+                '{"instances": [{"other": 1}]}'):
+        man = tmp_path / "m.json"
+        man.write_text(doc)
+        rc = run_status.main(["--workdir", str(work), "--manifest",
+                              str(man)])
+        err = capsys.readouterr().err
+        assert rc == run_status.EXIT_INPUT, (doc, rc, err)
+        assert "instance_id" in err and "Traceback" not in err, (doc, err)

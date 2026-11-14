@@ -85,11 +85,13 @@ HAS_STOP_CAP=0
 for a in ${EFF[@]+"${EFF[@]}"}; do
 	[ "$a" = "--stop-at-window-cap" ] && HAS_STOP_CAP=1
 done
-# WP6C_KEEP_RUNNING is a flag, not a string: "0"/"false"/"no" mean "do
-# not", exactly as on the command line everywhere else in this repo
+# WP6C_KEEP_RUNNING is a flag, not a string: "0"/"false"/"no"/"off" mean
+# "do not", exactly as on the command line everywhere else in this repo —
+# and case-insensitively, because WP6C_KEEP_RUNNING=FALSE is a person
+# saying "no" in the caps their shell typed (issue #44 review r3)
 KEEP_RUNNING=0
-case "${WP6C_KEEP_RUNNING:-}" in
-"" | 0 | [Ff]alse | [Nn]o) ;;
+case "${WP6C_KEEP_RUNNING-}" in
+"" | 0 | [Ff][Aa][Ll][Ss][Ee] | [Nn][Oo] | [Oo][Ff][Ff]) ;;
 *) KEEP_RUNNING=1 ;;
 esac
 ADDED_STOP_CAP=0
@@ -199,10 +201,15 @@ case "$rc" in
 	echo "run_window: exit 42 — WINDOW CAP reached (the daily budget is"
 	echo "              spent; the checkpoint holds every outcome)."
 	echo "              Next window, same command:"
-	echo "                $0 $ARGS"
+	# $0 too, not only the arguments: a checkout under a path with a space
+	# would break the very line this exists to be pasted as
+	echo "                $(printable "$0") $ARGS"
 	echo "              Status any time (read-only):"
-	echo "                $PYTHON $SELF_DIR/run_status.py "
-	echo "                    --workdir $(printable "$WORKDIR")"
+	# ONE line: a hint wrapped after the program name runs run_status.py
+	# bare (argparse exit 2) and then tries to execute '--workdir'
+	# (issue #44 review r3 — the round-2 quoting fix introduced this)
+	STATUS_CMD="$PYTHON $SELF_DIR/run_status.py --workdir $(printable "$WORKDIR")"
+	echo "                $STATUS_CMD"
 	;;
 4)
 	echo "run_window: exit 4 — RUN FAILED. **STOP.** Do not loop-retry:"

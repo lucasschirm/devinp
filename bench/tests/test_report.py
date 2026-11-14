@@ -999,3 +999,52 @@ def test_label_in_header_needs_no_sections_to_be_strict(tmp_path):
     assert report.label_in_header(
         "# SWE-bench Verified — Devin ACP run report\n\n"
         f"**{_LABEL}**\n", _LABEL)
+
+
+def test_label_in_header_needs_a_title_block_at_all():
+    """A document whose FIRST line is already ``## `` has no title block —
+    the split looks for ``\\n## `` — so a trailing ``**label**`` in it must
+    not read as labelled. Same for a fenced block that swallows the title
+    (issue #44 review round 3)."""
+    no_title = (f"## Summary\n\n- pass@1 …\n\n**{_LABEL}**\n")
+    assert not report.label_in_header(no_title, _LABEL)
+    fenced = ("# SWE-bench Verified — Devin ACP run report\n\n"
+              "```markdown\n## not a section\n```\n\n"
+              f"**{_LABEL}**\n\n## Summary\n")
+    # the fence truncates the block early, so the label is NOT the last
+    # line of what the parser calls the title: refused, and that is the
+    # safe direction for a check that only ever says yes to a header
+    assert not report.label_in_header(fenced, _LABEL)
+
+
+# --------------------------------------------------------------------------
+# manifest_ids (issue #44 review round 3): both readers of the pinned
+# manifest take their numbers from one shape rule
+# --------------------------------------------------------------------------
+
+def test_manifest_ids_accepts_the_pinned_shape():
+    doc = {"instances": [{"instance_id": "a__b-1"},
+                         {"instance_id": "c__d-2"}]}
+    assert report.manifest_ids(doc) == ["a__b-1", "c__d-2"]
+    # a bare list is the other shape run_status has always taken
+    assert report.manifest_ids([{"instance_id": "a__b-1"}]) == ["a__b-1"]
+
+
+@pytest.mark.parametrize("doc,why", [
+    ({"instances": [{"instance_id": None}]}, "instance_id"),
+    ({"instances": [{"instance_id": 5}]}, "instance_id"),
+    ({"instances": [{"instance_id": ""}]}, "instance_id"),
+    ({"instances": [5]}, "instance_id"),
+    ({"instances": [None]}, "instance_id"),
+    ({"instances": []}, "empty"),
+    ({"instances": "a__b-1"}, "list"),
+    ({"nope": []}, "list"),
+    ("not a document", "list"),
+])
+def test_manifest_ids_refuses_a_hollow_document(doc, why):
+    """``{"instances": [{"instance_id": null}]}`` used to pass the
+    container check and blow up later in a consumer's ``sorted``/``join``
+    — exit 1 where the documented answer is "bad input"."""
+    with pytest.raises(ValueError) as e:
+        report.manifest_ids(doc)
+    assert why in str(e.value)
