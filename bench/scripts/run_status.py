@@ -113,8 +113,18 @@ def measure(records: list) -> dict:
                     and v > 0:
                 walls.append(float(v))
                 break
+    ordered = sorted(walls)
+    med = None
+    if ordered:
+        mid = len(ordered) // 2
+        med = (ordered[mid] if len(ordered) % 2
+              else (ordered[mid - 1] + ordered[mid]) / 2.0)
     return {"n": len(walls), "total_s": sum(walls),
-           "mean_s": (sum(walls) / len(walls)) if walls else None}
+            "mean_s": (sum(walls) / len(walls)) if walls else None,
+            # the ETA rests on the MEDIAN: one wedged session that hit
+            # the wall cap would otherwise drag the projection out by
+            # days, and item 10's calibration prints the median too
+            "median_s": med}
 
 
 def status(jsonl: str, manifest_ids: "list[str] | None",
@@ -179,12 +189,16 @@ def status(jsonl: str, manifest_ids: "list[str] | None",
                 "finish_date": None, "basis": "no measurement yet"}
     if manifest_ids is not None and remaining:
         eta["windows"] = -(-remaining // max(1, cap))
-        if measured["mean_s"]:
+        if measured["median_s"]:
             eta["session_hours"] = round(
-                remaining * measured["mean_s"] / 3600.0, 1)
-            eta["basis"] = (f"mean measured session wall "
-                           f"{measured['mean_s']:.0f}s over "
-                           f"{measured['n']} session(s)")
+                remaining * measured["median_s"] / 3600.0, 1)
+            eta["basis"] = (f"median measured session wall "
+                           f"{measured['median_s']:.0f}s over "
+                           f"{measured['n']} session(s)"
+                           + (f" (mean {measured['mean_s']:.0f}s — the "
+                              "median ignores a wedged session's "
+                              "wall-cap outlier)"
+                              if measured["n"] >= 3 else ""))
         # one window per UTC day is the quota ceiling, so the date
         # projection is windows, not hours
         eta["finish_date"] = time.strftime(
@@ -400,9 +414,20 @@ def main(argv: "list[str] | None" = None) -> int:
                   "--manifest '' to skip the queue view)",
                   file=sys.stderr)
             return EXIT_INPUT
-        with open(args.manifest, "r", encoding="utf-8") as f:
-            manifest_ids = [i["instance_id"]
-                           for i in json.load(f)["instances"]]
+        try:
+            with open(args.manifest, "r", encoding="utf-8") as f:
+                doc = json.load(f)
+            rows = doc["instances"] if isinstance(doc, dict) else doc
+            manifest_ids = [i["instance_id"] for i in rows]
+            if not manifest_ids:
+                raise ValueError("the instance list is empty")
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            # every queue number on the dashboard comes from this file;
+            # a wrong shape must stop the report, not corrupt it
+            print(f"INPUT: {args.manifest!r} is not an instance manifest "
+                  f"(an object with an \"instances\" list of objects "
+                  f"carrying instance_id): {exc}", file=sys.stderr)
+            return EXIT_INPUT
     if cap is None:
         # the operator's authorized per-window cap, not the pilot default
         # — a 500-run ETA computed from a 10-session pilot cap would be
@@ -411,8 +436,19 @@ def main(argv: "list[str] | None" = None) -> int:
             import live_pilot as lp
             cap = lp.load_budget_file(lp.BUDGET_FILE).get(
                 "max_sessions_per_day")
-        except SystemExit:
+        except (Exception, SystemExit):
+            # a budget file that cannot be read or parsed says nothing
+            # (SystemExit included: a budget loader that refuses loudly
+            # must still leave the operator a dashboard) — the ETA falls
+            # back to a stated cap, printed below
             cap = None
+    if isinstance(cap, bool) or not isinstance(cap, (int, float)):
+        # a PENDING placeholder in the budget file says "not authorized
+        # yet"; the ETA is still printed, on a stated fallback cap
+        print(f"NOTE: budget cap {cap!r} is not a number — the ETA below "
+              "uses the WP6a default cap (fill in "
+              "live_pilot_budget.json, issue #44 B2)", file=sys.stderr)
+        cap = None
     if not cap or cap <= 0:
         cap = 10  # the WP6a default; the output says which cap was used
     try:

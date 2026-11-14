@@ -755,6 +755,23 @@ def parse_report_pass1(md: str) -> "tuple[dict | None, dict]":
     return overall, rows
 
 
+def label_in_header(md: str, label: str) -> bool:
+    """True when ``label`` is the report's HEADER label line — the
+    ``**<label>**`` line :func:`render_report` writes in the title block
+    above the first ``##`` section.
+
+    The strictness is the point: a label that appears only in the
+    methodology prose is body text, not the heading the published report
+    stands under, so a render drift that dropped the header while
+    mentioning the label elsewhere must not read as labelled
+    (issue #44 E3, reviewed)."""
+    if not md or not label:
+        return False
+    want = f"**{label}**"
+    head = md.split("\n## ", 1)[0]
+    return any(line.strip() == want for line in head.splitlines())
+
+
 # ---------------------------------------------------------------------------
 # AC3 — the methodology block
 # ---------------------------------------------------------------------------

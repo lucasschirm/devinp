@@ -115,7 +115,9 @@ def _authorized_budget(**over) -> dict:
         "basis": "WP6c §9: the Pro daily allowance read in app.devin.ai "
                 "on 2026-11-13 + the WP6a/WP6b measured session walls",
         "authorized_by": "Operator Name <op@example.com>",
-        "completion_deadline": "2027-06-30"}
+        "completion_deadline": "2027-06-30",
+        "abort_rule": "two consecutive RUN FAILED windows, or the "
+                      "deadline at 60 % queue remaining, stop the run"}
     b.update(over)
     return b
 
@@ -291,22 +293,32 @@ def test_pilot_c_dry_run_renders_the_full_run_skeleton(tmp_path,
 _src_n = [0]
 
 
-def _import_fixture(tmp_path, *, mode=None, state_mode=None):
-    """A source workdir with a checkpoint, and the mode evidence asked
-    for (meta / state / neither)."""
+def _import_fixture(tmp_path, *, mode=None, state_mode=None,
+                    model=None, state_model=None):
+    """A source workdir with a checkpoint, and the methodology evidence
+    asked for (meta / state / neither). The state file carries the same
+    ``mode`` + ``model`` keys the real ``_write_state`` writes."""
     _src_n[0] += 1
     src = tmp_path / f"srcwd{_src_n[0]}"
     src.mkdir()
     (src / "run-srcA.jsonl").write_text(json.dumps(
         {"instance_id": "a__a-1", "status": "resolved",
          "ts": 1_700_000_000.0, "meta": {}}) + "\n")
-    if mode is not None:
+    if mode is not None or model is not None:
         (src / "report").mkdir()
-        (src / "report" / "run_meta.json").write_text(json.dumps(
-            {"mode": mode}))
-    if state_mode is not None:
-        (src / "pilot-srcA.state.json").write_text(json.dumps(
-            {"mode": state_mode}))
+        doc = {}
+        if mode is not None:
+            doc["mode"] = mode
+        if model is not None:
+            doc["model"] = model
+        (src / "report" / "run_meta.json").write_text(json.dumps(doc))
+    if state_mode is not None or state_model is not None:
+        doc = {}
+        if state_mode is not None:
+            doc["mode"] = state_mode
+        if state_model is not None:
+            doc["model"] = state_model
+        (src / "pilot-srcA.state.json").write_text(json.dumps(doc))
     return src
 
 
@@ -322,24 +334,57 @@ def _insts():
     return [{"instance_id": "a__a-1"}]
 
 
-def test_source_run_mode_prefers_the_meta_then_the_state(tmp_path):
-    src = _import_fixture(tmp_path, mode="container",
-                         state_mode="sandbox")
-    assert lp.source_run_mode(str(src), "srcA") == "container"
-    src2 = _import_fixture(tmp_path, state_mode="sandbox")
-    assert lp.source_run_mode(str(src2), "srcA") == "sandbox"
-    src3 = _import_fixture(tmp_path)
-    assert lp.source_run_mode(str(src3), "srcA") is None
+def test_provenance_prefers_the_meta_then_the_state(tmp_path):
+    src = _import_fixture(tmp_path, mode="container", model="swe-2-max",
+                         state_mode="sandbox", state_model="other")
+    assert lp.source_provenance(str(src), "srcA") == {
+        "mode": "container", "model": "swe-2-max"}
+    # a field the meta does not carry is still read from the state file
+    src2 = _import_fixture(tmp_path, mode="container",
+                          state_mode="sandbox", state_model="swe-2-high")
+    assert lp.source_provenance(str(src2), "srcA") == {
+        "mode": "container", "model": "swe-2-high"}
+    src3 = _import_fixture(tmp_path, state_mode="sandbox")
+    assert lp.source_provenance(str(src3), "srcA") == {"mode": "sandbox"}
+    assert lp.source_provenance(str(_import_fixture(tmp_path)),
+                               "srcA") == {}
 
 
-def test_source_run_mode_ignores_garbage(tmp_path):
+def test_provenance_ignores_garbage(tmp_path):
+    """Unreadable / unparseable evidence is the ABSENCE of evidence —
+    never a guess (the refusal that follows from an absence is the
+    caller's decision, and --pilot b tolerates it)."""
     src = _import_fixture(tmp_path)
     (src / "report").mkdir()
     (src / "report" / "run_meta.json").write_text("{not json")
-    assert lp.source_run_mode(str(src), "srcA") is None
+    assert lp.source_provenance(str(src), "srcA") == {}
+    (src / "report" / "run_meta.json").write_text("[1, 2]")
+    assert lp.source_provenance(str(src), "srcA") == {}
     (src / "report" / "run_meta.json").write_text(json.dumps(
-        {"mode": "kubernetes"}))
-    assert lp.source_run_mode(str(src), "srcA") is None
+        {"mode": 42, "model": "   "}))
+    assert lp.source_provenance(str(src), "srcA") == {}
+
+
+def test_a_source_claiming_an_unknown_mode_is_refused_not_ignored(
+        tmp_path):
+    """A recorded-but-impossible mode is evidence of a methodology this
+    run cannot mix with, so it is a mismatch — the strict reading is the
+    safe one for a submission."""
+    src = _import_fixture(tmp_path, mode="kubernetes",
+                         model="swe-2-high")
+    cfg = _import_cfg(tmp_path, src, "sandbox")
+    with pytest.raises(lp.PilotConfigError, match="kubernetes"):
+        lp.load_imported(cfg, str(tmp_path / "wd"), _insts())
+
+
+def test_import_of_a_different_model_is_refused(tmp_path):
+    """One pass@1 cannot be two models: the imported lines were produced
+    by the source's model and are never re-run (issue #44 E2)."""
+    src = _import_fixture(tmp_path, mode="sandbox",
+                         model="some-paid-model")
+    cfg = _import_cfg(tmp_path, src, "sandbox")
+    with pytest.raises(lp.PilotConfigError, match="model"):
+        lp.load_imported(cfg, str(tmp_path / "wd"), _insts())
 
 
 def test_import_of_a_different_grading_leg_is_refused(tmp_path):
@@ -349,10 +394,22 @@ def test_import_of_a_different_grading_leg_is_refused(tmp_path):
         lp.load_imported(cfg, str(tmp_path / "wd"), _insts())
 
 
-def test_pilot_c_refuses_a_source_with_an_unknown_mode(tmp_path):
-    src = _import_fixture(tmp_path)  # no mode recorded anywhere
+def test_pilot_c_refuses_a_source_with_an_unrecorded_methodology(
+        tmp_path):
+    src = _import_fixture(tmp_path)  # nothing recorded anywhere
     cfg = _import_cfg(tmp_path, src, "sandbox")
-    with pytest.raises(lp.PilotConfigError, match="no grading mode"):
+    with pytest.raises(lp.PilotConfigError,
+                       match="recorded no mode, model"):
+        lp.load_imported(cfg, str(tmp_path / "wd"), _insts())
+
+
+def test_pilot_c_refuses_a_half_recorded_source(tmp_path):
+    """Mode without model is still an unattributable methodology for the
+    submission-bound run; --pilot b keeps tolerating it (the WP6b pair
+    predates the meta)."""
+    src = _import_fixture(tmp_path, state_mode="sandbox")
+    cfg = _import_cfg(tmp_path, src, "sandbox")
+    with pytest.raises(lp.PilotConfigError, match="model"):
         lp.load_imported(cfg, str(tmp_path / "wd"), _insts())
 
 
@@ -371,7 +428,8 @@ def test_pilot_b_still_tolerates_a_pre_meta_source(tmp_path):
 
 
 def test_import_mode_matches_is_allowed(tmp_path):
-    src = _import_fixture(tmp_path, state_mode="container")
+    src = _import_fixture(tmp_path, state_mode="container",
+                         state_model=lp.DEFAULT_MODEL)
     cfg = _import_cfg(tmp_path, src, "container")
     imported, _ = lp.load_imported(cfg, str(tmp_path / "wd"), _insts())
     assert "a__a-1" in imported
@@ -759,3 +817,71 @@ def test_pilot_b_record_still_has_no_full_run_items(tmp_path, live,
     # every kind) — and the label header too
     assert (wd / "report" / "run_meta.json").is_file()
     assert lp.SUBMISSION_LABEL in (wd / "report" / "report.md").read_text()
+
+
+# --------------------------------------------------------------------------
+# M1 (issue #44 review round 1): the abort rule is an enforced B2 field
+# --------------------------------------------------------------------------
+
+def test_b2_gate_requires_the_abort_rule(tmp_path):
+    """Every other field filled and the abort rule still PENDING is NOT
+    an authorization: B7's discipline ("a failed window stops") has no
+    content until the operator writes the sentence, and the 500-session
+    invocation must not start without it."""
+    for bad in ("PENDING (issue #44 B7)", "", None, 0):
+        b = _authorized_budget()
+        if bad is None:
+            del b["abort_rule"]
+        else:
+            b["abort_rule"] = bad
+        with pytest.raises(lp.PilotConfigError, match="abort_rule"):
+            lp.require_full_run_authorization(b, "budget.json")
+    # and the committed template still refuses (it says PENDING)
+    with open(lp.BUDGET_FILE, encoding="utf-8") as f:
+        committed = json.load(f)
+    assert committed["abort_rule"].startswith("PENDING")
+    with pytest.raises(lp.PilotConfigError, match="abort_rule"):
+        lp.require_full_run_authorization(committed, lp.BUDGET_FILE)
+    # the docstring/README/notes list the same field set the code enforces
+    assert set(lp.FULL_RUN_BUDGET_FIELDS) == {
+        "max_sessions_per_day", "max_wall_per_session", "calibrated_at",
+        "basis", "authorized_by", "completion_deadline", "abort_rule"}
+
+
+def test_b2_gate_precedes_the_live_gate(tmp_path, monkeypatch):
+    """Authorization is a configuration refusal (exit 2), so it is the
+    message an operator gets whether or not BENCH_LIVE is set — the env
+    var must never look like the thing standing between them and an
+    unauthorized 500-session run."""
+    monkeypatch.delenv("BENCH_LIVE", raising=False)
+    inst = tmp_path / "inst.json"
+    inst.write_text(json.dumps({"instances": [
+        {"instance_id": "a__a-1", "repo": "a/b", "repo_url": "https://x/y",
+         "base_commit": "0" * 40, "problem_statement": "p"}]}))
+    budget = tmp_path / "budget.json"
+    b = _authorized_budget()
+    del b["abort_rule"]
+    budget.write_text(json.dumps(b))
+    rc = lp.main(["--pilot", "c", "--mode", "sandbox", "--instances",
+                 str(inst), "--workdir", str(tmp_path / "wd"),
+                 "--budget-file", str(budget)])
+    assert rc == lp.EXIT_CONFIG, rc
+
+
+def test_item22_needs_the_header_not_a_prose_mention(tmp_path):
+    """A report that mentions the label in its methodology text but does
+    not stand under it is not labelled (issue #44 E3, reviewed)."""
+    jsonl, report_dir = _run_dir(tmp_path)
+    md_path = Path(report_dir) / "report.md"
+    md = md_path.read_text()
+    assert f"**{lp.SUBMISSION_LABEL}**" in md
+    body_only = "\n".join(
+        l for l in md.splitlines()
+        if l.strip() != f"**{lp.SUBMISSION_LABEL}**")
+    body_only += (f"\nSome prose that happens to mention "
+                 f"{lp.SUBMISSION_LABEL} further down.\n")
+    md_path.write_text(body_only)
+    ev = _gather(tmp_path, jsonl, report_dir)
+    assert lp.SUBMISSION_LABEL in (md_path.read_text())  # substring: not
+    assert ev["header_has_label"] is False              # enough
+    assert _by_num(_items(ev), 22)["pass"] is False

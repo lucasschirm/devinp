@@ -11,7 +11,8 @@ This script snapshots a workdir **off the run path**, content-addressed:
 
     <dest>/<run_id>/windows/<UTC>/MANIFEST.tsv    sha256 · bytes · path
     <dest>/<run_id>/windows/<UTC>/…               the artifacts themselves
-    <dest>/<run_id>/LATEST.tsv                    the newest window's manifest
+    <dest>/<run_id>/LATEST.tsv                    the PATH of the newest
+                                                  window's manifest
 
 and then **verifies the copy** (a backup nobody re-reads is a rumor — the
 same rule WP5's R1/R2 checks apply to the patch artifacts). A window's
@@ -130,7 +131,15 @@ def read_manifest(path: str) -> "list[tuple[str, int, str]]":
             parts = line.split("\t")
             if len(parts) < 3:
                 raise SystemExit(f"{path!r}: malformed manifest line")
-            out.append((parts[0], int(parts[1]), parts[2]))
+            try:
+                size = int(parts[1])
+            except ValueError as exc:
+                # a corrupt manifest is an input problem with a name,
+                # not a traceback in the middle of a --verify
+                raise SystemExit(
+                    f"{path!r}: malformed byte count {parts[1]!r} for "
+                    f"{parts[2]!r}") from exc
+            out.append((parts[0], size, parts[2]))
     return out
 
 
@@ -238,14 +247,22 @@ def main(argv: "list[str] | None" = None) -> int:
         if not args.bundle:
             print("INPUT: --verify needs --bundle", file=sys.stderr)
             return EXIT_INPUT
-        problems = verify(args.bundle)
+        try:
+            problems = verify(args.bundle)
+            ents = read_manifest(os.path.join(args.bundle, MANIFEST_NAME))
+        except SystemExit as exc:
+            # a MANIFEST.tsv that cannot be parsed is BAD INPUT (exit 2),
+            # which is a different statement from "this bundle is not
+            # byte-identical" (exit 3): one means fix the invocation or
+            # the file, the other means the backup is wrong
+            print(f"INPUT: {exc}", file=sys.stderr)
+            return EXIT_INPUT
         if problems:
             for x in problems[:20]:
                 print(f"[FAIL] {x}")
             print(f"NOT DURABLE: {len(problems)} problem(s) in "
                   f"{args.bundle}", file=sys.stderr)
             return EXIT_VERIFY
-        ents = read_manifest(os.path.join(args.bundle, MANIFEST_NAME))
         print(f"VERIFIED {args.bundle}: {len(ents)} file(s), "
               f"{sum(e[1] for e in ents)} bytes, byte-identical to the "
               "manifest")

@@ -148,7 +148,7 @@ SUBMISSION_LABEL = "Devin (agent) on SWE-bench Verified"
 #: 500 sessions on an unauthorised budget, it never invents one.
 FULL_RUN_BUDGET_FIELDS = ("max_sessions_per_day", "max_wall_per_session",
                          "calibrated_at", "basis", "authorized_by",
-                         "completion_deadline")
+                         "completion_deadline", "abort_rule")
 #: The report-directory file the run meta is persisted to (issue #44
 #: E3) — the methodology inputs are part of the artifact set, and
 #: ``report.py --meta-file`` / ``scripts/verify_submission.py`` re-read
@@ -644,30 +644,52 @@ def _validate_imported_line(rec: dict, iid: str,
                 f"workdir)")
 
 
-def source_run_mode(import_workdir: str, run_id: str) -> "Optional[str]":
-    """The grading mode a source run recorded (the ``--import-run``
-    mode gate, issue #44 E2). Two places carry it, newest first: the
-    persisted methodology meta (``report/run_meta.json`` — the WP6c E3
-    artifact) and the run's state file (``pilot-<id>.state.json``).
-    ``None`` = neither records it (a run from before the meta was
-    persisted — the mode of an old checkpoint is genuinely unknown).
-    Unreadable / malformed evidence is "no evidence", never a guess.
-    """
-    for path, key in ((os.path.join(import_workdir, "report",
-                                   RUN_META_NAME), "mode"),
-                     (os.path.join(import_workdir,
-                                  f"pilot-{run_id}.state.json"),
-                      "mode")):
+#: What the ``--import-run`` methodology gate compares (issue #44 E2):
+#: the key as the source records it, the ``PilotConfig`` attribute that
+#: states this run's value, and the reason mixing it is fatal. The cost
+#: tier is deliberately NOT here: this run's tier is decided later by the
+#: WP3 models-list gate, so there is nothing to compare at import time
+#: (and a source's tier is historical evidence, not this run's claim).
+IMPORT_PROVENANCE = (
+    ("mode", "mode",
+     "the two grading legs must never be mixed in one pass@1 (a "
+     "sandbox-mode host-check ``resolved`` is not an official-harness "
+     "``resolved``)"),
+    ("model", "model",
+     "one pass@1 cannot be the result of two models — the imported "
+     "lines were produced by the source's model and are never re-run"),
+)
+
+
+def source_provenance(import_workdir: str, run_id: str) -> dict:
+    """What a source run recorded about its own methodology (the
+    ``--import-run`` gate, issue #44 E2): ``{mode, model, cost_tier}``,
+    each key present only where there is evidence. Two places carry it,
+    newest first, and a later source never overwrites an earlier one:
+    the persisted methodology meta (``report/run_meta.json`` — the WP6c
+    E3 artifact) and the run's state file
+    (``pilot-<id>.state.json``). An absent key means the source does not
+    record it (a run from before the meta was persisted) — "no
+    evidence", never a guess; unreadable or malformed files are the same
+    absence."""
+    out: dict = {}
+    for path in (os.path.join(import_workdir, "report", RUN_META_NAME),
+                 os.path.join(import_workdir,
+                              f"pilot-{run_id}.state.json")):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
         except (OSError, json.JSONDecodeError):
             continue
-        if isinstance(data, dict):
+        if not isinstance(data, dict):
+            continue
+        for key, _attr, _why in IMPORT_PROVENANCE:
+            if key in out:
+                continue
             v = data.get(key)
-            if v in ("container", "sandbox"):
-                return v
-    return None
+            if isinstance(v, str) and v.strip():
+                out[key] = v.strip()
+    return out
 
 
 def load_imported(config: PilotConfig, workdir: str,
@@ -715,34 +737,44 @@ def load_imported(config: PilotConfig, workdir: str,
             f"--import-run source not found: {src!r} (the import is "
             "fail-closed — a missing / corrupt source is a config "
             "error before the pre-flight)")
-    # the grading-leg gate (issue #44 E2): a sandbox-mode ``resolved``
+    # The methodology gate (issue #44 E2): a sandbox-mode ``resolved``
     # (our host check) and a container-mode ``resolved`` (the official
-    # harness) are two DIFFERENT claims. Importing one into the other's
-    # run would silently mix them in one pass@1 — and the imported lines
-    # are never re-run, so nothing later can separate them. The source's
-    # mode is read from its own persisted evidence; --pilot c (the
-    # submission-bound 500-run) additionally refuses a source whose mode
-    # is unknown, because a pass@1 it cannot attribute is not a pass@1
-    # it can publish.
-    src_mode = source_run_mode(config.import_workdir or workdir,
-                              config.import_run)
-    if src_mode is not None and src_mode != config.mode:
-        raise PilotConfigError(
-            f"--import-run {config.import_run!r} ran in "
-            f"{src_mode!r} mode; this run is {config.mode!r} — the two "
-            "grading legs must never be mixed in one pass@1 (a "
-            "sandbox-mode host-check `resolved` is not an official-"
-            "harness `resolved`, and the imported lines are never "
-            "re-run). Import it into a run of the same --mode "
-            "(issue #44 E2)")
-    if src_mode is None and config.pilot == "c":
-        raise PilotConfigError(
-            f"--import-run {config.import_run!r} recorded no grading "
-            "mode (no report/run_meta.json, no mode in its state "
-            "file) — a --pilot c pass@1 may not absorb evidence it "
-            "cannot attribute to a grading leg (issue #44 E2). Re-run "
-            "the source with a harness that persists the run meta "
-            "(WP6c E3), or start --pilot c without the import")
+    # harness) are two DIFFERENT claims, and a pass@1 from two models is
+    # not one result. Importing such a line would mix them permanently —
+    # imported lines are never re-run, so nothing later can separate
+    # them. The source's own recorded evidence is read for it (NB the
+    # name: ``src`` is the source checkpoint path, and shadowing it here
+    # would feed a dict to the checkpoint reader). --pilot c, the
+    # submission-bound run, additionally refuses a source whose
+    # methodology is unrecorded: a pass@1 it cannot attribute is not a
+    # pass@1 it can publish.
+    prov = source_provenance(config.import_workdir or workdir,
+                            config.import_run)
+    for key, attr, why in IMPORT_PROVENANCE:
+        got = prov.get(key)
+        mine = getattr(config, attr, None)
+        if got is not None and mine and got != mine:
+            raise PilotConfigError(
+                f"--import-run {config.import_run!r} recorded "
+                f"{key}={got!r}; this run is {key}={mine!r} — {why} "
+                "(issue #44 E2). Import it into a run with the same "
+                f"--{key}, or without the import")
+    # the pilot-C half of the same rule: a submission-bound pass@1 may
+    # not absorb evidence it cannot attribute, so an unrecorded field is
+    # refused here even though --pilot b tolerates it (the WP6b run
+    # predates the persisted meta)
+    if config.pilot == "c":
+        unknown = [key for key, _attr, _why in IMPORT_PROVENANCE
+                  if key not in prov]
+        if unknown:
+            raise PilotConfigError(
+                f"--import-run {config.import_run!r} recorded no "
+                f"{', '.join(unknown)} (no report/{RUN_META_NAME}, "
+                "nothing in its state file) — a --pilot c pass@1 may "
+                "not absorb evidence it cannot attribute to a "
+                "methodology (issue #44 E2). Re-run the source with a "
+                "harness that persists the run meta (WP6c E3), or "
+                "start --pilot c without the import")
     try:
         src_records, _ = rr.load_checkpoint(src)
     except rr.RunnerProtocolError as exc:
@@ -2824,7 +2856,11 @@ def gather_full_run_evidence(*, config: PilotConfig, jsonl: str,
         bad.append(f"<unreadable: {exc}>")
     ev["preds_lines"] = n_lines
     ev["preds_bad_label"] = bad
-    ev["header_has_label"] = (SUBMISSION_LABEL in md) if md else None
+    # the header, not the file: a label that appears only deep in the
+    # methodology text is not the report standing under the label (the
+    # claim a reviewer reads is the one at the top)
+    ev["header_has_label"] = (rep.label_in_header(md, SUBMISSION_LABEL)
+                             if md else None)
 
     # the batch discipline view
     ev["windows"] = buckets
@@ -3814,8 +3850,13 @@ def require_full_run_authorization(budget: dict,
     The code never invents a cap: it reads ``max_sessions_per_day`` /
     ``max_wall_per_session`` from the file like every other pilot, and
     additionally requires ``authorized_by`` / ``completion_deadline`` /
-    ``basis`` / ``calibrated_at`` to be filled in (a placeholder such as
-    the committed ``PENDING (issue #44 B2)`` is not an authorization).
+    ``abort_rule`` / ``basis`` / ``calibrated_at`` to be filled in (a
+    placeholder such as the committed ``PENDING (issue #44 B2)`` is not an
+    authorization). ``abort_rule`` is in the enforced set because the
+    window wrapper's discipline ("a failed window stops, it does not
+    retry") is only a convention until the run plan says what it stops
+    for — B7 is the operator's sentence, and the 500-session invocation
+    must not start without it.
     A ``--pilot a``/``--pilot b`` run is unaffected — the gate is on the
     500-session invocation, not on a 3-instance smoke.
     """
@@ -4203,12 +4244,15 @@ def run_pilot(config: PilotConfig,
     """The pilot driver (the tests call this with the injected
     ``make_session`` seam — e.g. the WP2 ``mock_devin``; the CLI calls
     it with the real one). Returns the exit code."""
-    require_live(config.dry_run)
-    # the B2 gate (issue #44): the 500-session invocation refuses an
-    # unauthorised budget. A --dry-run is not gated (it spends nothing,
-    # and validating the 500-instance invocation is how the operator
-    # prepares the authorization) — but it says so, in the same words a
-    # live invocation would refuse with.
+    # The B2 gate (issue #44) runs BEFORE the live-run gate: an
+    # unauthorised 500-session invocation is a configuration failure, and
+    # the operator must see that message whether or not BENCH_LIVE is set
+    # (setting the env var is one keystroke away, and the answer is still
+    # "no" — the budget file is the authorization, not the environment).
+    # A --dry-run is not gated (it spends nothing, and validating the
+    # 500-instance invocation is how the operator prepares the
+    # authorization) — but it says so, in the same words a live
+    # invocation would refuse with.
     if config.pilot == "c":
         try:
             require_full_run_authorization(
@@ -4217,6 +4261,7 @@ def run_pilot(config: PilotConfig,
             if not config.dry_run:
                 raise
             print(f"[pilot] NOTE (dry run only): {exc}")
+    require_live(config.dry_run)
     insts = load_instances(config.instances_file)
     run_id = config.run_id or time.strftime("pilot-%Y%m%d-%H%M%S")
     config.run_id = run_id

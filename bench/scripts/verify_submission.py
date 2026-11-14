@@ -81,6 +81,14 @@ BUNDLE_ARTIFACTS = (("patch_diff", "patch.diff"),
 GRADING_LEGS = ("container", "sandbox")
 
 
+class InputError(Exception):
+    """Something the operator must fix before the artifacts can be read
+    at all (a corrupt checkpoint, a manifest that is not the pinned
+    shape). It maps to the documented exit 2 — a verifier that dumps a
+    traceback gives the operator an exit code the runbook does not
+    describe."""
+
+
 def _sha256_file(path: str) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -256,7 +264,10 @@ def check_label(report_dir: str, label: str, res: Results) -> None:
     if os.path.isfile(md_path):
         with open(md_path, "r", encoding="utf-8") as f:
             md = f.read()
-    header = label in md
+    # the HEADER (the **label** line report.py renders), not a substring
+    # anywhere: a report that mentions the label in prose but does not
+    # stand under it is not labelled
+    header = rep.label_in_header(md, label)
     ok = n > 0 and not bad and header
     res.add("LABEL", ok,
             f"{n} preds line(s) labelled"
@@ -327,8 +338,25 @@ def verify(jsonl: str, report_dir: str,
            manifest_path: "str | None",
            bundle: "str | None", label: str) -> Results:
     res = Results()
-    records, _dropped = rep.load_jsonl(jsonl)
-    finals, _markers = rep.dedupe(records)
+    try:
+        records, dropped = rep.load_jsonl(jsonl)
+        finals, _markers = rep.dedupe(records)
+    except rep.ReportError as exc:
+        # the WP5 loader is fail-loud on a mid-file corrupt line; the
+        # submission verdict is an exit code, not a traceback
+        raise InputError(f"{jsonl!r} is not a readable checkpoint: "
+                         f"{exc}") from exc
+    # A dropped line is an UNKNOWN outcome (the loader's torn-last-line
+    # rule), and an unknown outcome is exactly what must never reach a
+    # submission unannounced: WP5 excludes it from the pass@1
+    # denominator, so an unreported drop silently shrinks the submitted
+    # number. Resume re-runs that instance; verifying does not excuse it.
+    res.add("CHECKPOINT", not dropped,
+            f"{len(records)} record(s) read clean (the WP5 loader's own "
+            "schema + torn-line rule)" if not dropped else
+            f"{len(records)} record(s) read but a malformed line was "
+            "DROPPED — one outcome is unknown and excluded from the "
+            "denominator; resume to re-run it (issue #44 E4)")
     meta = load_meta(report_dir, res)
     check_r1_r2(jsonl, report_dir, meta, res)
     if meta is not None:
@@ -344,9 +372,18 @@ def verify(jsonl: str, report_dir: str,
     check_pass1(finals, md, res)
     check_label(report_dir, label, res)
     if manifest_path:
-        with open(manifest_path, "r", encoding="utf-8") as f:
-            doc = json.load(f)
-        ids = [i["instance_id"] for i in doc["instances"]]
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                doc = json.load(f)
+            ids = [i["instance_id"] for i in doc["instances"]]
+            if not ids:
+                raise ValueError("the 'instances' list is empty")
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            # the completeness check is meaningless without a manifest,
+            # and "meaningless" must not read as "verified"
+            raise InputError(
+                f"{manifest_path!r} is not a pinned instance manifest "
+                f"({'{{"instances": [...]}}' } required): {exc}") from exc
         check_queue(finals, ids, res)
     if bundle:
         check_bundle(bundle, bundle_run_id(jsonl), finals,
@@ -361,7 +398,10 @@ def bundle_run_id(jsonl: str) -> str:
     base = os.path.basename(jsonl)
     if base.startswith("run-") and base.endswith(".jsonl"):
         return base[4:-len(".jsonl")]
-    raise SystemExit(f"cannot derive the run id from {jsonl!r}")
+    raise InputError(
+        f"cannot derive the run id from {jsonl!r} — the bundle layout is "
+        "checked against the checkpoint's own name (run-<id>.jsonl), so "
+        "the file must carry it (issue #44 E4)")
 
 
 def main(argv: "list[str] | None" = None) -> int:
@@ -398,8 +438,19 @@ def main(argv: "list[str] | None" = None) -> int:
               "to skip the completeness check)", file=sys.stderr)
         return EXIT_INPUT
 
-    res = verify(args.jsonl, report_dir, manifest, args.bundle,
-                args.label)
+    try:
+        res = verify(args.jsonl, report_dir, manifest, args.bundle,
+                    args.label)
+    except InputError as exc:
+        print(f"INPUT: {exc}", file=sys.stderr)
+        return EXIT_INPUT
+    except rep.ReportError as exc:
+        print(f"INPUT: {exc}", file=sys.stderr)
+        return EXIT_INPUT
+    except OSError as exc:
+        print(f"INPUT: unreadable submission artifacts: {exc}",
+              file=sys.stderr)
+        return EXIT_INPUT
     print(res.render())
     print()
     if res.ok:

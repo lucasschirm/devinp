@@ -96,7 +96,7 @@ are listed unanswered in `notes/wp6c-preflight.md`.
 | `notes/wp6c-preflight.md` | **WP6c** — what the code now enforces for the 500-instance run, the environment facts measured here, and the blockers that remain operator decisions (B1 quota, B2 authorization, B3/B6 model + mode, B4 destination, B5 deadline + account, B7 cadence) |
 | `notes/*` | Additional recon evidence (version, image registry scans…) |
 | `probes/acp_probe.py` | NDJSON JSON-RPC probe for `devin acp` (4 modes) |
-| `scripts/verify_submission.py` | **WP6c** (issue #44 E4) — prove a finished run is submittable: re-verifies the artifacts with WP5's own `build_report` (exit 3 on an integrity failure), then the parts only the submission needs — the persisted `run_meta.json` (no `pending` methodology field, the grading leg stated honestly), queue completeness against the pinned manifest, the pass@1 the report renders recomputed from the checkpoint, the grading-queue break where a non-terminal record sits between two decided ones, and the declared submission label; `--bundle` also proves the `runs/<run_id>/<instance_id>/` layout. Exit 0 verified · 2 bad input · 3 integrity |
+| `scripts/verify_submission.py` | **WP6c** (issue #44 E4) — prove a finished run is submittable: re-verifies the artifacts with WP5's own `build_report` (exit 3 on an integrity failure), then the parts only the submission needs — the persisted `run_meta.json` (no `pending` methodology field, the grading leg stated honestly), the checkpoint reads clean (`CHECKPOINT`: a line the WP5 loader dropped is an **unknown outcome** it excludes from the denominator — the silent-shrink case a submission cannot carry), queue completeness against the pinned manifest with the retry-class gaps listed separately, the pass@1 the report renders recomputed from the checkpoint, and the declared submission label — required in the report's **header** (`report.label_in_header`), not as a substring somewhere in the file; `--bundle` also proves the `runs/<run_id>/<instance_id>/` layout. Exit 0 verified · 2 bad input · 3 integrity |
 | `scripts/package_submission.py` | **WP6c** (issue #44 E4) — package what `verify_submission.py` verified: `runs/<run_id>/<iid>/{patch.diff,trajectory.jsonl,eval.log}` + `all_preds.jsonl` + `report.md` + `run_meta.json` + the checkpoint + `SHA256SUMS`, and a README written for the reviewer (the label, the methodology, the deviations, the reproduction command). Verifies first and refuses a non-empty target unless `--force`; `--allow-incomplete` stamps an interim bundle as not-leaderboard-submittable instead of pretending |
 | `scripts/run_status.py` | **WP6c** (issue #44 E5) — the read-only dashboard for a run in flight: instances decided / 500, the queue still open (derived through WP3's `resume_queue`, never a second implementation), pass@1 so far, sessions per UTC day against the cap, the ETA from the measured median wall, disk free, and the state the previous window left (window cap / interrupt / abort). Exit 0 = readable, 2 = unreadable input |
 | `scripts/run_window.sh` | **WP6c** (issue #44 E5 + B7) — ONE operator window: runs the harness exactly once, tees to `<workdir>/logs/window-<UTC>.log`, prints how to read the exit code, and exits with the code it got (`42` = window cap, resume next window; `4` = STOP, do not loop-retry). Never retries, never backgrounds, never edits the checkpoint. `WP6C_ARCHIVE_DEST` also archives + verifies the window's artifacts (exit 5 if that fails) |
@@ -703,31 +703,51 @@ pipeline but the parts that only a 10–50-day submission run needs:
 cd bench
 # 0. the manifest is pinned once, in the repo (issue #44 E1)
 python scripts/pin_verified_instances.py            # → verified_instances.json
-# 1. B2: fill in live_pilot_budget.json (authorized_by, completion_deadline,
-#    abort_rule, basis, calibrated_at). PENDING = not authorized: --pilot c
-#    exits 2 before the live-run gate, before connecting, before any session.
+
+# 1. B2: fill in live_pilot_budget.json — max_sessions_per_day,
+#    max_wall_per_session, calibrated_at, basis, authorized_by,
+#    completion_deadline, abort_rule. A PENDING value is not an
+#    authorization: --pilot c exits 2 (before the live-run gate, before
+#    connecting, before any session) until every one of them is filled in.
 $EDITOR live_pilot_budget.json
-# 2. one window per UTC day — the operator starts it, the harness stops at
-#    the cap, the wrapper interprets the exit code and archives the evidence
+
+# 2. one window per UTC day. run_window.sh supplies --stop-at-window-cap
+#    itself, tees the window log, archives + verifies when
+#    WP6C_ARCHIVE_DEST is set, and prints what the exit code means.
+#    (First window: no --resume.)
 WP6C_ARCHIVE_DEST=/mnt/offhost/devinp \
   scripts/run_window.sh --pilot c --mode container --run-id full500 \
-  --workdir ./full-run --resume
-# 3. any time, read-only, while the run is in flight
+      --workdir ./full-run --resume
+
+# 3. progress, read-only, while a window is live
 python scripts/run_status.py --workdir ./full-run --run-id full500
-# 4. after the queue is empty: verify, then package
-python scripts/verify_submission.py --run-id full500 --workdir ./full-run \
-  --instances verified_instances.json --bundle
-python scripts/package_submission.py --run-id full500 --workdir ./full-run \
-  --instances verified_instances.json
+
+# 4. when the queue is empty: package (it verifies first and refuses a run
+#    that does not verify), then re-verify the packaged bundle's layout
+python scripts/package_submission.py \
+    --jsonl ./full-run/run-full500.jsonl \
+    --report ./full-run/report \
+    --manifest ./verified_instances.json \
+    --out ./submission/full500
+python scripts/verify_submission.py \
+    --jsonl ./full-run/run-full500.jsonl \
+    --report ./full-run/report \
+    --manifest ./verified_instances.json \
+    --bundle ./submission/full500
 ```
 
 - **The window model (E5, B7).** A run this long is one invocation per
   window, not one long-lived process: `--stop-at-window-cap` makes the
   harness **exit 42** when the per-UTC-day cap is reached (the WP3 runner
   would otherwise sleep to the next window inside the process — right for
-  Pilot B, wrong for an operator who reboots). `scripts/run_window.sh` is
-  the wrapper: one harness invocation, no retry, output tee'd to
-  `<workdir>/logs/window-<UTC>.log`, and the exit code explained
+  Pilot B, wrong for an operator who reboots). `scripts/run_window.sh`
+  **adds that flag itself** — a wrapper that documented the per-window
+  model while leaving the flag to the operator would sleep for days
+  instead, never printing the resume line and never reaching its own
+  archive step — and `WP6C_KEEP_RUNNING=1` opts back into the in-process
+  model. The wrapper is otherwise thin: one harness invocation, no retry,
+  output tee'd to `<workdir>/logs/window-<UTC>.log`, and the exit code
+  explained
   (`42` resume · `4` **STOP**, do not loop-retry · `3` the live-run gate ·
   `2` configuration · `5` the archive failed). It never touches the
   checkpoint.
@@ -741,7 +761,10 @@ python scripts/package_submission.py --run-id full500 --workdir ./full-run \
 - **Authorization is a gate, not a checklist item (B2).** `--pilot c` reads
   `live_pilot_budget.json` and refuses (exit 2) while `authorized_by` /
   `completion_deadline` / `abort_rule` / `basis` / `calibrated_at` are
-  missing or still say `PENDING`. The committed template carries the WP6a
+  missing or still say `PENDING` — and it does so **before** the
+  `BENCH_LIVE` gate, because an unauthorized 500-session run is a
+  configuration failure, not an environment one (setting the env var is
+  one keystroke away and the answer is still no). The committed template carries the WP6a
   caps (so pilots a/b are unchanged) and `PENDING` authorizations — filling
   them in is the operator's decision, and the harness will not guess it.
 - **Methodology that is written down, not remembered (E3).** Every run
@@ -751,9 +774,14 @@ python scripts/package_submission.py --run-id full500 --workdir ./full-run \
   (`Devin (agent) on SWE-bench Verified`, `live_pilot.SUBMISSION_LABEL`).
   The report renders the label from that file, so a label cannot be true in
   one artifact and absent from another; `--import-run` refuses a source run
-  whose recorded mode/model/cost-tier differs from this run's (a mixed
-  methodology has no single pass@1 — and a source with *no* meta, i.e. a
-  pre-WP6c run, is refused for `--pilot c` rather than trusted).
+  whose recorded `mode` or `model` differs from this run's (a mixed
+  methodology has no single pass@1, and imported lines are never re-run,
+  so the mix could never be un-mixed afterwards). The cost tier is not
+  compared: this run's tier is decided later by the WP3 models-list gate,
+  so there is nothing to compare at import time. A source with *no*
+  recorded methodology is tolerated by `--pilot b` (the WP6b pair predates
+  the meta) and refused by `--pilot c`, which may not publish a pass@1 it
+  cannot attribute.
 - **Items 18–23 (the full-run checklist).** 18 completeness against the
   pinned manifest (retry-class gaps are named: they are re-runnable, an
   undecided instance is not); 19 artifact integrity (WP5's own cross-check);

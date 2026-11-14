@@ -551,7 +551,8 @@ def test_label_constant_matches_the_harness():
 
 def test_run_id_derivation(tmp_path):
     assert vs.bundle_run_id("/x/work/run-full500.jsonl") == "full500"
-    with pytest.raises(SystemExit):
+    # an input problem, not a crash: it maps to the documented exit 2
+    with pytest.raises(vs.InputError):
         vs.bundle_run_id("/x/work/checkpoint.json")
 
 
@@ -578,3 +579,81 @@ def test_report_md_parser_malformed_row_is_not_silently_dropped():
          "|---|---|---|---|\n| a/b | x | 1 | n/a |\n")
     _ov, rows = rep.parse_report_pass1(md)
     assert rows == {"a/b": (None, None, "n/a")}
+
+
+# --------------------------------------------------------------------------
+# issue #44 review round 1: the documented exit codes must be the ones the
+# runbook sees — and a dropped checkpoint line is never silently accepted
+# --------------------------------------------------------------------------
+
+def test_clean_checkpoint_is_itself_a_check(tmp_path, capsys):
+    f = build(tmp_path)
+    assert vmain("--jsonl", f["jsonl"], "--manifest",
+                f["manifest"]) == vs.EXIT_OK
+    assert "[PASS] CHECKPOINT" in capsys.readouterr().out
+
+
+def test_a_dropped_line_fails_the_verification(tmp_path, capsys):
+    """The loader's torn-last-line rule makes that instance's outcome
+    UNKNOWN, and WP5 excludes it from the pass@1 denominator — so a
+    verifier that ignored `dropped` would certify a submission whose
+    submitted number silently shrank (issue #44 E4)."""
+    f = build(tmp_path)
+    with open(f["jsonl"], "a", encoding="utf-8") as fh:
+        fh.write('{"instance_id": "psf__requests-1142", "stat')  # torn
+    assert vmain("--jsonl", f["jsonl"], "--manifest",
+                f["manifest"]) == vs.EXIT_INTEGRITY
+    out = capsys.readouterr().out
+    assert "[FAIL] CHECKPOINT" in out, out
+    assert "DROPPED" in out
+
+
+def test_a_corrupt_checkpoint_is_an_input_error_not_a_traceback(
+        tmp_path, capsys):
+    """Mid-file corruption is fail-loud in the WP5 loader; the verifier's
+    contract is the documented exit 2 (bad input), not exit 1 with a
+    stack trace the runbook cannot interpret."""
+    f = build(tmp_path)
+    lines = Path(f["jsonl"]).read_text().splitlines()
+    lines.insert(1, "{ this is not json")
+    Path(f["jsonl"]).write_text("\n".join(lines) + "\n")
+    assert vmain("--jsonl", f["jsonl"], "--manifest",
+                f["manifest"]) == vs.EXIT_INPUT
+    err = capsys.readouterr().err
+    assert err.startswith("INPUT:") and "Traceback" not in err, err
+
+
+def test_a_malformed_manifest_is_an_input_error(tmp_path, capsys):
+    """Completeness against the pinned manifest is the check that gives
+    the submission its 'all 500' claim — a file that is not a manifest
+    must stop the run, never degrade into 'verified'."""
+    f = build(tmp_path)
+    bad = tmp_path / "bad-manifest.json"
+    for content in ('{"instances": [{"id": "x"}]}',   # KeyError shape
+                   "[]",                              # empty
+                   "{not json",                       # not JSON
+                   '{"instances": "nope"}'):          # wrong type
+        bad.write_text(content)
+        assert vmain("--jsonl", f["jsonl"], "--manifest",
+                    str(bad)) == vs.EXIT_INPUT, content
+        err = capsys.readouterr().err
+        assert err.startswith("INPUT:") and "Traceback" not in err, err
+
+
+def test_the_label_must_be_the_header(tmp_path, capsys):
+    """A substring test would PASS a report that mentions the label in
+    prose while its header renders without it — the reviewer reads the
+    header (issue #44 E3)."""
+    f = build(tmp_path)
+    md_path = Path(f["report"]) / "report.md"
+    md = md_path.read_text()
+    want = f"**{vs.DEFAULT_LABEL}**"
+    assert want in md
+    drift = "\n".join(l for l in md.splitlines() if l.strip() != want)
+    drift += f"\n- methodology note: this is {vs.DEFAULT_LABEL}\n"
+    md_path.write_text(drift)
+    assert vs.DEFAULT_LABEL in md_path.read_text()   # substring: present
+    assert vmain("--jsonl", f["jsonl"], "--manifest",
+                f["manifest"]) == vs.EXIT_INTEGRITY
+    out = capsys.readouterr().out
+    assert "[FAIL] LABEL" in out, out

@@ -289,7 +289,7 @@ def test_status_at_500_instance_scale(tmp_path):
     assert s["sessions_total"] == 472
     # ETA: 40 remaining / 10 per window = 4 windows, from measured walls
     assert s["eta"]["windows"] == 4
-    assert s["eta"]["basis"].startswith("mean measured session wall")
+    assert s["eta"]["basis"].startswith("median measured session wall")
     assert s["eta"]["session_hours"] == round(40 * 1200 / 3600, 1)
     out = run_status.render(s, run_status.disk_view(str(work)))
     assert "pass@1 SO FAR" in out and "provisional" in out
@@ -500,6 +500,10 @@ AUTHORIZED_BUDGET = {
     "basis": "drill fixture (the real file is issue #44 B2)",
     "authorized_by": "Operator Name <op@example.com>",
     "completion_deadline": "2027-06-30",
+    # issue #44 B7/B2: the gate enforces this field too, so an
+    # "authorized" fixture has to state it
+    "abort_rule": "two consecutive RUN FAILED windows stop the run "
+                  "(drill fixture)",
 }
 
 
@@ -968,3 +972,158 @@ def test_run_window_refuses_to_call_a_window_durable_when_archive_fails(
                    env={"WP6C_ARCHIVE_DEST": str(blocker)})
     assert p.returncode == 5, p.stdout + p.stderr
     assert "NOT durable" in p.stderr, p.stderr
+
+
+# ---------------------------------------------------------------------------
+# issue #44 review round 1: the wrapper's window contract, the ETA's
+# statistic, and the read-only tool's documented exit code
+# ---------------------------------------------------------------------------
+
+def test_run_window_supplies_the_window_cap_flag(tmp_path):
+    """A wrapper that documents the per-window model while leaving
+    ``--stop-at-window-cap`` to the operator sleeps for days inside the
+    process — the resume line never prints and the archive step below it
+    never runs (issue #44 E5)."""
+    args = ["--pilot", "c", "--mode", "container", "--run-id", "full500",
+            "--workdir", str(tmp_path / "wd"), "--resume"]
+    p, calls = _window(tmp_path, rc=42, args=args)
+    assert p.returncode == 42, p.stdout + p.stderr
+    argv = json.loads(calls.read_text())["argv"]
+    assert argv == args + ["--stop-at-window-cap"], argv
+    assert list((tmp_path / "wd" / "logs").glob("window-*.log"))
+    # the printed resume command is the one that ends the window again
+    hint = [l for l in p.stdout.splitlines() if "run_window.sh" in l
+            and "--workdir" in l]
+    assert hint and "--stop-at-window-cap" in hint[-1], p.stdout
+
+
+def test_run_window_never_doubles_the_flag(tmp_path):
+    p, calls = _window(tmp_path, rc=42, args=["--workdir",
+                                              str(tmp_path / "wd"),
+                                              "--stop-at-window-cap"])
+    argv = json.loads(calls.read_text())["argv"]
+    assert argv.count("--stop-at-window-cap") == 1, argv
+
+
+def test_run_window_keep_running_opts_back_into_the_process(tmp_path):
+    """WP6b's contract (one long-lived process that sleeps between
+    windows) stays available: the wrapper states its model, it does not
+    impose it."""
+    p, calls = _window(tmp_path, rc=0, env={"WP6C_KEEP_RUNNING": "1"})
+    assert p.returncode == 0, p.stdout + p.stderr
+    argv = json.loads(calls.read_text())["argv"]
+    assert "--stop-at-window-cap" not in argv, argv
+    assert "WP6C_KEEP_RUNNING" in p.stdout
+
+
+def test_run_window_accepts_the_equals_form(tmp_path):
+    """``--workdir=path`` is argparse-legal. The wrapper parses the args
+    only to place the window log and name the archive, and a parser that
+    missed the glued form would write the log somewhere else while the
+    harness ran the right run (issue #44 E5)."""
+    wd = tmp_path / "wd"
+    p, calls = _window(tmp_path, rc=0, args=[f"--workdir={wd}",
+                                            "--run-id=full500"])
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert list((wd / "logs").glob("window-*.log")), p.stdout
+    assert not (tmp_path / "logs").exists()
+    argv = json.loads(calls.read_text())["argv"]
+    assert argv[:4] == ["--workdir", str(wd), "--run-id", "full500"], argv
+
+
+def test_run_window_no_args_is_the_documented_config_error(tmp_path):
+    """exit 2 + the message — not bash's unbound-variable exit 1, which
+    the runbook's exit-code table has no row for."""
+    p, _calls = _window(tmp_path, args=[])
+    assert p.returncode == 2, (p.returncode, p.stdout, p.stderr)
+    assert "--workdir" in p.stdout + p.stderr
+    assert "unbound variable" not in p.stderr
+
+
+def test_eta_uses_the_median_when_a_session_wedged(tmp_path):
+    """One wedged session at the wall cap is exactly the case the ETA
+    exists to survive. The mean projects the run out by days on it; the
+    median (also what checklist item 10 calibrates on) does not
+    (issue #44 E5)."""
+    walls = [1200.0] * 50 + [36000.0, 36000.0]   # two 10h wedges
+    ids = [f"a__a-{i}" for i in range(len(walls) + 20)]  # 20 still queued
+    lines = [_rec(iid, "failed_test", T0 + i * 60, wall=w)
+             for i, (iid, w) in enumerate(zip(ids, walls))]
+    work = _mk_run(tmp_path, lines)
+    s = run_status.status(str(work / "run-full500.jsonl"), ids, 10)
+    assert s["measure"]["median_s"] == 1200.0
+    assert s["measure"]["mean_s"] > 2000
+    assert s["eta"]["basis"].startswith("median measured session wall")
+    assert "mean" in s["eta"]["basis"]          # both, so it's auditable
+    assert s["eta"]["windows"] == 2             # 20 queued / cap 10
+
+
+def test_status_a_malformed_manifest_is_an_input_error(tmp_path, capsys):
+    """The manifest is what makes '472/500' mean something; a file that
+    is not a manifest must exit 2, not render a dashboard of dashes."""
+    work = _mk_run(tmp_path, [_rec("a__a-1", "resolved", T0)])
+    bad = tmp_path / "bad.json"
+    for content in ('{"instances": [{"id": "x"}]}', "[]", "{not json"):
+        bad.write_text(content)
+        rc = run_status.main(["--workdir", str(work), "--manifest",
+                             str(bad)])
+        err = capsys.readouterr().err
+        assert rc == run_status.EXIT_INPUT, (content, rc, err[-400:])
+        assert err.startswith("INPUT:") and "Traceback" not in err, err
+
+
+def test_status_a_non_numeric_cap_falls_back_loudly(tmp_path, monkeypatch,
+                                                   capsys):
+    """A budget file whose caps still say PENDING says 'not authorized
+    yet' — the read-only dashboard must still answer, and must say which
+    cap it invented (issue #44 B2/B7)."""
+    monkeypatch.setattr(lp, "load_budget_file",
+                        lambda _p: {"max_sessions_per_day": "PENDING",
+                                    "max_wall_per_session": "PENDING"})
+    work = _mk_run(tmp_path, [_rec(f"a__a-{i}", "resolved", T0 + i * 60)
+                             for i in range(3)])
+    assert run_status.main(["--workdir", str(work), "--manifest", ""]) \
+        == run_status.EXIT_OK
+    out = capsys.readouterr()
+    assert "NOTE" in out.err and "PENDING" in out.err, out.err
+    assert "cap 10/window" in out.out, out.out
+
+
+def test_archive_latest_is_a_pointer_and_a_corrupt_manifest_is_clean(
+        tmp_path, capsys):
+    """LATEST.tsv names the newest window's manifest (so a hand-checked
+    backup has one file to open), and a manifest with a corrupt byte
+    count must exit 2 with a sentence — not a ValueError in the middle of
+    the durability check the operator is relying on (issue #44 B4)."""
+    wd = tmp_path / "wd"
+    wd.mkdir()
+    (wd / "run-full500.jsonl").write_text(
+        _rec("test__repo0-1", "resolved", T0) + "\n")
+    (wd / "report").mkdir()
+    (wd / "report" / "report.md").write_text("# report\n")
+    dest = tmp_path / "offhost"
+    rc = ar.main(["--workdir", str(wd), "--dest", str(dest),
+                 "--stamp", "20260101T000000Z"])
+    assert rc == ar.EXIT_OK
+    latest = (dest / "full500" / "LATEST.tsv").read_text().strip()
+    target = Path(latest)
+    assert target.is_file() and target.name == "MANIFEST.tsv"
+    assert target.parent.name.startswith("20260101T000000Z")
+    # (a) the bundle itself is corrupt → 3: the backup is wrong
+    bundle = target.parent
+    (bundle / "report" / "report.md").write_text("# tampered\n")
+    assert ar.main(["--verify", "--bundle", str(bundle)]) == ar.EXIT_VERIFY
+    (bundle / "report" / "report.md").write_text("# report\n")
+    assert ar.main(["--verify", "--bundle", str(bundle)]) == ar.EXIT_OK
+    # (b) the manifest METADATA is unparseable → 2: the invocation/file
+    # is wrong, which is a different statement about the backup
+    rows = target.read_text().splitlines()
+    assert rows[0].startswith("# sha256")     # the header is a comment
+    f = rows[1].split("\t")
+    assert len(f) == 4, rows[1]
+    rows[1] = "\t".join([f[0], "not-a-number", f[2], f[3]])
+    target.write_text("\n".join(rows) + "\n")
+    rc = ar.main(["--verify", "--bundle", str(bundle)])
+    err = capsys.readouterr().err
+    assert rc == ar.EXIT_INPUT, (rc, err[-400:])
+    assert "malformed byte count" in err and "Traceback" not in err, err

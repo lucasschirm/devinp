@@ -29,10 +29,18 @@
 #   scripts/run_window.sh --pilot c --mode container --run-id full500 \
 #       --workdir ./full-run --resume
 #
+# This script SUPPLIES ``--stop-at-window-cap`` (issue #44 E5): the WP3
+# runner's default is to sleep to the next UTC window inside the process,
+# which would leave this script running for days, never printing the
+# resume line, never archiving. Set WP6C_KEEP_RUNNING=1 for that
+# (in-process) model.
+#
 # Environment (all optional):
 #   PYTHON              the interpreter (default: python3)
 #   LIVE_PILOT          the harness path (default: ../live_pilot.py)
 #   LOG_DIR             window logs (default: <workdir>/logs)
+#   WP6C_KEEP_RUNNING   don't add --stop-at-window-cap (the WP6b
+#                       in-process sleep model: one long-lived process)
 #   WP6C_ARCHIVE_DEST   a path off the run's own disk: every window ends by
 #                       archiving its artifacts there and VERIFYING the copy
 #                       byte-for-byte (scripts/archive_run.py); a failed
@@ -53,19 +61,47 @@ HARNESS="${LIVE_PILOT:-$SELF_DIR/../live_pilot.py}"
 	die "no interpreter at PYTHON=$PYTHON"
 [ -f "$HARNESS" ] || die "no harness at $HARNESS"
 
-# the workdir is parsed out of the passthrough args purely to place the
-# log — the harness remains the only reader of the invocation itself
+# ---- the effective invocation ------------------------------------------
+#
+# 1. ``--flag=value`` is normalised to ``--flag value`` (argparse accepts
+#    both forms, and the scan below — and the harness — must see the same
+#    thing the operator typed).
+# 2. the window model is THIS script's whole reason to exist, so it
+#    supplies ``--stop-at-window-cap`` itself: without it the WP3 runner
+#    sleeps to the next UTC window INSIDE the process, this script never
+#    returns, exit 42 never happens and the per-window archive below never
+#    runs. An operator who wants the in-process model (a long-lived
+#    screen session, the WP6b contract) sets WP6C_KEEP_RUNNING=1.
+EFF=()
+for a in "$@"; do
+	case "$a" in
+	--workdir=* | --run-id=* | --instances=* | --budget-file=*)
+		EFF+=("${a%%=*}" "${a#*=}")
+		;;
+	*) EFF+=("$a") ;;
+	esac
+done
+HAS_STOP_CAP=0
+for a in ${EFF[@]+"${EFF[@]}"}; do
+	[ "$a" = "--stop-at-window-cap" ] && HAS_STOP_CAP=1
+done
+if [ "$HAS_STOP_CAP" = 0 ] && [ -z "${WP6C_KEEP_RUNNING:-}" ]; then
+	EFF+=(--stop-at-window-cap)
+fi
+
+# the workdir/run id are parsed out of the args purely to place the log
+# and the archive — the harness remains the only reader of the run itself
 WORKDIR=""
 RUN_ID=""
 prev=""
-for a in "$@"; do
+for a in ${EFF[@]+"${EFF[@]}"}; do
 	case "$prev" in
 	--workdir) WORKDIR="$a" ;;
 	--run-id) RUN_ID="$a" ;;
 	esac
 	prev="$a"
 done
-case "$1" in
+case "${1:-}" in
 -h | --help)
 	# the whole header, whatever length it grows to (a fixed line range
 	# silently truncates the moment somebody documents another exit code)
@@ -91,13 +127,25 @@ while [ -e "$LOG" ]; do
 	n=$((n + 1))
 done
 
-echo "run_window: $PYTHON $HARNESS $*"
+echo "run_window: $PYTHON $HARNESS ${EFF[*]}"
 echo "run_window: log $LOG"
+if [ -n "${WP6C_KEEP_RUNNING:-}" ]; then
+	echo "run_window: window model: in-process sleep between windows"
+	echo "              (WP6C_KEEP_RUNNING=1: this process stays alive"
+	echo "              across UTC days — WP6b's contract; no exit 42,"
+	echo "              so no per-window archive either)"
+elif [ "$HAS_STOP_CAP" = 0 ]; then
+	echo "run_window: window model: one window, stop at the cap"
+	echo "              (added --stop-at-window-cap)"
+else
+	echo "run_window: window model: one window, stop at the cap"
+	echo "              (--stop-at-window-cap was already in the args)"
+fi
 echo "run_window: ----"
 
 # one invocation, no retry, the exit code preserved through the tee
 # (PIPESTATUS, not $? — the operator needs the harness' code, not tee's)
-"$PYTHON" "$HARNESS" "$@" 2>&1 | tee "$LOG"
+"$PYTHON" "$HARNESS" ${EFF[@]+"${EFF[@]}"} 2>&1 | tee "$LOG"
 rc=${PIPESTATUS[0]}
 
 echo "run_window: ----"
@@ -111,7 +159,7 @@ case "$rc" in
 	echo "run_window: exit 42 — WINDOW CAP reached (the daily budget is"
 	echo "              spent; the checkpoint holds every outcome)."
 	echo "              Next window, same command:"
-	echo "                $0 $*"
+	echo "                $0 ${EFF[*]}"
 	echo "              Status any time (read-only):"
 	echo "                $PYTHON $SELF_DIR/run_status.py --workdir $WORKDIR"
 	;;
