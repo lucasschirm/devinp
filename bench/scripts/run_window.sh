@@ -63,24 +63,26 @@ HARNESS="${LIVE_PILOT:-$SELF_DIR/../live_pilot.py}"
 
 # ---- the effective invocation ------------------------------------------
 #
-# 1. ``--flag=value`` is normalised to ``--flag value`` (argparse accepts
-#    both forms, and the scan below — and the harness — must see the same
-#    thing the operator typed).
+# 1. the operator's argv is forwarded EXACTLY as typed. It used to be
+#    "normalised" here (``--workdir=X`` → ``--workdir X``), which changed
+#    the command rather than the spelling: argparse takes the glued form
+#    as it stands — ``--workdir=--x`` means the value ``--x`` — while the
+#    split form hands it an option where the value was, so rewriting it
+#    substituted a different outcome for the one asked for. The scans
+#    below read both forms instead (issue #44 review round 4).
 # 2. the window model is THIS script's whole reason to exist, so it
 #    supplies ``--stop-at-window-cap`` itself: without it the WP3 runner
 #    sleeps to the next UTC window INSIDE the process, this script never
 #    returns, exit 42 never happens and the per-window archive below never
 #    runs. An operator who wants the in-process model (a long-lived
 #    screen session, the WP6b contract) sets WP6C_KEEP_RUNNING=1.
-EFF=()
-for a in "$@"; do
-	case "$a" in
-	--workdir=* | --run-id=* | --instances=* | --budget-file=*)
-		EFF+=("${a%%=*}" "${a#*=}")
-		;;
-	*) EFF+=("$a") ;;
-	esac
-done
+# 3. ``--workdir=X`` is the same flag to argparse as ``--workdir X``, and
+#    the scan below looks at separate tokens — so the glued form is split.
+#    A value that itself starts with ``-`` is left glued: that is what
+#    argparse was given, argparse rejects it, and silently un-gluing it
+#    would turn the operator's own command into a different refusal
+#    (issue #44 review r4).
+EFF=("$@")
 HAS_STOP_CAP=0
 for a in ${EFF[@]+"${EFF[@]}"}; do
 	[ "$a" = "--stop-at-window-cap" ] && HAS_STOP_CAP=1
@@ -131,6 +133,12 @@ for a in ${EFF[@]+"${EFF[@]}"}; do
 	case "$prev" in
 	--workdir) WORKDIR="$a" ;;
 	--run-id) RUN_ID="$a" ;;
+	esac
+	# the glued spelling, so a normalised argv is not required for the
+	# log and the archive to land in the run's own directory
+	case "$a" in
+	--workdir=*) WORKDIR="${a#*=}" ;;
+	--run-id=*) RUN_ID="${a#*=}" ;;
 	esac
 	prev="$a"
 done
@@ -208,7 +216,12 @@ case "$rc" in
 	# ONE line: a hint wrapped after the program name runs run_status.py
 	# bare (argparse exit 2) and then tries to execute '--workdir'
 	# (issue #44 review r3 — the round-2 quoting fix introduced this)
-	STATUS_CMD="$PYTHON $SELF_DIR/run_status.py --workdir $(printable "$WORKDIR")"
+	# every token of it, not just the arguments: under a checkout like
+	# "/tmp/spaced dir/", an unquoted $SELF_DIR printed a command that runs
+	# /tmp/spaced (issue #44 review round 4 — the round-3 fix quoted $0 and
+	# the workdir but not the program, so the sibling hint was still wrong)
+	STATUS_CMD="$(printable "$PYTHON" "$SELF_DIR/run_status.py") \
+--workdir $(printable "$WORKDIR")"
 	echo "                $STATUS_CMD"
 	;;
 4)

@@ -1028,7 +1028,12 @@ def test_run_window_accepts_the_equals_form(tmp_path):
     assert list((wd / "logs").glob("window-*.log")), p.stdout
     assert not (tmp_path / "logs").exists()
     argv = json.loads(calls.read_text())["argv"]
-    assert argv[:4] == ["--workdir", str(wd), "--run-id", "full500"], argv
+    # …and what the harness receives is what the operator typed: argparse
+    # reads both spellings, and rewriting the glued form makes
+    # ``--workdir=--x`` (the value ``--x``) into an option error
+    # (issue #44 review round 4)
+    assert argv == [f"--workdir={wd}", "--run-id=full500",
+                    "--stop-at-window-cap"], argv
 
 
 def test_run_window_no_args_is_the_documented_config_error(tmp_path):
@@ -1310,32 +1315,6 @@ def test_status_hint_is_one_pasteable_command(tmp_path):
     assert chk.returncode == 0, (cmd, chk.stderr)
 
 
-def test_resume_hint_quotes_its_own_program(tmp_path):
-    """$0 is part of the pasted command too: a checkout under a path with
-    a space would otherwise stop being the command it prints (issue #44
-    review round 3 nit)."""
-    import shlex
-    spaced = tmp_path / "a copy"
-    spaced.mkdir()
-    target = spaced / "run_window.sh"
-    target.write_text((_SCRIPTS / "run_window.sh").read_text())
-    stub = tmp_path / "stub_harness.py"
-    stub.write_text(STUB)
-    env = dict(os.environ)
-    env.update({"PYTHON": sys.executable, "LIVE_PILOT": str(stub),
-                "STUB_RC": "42", "STUB_CALLS": str(tmp_path / "c.json")})
-    p = subprocess.run(["bash", str(target), "--workdir",
-                        str(tmp_path / "wd")], capture_output=True,
-                       text=True, env=env, timeout=120, cwd=str(tmp_path))
-    lines = p.stdout.splitlines()
-    at = [n for n, l in enumerate(lines) if "Next window" in l]
-    assert at, p.stdout + p.stderr
-    cmd = lines[at[0] + 1].strip()
-    assert shlex.split(cmd)[0] == str(target), cmd
-    chk = subprocess.run(["bash", "-n", "-c", cmd], capture_output=True)
-    assert chk.returncode == 0, (cmd, chk.stderr)
-
-
 @pytest.mark.parametrize("value,follows", [("FALSE", True), ("Off", True),
                                            ("NO", True), ("yes", False),
                                            ("1", False)])
@@ -1396,3 +1375,103 @@ def test_status_a_manifest_with_a_hollow_entry_is_input_too(tmp_path,
         err = capsys.readouterr().err
         assert rc == run_status.EXIT_INPUT, (doc, rc, err)
         assert "instance_id" in err and "Traceback" not in err, (doc, err)
+
+
+# --------------------------------------------------------------------------
+# issue #44 review round 4 (Devin on #47): the tokens of the hint that were
+# still bare, and two numbers that were not the numbers used
+# --------------------------------------------------------------------------
+
+def _run_from(tmp_path, spaced=True):
+    """Run the wrapper from a checkout whose path contains a space — the
+    condition every printed hint has to survive."""
+    where = tmp_path / ("a copy" if spaced else "plain")
+    where.mkdir(parents=True, exist_ok=True)
+    target = where / "run_window.sh"
+    target.write_text((_SCRIPTS / "run_window.sh").read_text())
+    stub = tmp_path / "stub_harness.py"
+    stub.write_text(STUB)
+    env = dict(os.environ)
+    env.update({"PYTHON": sys.executable, "LIVE_PILOT": str(stub),
+                "STUB_RC": "42", "STUB_CALLS": str(tmp_path / "c.json")})
+    p = subprocess.run(["bash", str(target), "--workdir",
+                        str(tmp_path / "wd")], capture_output=True,
+                       text=True, env=env, timeout=120, cwd=str(tmp_path))
+    return p, target
+
+
+def test_status_hint_survives_a_checkout_with_a_space(tmp_path):
+    """Round 3 quoted $0 and the workdir but left ``$PYTHON`` and
+    ``$SELF_DIR/run_status.py`` bare, so under '/tmp/spaced dir/' the hint
+    printed a command that runs '/tmp/spaced'. Both hints are one shlex
+    round-trip from being the real argv now."""
+    import shlex
+    p, target = _run_from(tmp_path)
+    lines = p.stdout.splitlines()
+    wd = str(tmp_path / "wd")
+
+    def hint(marker):
+        at = [n for n, l in enumerate(lines) if marker in l]
+        assert at, (marker, p.stdout)
+        cmd = lines[at[0] + 1].strip()
+        chk = subprocess.run(["bash", "-n", "-c", cmd],
+                             capture_output=True)
+        assert chk.returncode == 0, (cmd, chk.stderr)
+        return shlex.split(cmd)
+
+    resume = hint("Next window")
+    assert resume[0] == str(target), resume        # $0, quoted
+    # …followed by the EFFECTIVE argv, which is the operator's own argv
+    # plus the --stop-at-window-cap this script supplies
+    assert resume[1:3] == ["--workdir", wd], resume
+    assert resume[-1] == "--stop-at-window-cap", resume
+    status = hint("Status any time")
+    assert status[0] == sys.executable, status     # $PYTHON
+    assert status[1] == str(target.parent / "run_status.py"), status
+    assert status[-2:] == ["--workdir", wd], status
+
+
+@pytest.mark.parametrize("arg", ["--workdir={wd}", "--workdir {wd}"])
+def test_the_operator_argv_reaches_the_harness_exactly_as_typed(tmp_path,
+                                                               arg):
+    """The wrapper used to rewrite ``--workdir=X`` into ``--workdir X``,
+    which is a DIFFERENT command to argparse: the glued form carries a
+    value beginning with ``-`` (``--workdir=--x`` is the value ``--x``),
+    the split form hands argparse an option where the value was. So argv
+    goes through untouched, and the wrapper reads both spellings itself
+    for the one thing it needs — where the log and the archive go
+    (issue #44 review round 4)."""
+    wd = str(tmp_path / "wd")
+    p, calls = _window(tmp_path, rc=42, args=arg.format(wd=wd).split())
+    argv = json.loads(calls.read_text())["argv"]
+    assert " ".join(argv).startswith(arg.format(wd=wd)), argv
+    assert "--stop-at-window-cap" in argv, argv
+    assert list((tmp_path / "wd" / "logs").glob("window-*.log")), \
+        p.stdout
+
+
+def test_status_a_missing_workdir_is_exit_2(tmp_path, capsys):
+    """"no workdir"/"two checkpoints, pass --run-id" is unreadable input,
+    which this script documents as exit 2 — it left with exit 1 and a
+    bare message (pre-existing, in the contract this PR polishes)."""
+    for args in ([str(tmp_path / "absent"), None],):
+        rc = run_status.main(["--workdir", args[0], "--manifest", ""])
+        err = capsys.readouterr().err
+        assert rc == run_status.EXIT_INPUT, (rc, err)
+        assert err.startswith("INPUT:"), err
+    # an ambiguous workdir says the same thing
+    work = tmp_path / "two"
+    work.mkdir()
+    for name in ("run-a.jsonl", "run-b.jsonl"):
+        (work / name).write_text("")
+    assert run_status.main(["--workdir", str(work), "--manifest",
+                          ""]) == run_status.EXIT_INPUT
+
+
+def test_usable_cap_names_the_cap_the_eta_uses():
+    """status() computes with max(1, cap), so a 0.5 announced as
+    '0/window' would name a number the ETA never used (r4)."""
+    for value, expected in [(0.5, 1), (3.7, 3), (1.2, 1)]:
+        cap, why = run_status.usable_cap(value)
+        assert cap == expected, (value, cap)
+        assert f"uses {expected}/window" in why, (value, why)

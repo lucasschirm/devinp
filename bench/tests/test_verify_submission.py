@@ -713,3 +713,19 @@ def test_verify_refuses_a_hollow_manifest_with_exit_2(tmp_path, capsys,
     err = capsys.readouterr().err
     assert rc == vs.EXIT_INPUT, (doc, rc, err)
     assert "INPUT:" in err and "Traceback" not in err, (doc, err)
+
+
+def test_package_reports_a_corrupt_run_meta_as_input(tmp_path, capsys):
+    """package() reads run_meta.json before vs.verify() reaches its META
+    check, so a malformed one escaped as a JSONDecodeError traceback and
+    exit 1 — the same class this PR fixes everywhere else (r4)."""
+    f = build(tmp_path)
+    meta = Path(f["report"], "run_meta.json")
+    meta.write_text('{"run_id": "r1", ')          # truncated JSON
+    out = str(tmp_path / "sub")
+    rc = pmain("--jsonl", f["jsonl"], "--out", out, "--manifest",
+               f["manifest"])
+    err = capsys.readouterr().err
+    assert rc == ps.EXIT_INPUT, (rc, err)
+    assert err.startswith("INPUT:") and "Traceback" not in err, err
+    assert "run_meta.json" in err, err

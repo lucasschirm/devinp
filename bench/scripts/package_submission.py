@@ -173,8 +173,16 @@ def package(jsonl: str, report_dir: str, out: str, *,
     meta_path = os.path.join(report_dir, "run_meta.json")
     if not os.path.isfile(meta_path):
         raise SystemExit(f"no run_meta.json in {report_dir!r}")
-    with open(meta_path, "r", encoding="utf-8") as f:
-        meta = json.load(f)
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+    except (ValueError, OSError) as exc:
+        # a corrupt run_meta.json used to escape as a JSONDecodeError
+        # traceback (exit 1) because this read happens before vs.verify()
+        # gets to report the same file as a failed META check — the whole
+        # point of this PR's error-handling pass (issue #44 review r4)
+        raise vs.InputError(f"{meta_path!r} is not readable JSON: {exc}"
+                            ) from exc
 
     # a stale bundle must never be published beside a changed checkpoint:
     # re-packaging is allowed only when the destination is empty (or the

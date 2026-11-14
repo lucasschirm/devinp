@@ -146,11 +146,9 @@ def usable_cap(value) -> "tuple[int, str]":
     act on (issue #44 E5/B2, reviewed).
     """
     if value is None:
-        return DEFAULT_CAP, ""
+        return DEFAULT_CAP, ""      # nothing configured: a quiet fallback
     fallback = (f"the ETA below uses the WP6a default of "
                 f"{DEFAULT_CAP}/window instead")
-    if value is None:
-        return DEFAULT_CAP, ""      # nothing configured: a quiet fallback
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return DEFAULT_CAP, (f"max_sessions_per_day {value!r} is not a "
                              f"number — {fallback}")
@@ -165,10 +163,12 @@ def usable_cap(value) -> "tuple[int, str]":
                              f"positive number — {fallback}")
     if int(value) != value:
         # 3.7 is a cap the harness itself would refuse; saying so beats
-        # truncating it to 3 in silence (review r3)
-        return int(value), (f"max_sessions_per_day {value!r} is not a whole "
-                            f"number — the ETA below uses {int(value)}"
-                            f"/window")
+        # truncating it to 3 in silence (review r3). And the number named
+        # must be the number used: status() computes with max(1, cap), so
+        # 0.5 must not be announced as 0/window (review r4)
+        eff = max(1, int(value))
+        return eff, (f"max_sessions_per_day {value!r} is not a whole "
+                     f"number — the ETA below uses {eff}/window")
     return int(value), ""
 
 
@@ -447,7 +447,15 @@ def main(argv: "list[str] | None" = None) -> int:
         jsonl = args.jsonl
         run_id = Path(jsonl).name[4:-len(".jsonl")]
     else:
-        jsonl, run_id = find_jsonl(args.workdir, args.run_id)
+        try:
+            jsonl, run_id = find_jsonl(args.workdir, args.run_id)
+        except SystemExit as exc:
+            # the documented contract of this script is 0 = readable and
+            # 2 = unreadable input; "no workdir"/"two checkpoints, pass
+            # --run-id" is exactly that, and used to leave with exit 1
+            # (issue #44 review round 4, pre-existing line)
+            print(f"INPUT: {exc}", file=sys.stderr)
+            return EXIT_INPUT
     if not os.path.isfile(jsonl):
         print(f"INPUT: no checkpoint at {jsonl!r}", file=sys.stderr)
         return EXIT_INPUT
