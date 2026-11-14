@@ -812,11 +812,23 @@ def manifest_ids(doc: object) -> "list[str]":
         raise ValueError("expected an object with an \"instances\" list "
                          "of objects carrying instance_id")
     ids: "list[str]" = []
+    seen: "set[str]" = set()
     for n, item in enumerate(rows):
         iid = item.get("instance_id") if isinstance(item, dict) else None
         if not isinstance(iid, str) or not iid:
             raise ValueError(f"instances[{n}] has no non-empty string "
                              f"instance_id (entry {item!r})")
+        # uniqueness is part of the shape: a repeated id is counted once
+        # by every consumer's set/dict, so a 500-entry manifest holding 480
+        # distinct ids would report a complete run at 480 — the same
+        # silently-shrunk denominator as the dropped checkpoint line
+        # (issue #44 review round 5; pin_verified_instances.py guarantees
+        # this for the committed file, --manifest accepts any path)
+        if iid in seen:
+            raise ValueError(f"instances[{n}] repeats instance_id "
+                             f"{iid!r} (a duplicate would shrink the "
+                             "completeness denominator)")
+        seen.add(iid)
         ids.append(iid)
     if not ids:
         raise ValueError("the \"instances\" list is empty")

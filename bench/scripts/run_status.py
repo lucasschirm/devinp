@@ -72,6 +72,24 @@ def find_jsonl(workdir: str, run_id: "str | None") -> "tuple[str, str]":
     return os.path.join(workdir, base), base[4:-len(".jsonl")]
 
 
+def jsonl_run_id(path: str) -> "tuple[str, str]":
+    """``(run id, warning)`` read from a checkpoint's own name.
+
+    The layout is ``run-<id>.jsonl`` and the state file beside it is
+    ``pilot-<id>.state.json``. Slicing the name blindly invented an id for
+    any other file — ``checkpoint.jsonl`` yielded ``kpoint``, the state
+    lookup missed, and the dashboard silently dropped the previous
+    window's flags while still printing a run id that looked real (issue
+    #44 review round 5). No id, and a warning, instead of a guess.
+    """
+    name = Path(path).name
+    if (name.startswith("run-") and name.endswith(".jsonl")
+            and len(name) > len("run-.jsonl")):
+        return name[4:-len(".jsonl")], ""
+    return "", (f"{name!r} is not run-<id>.jsonl: no run id, so the "
+                "previous window's state file is not consulted")
+
+
 def window_stats(records: list) -> dict:
     """Sessions + wall per UTC window (the quota reset boundary). The
     ``preflight_failed`` batch markers count no session but do count wall;
@@ -191,13 +209,15 @@ def status(jsonl: str, manifest_ids: "list[str] | None",
     pending_retry = sorted(iid for iid, r in finals.items()
                           if r.get("status") in rr.RETRY_STATUSES)
     workdir = os.path.dirname(os.path.abspath(jsonl))
-    run_id = Path(jsonl).name[4:-len(".jsonl")]
+    run_id, id_warning = jsonl_run_id(jsonl)
     # the state file: the previous window's flags (it carries no queue —
     # the checkpoint does), so it is reported, never trusted for the math
     state: dict = {}
     state_error = ""
     state_path = os.path.join(workdir, f"pilot-{run_id}.state.json")
     try:
+        if not run_id:
+            raise OSError("no run id in the file name")
         with open(state_path, "r", encoding="utf-8") as f:
             loaded = json.load(f)
         state = loaded if isinstance(loaded, dict) else {}
@@ -251,6 +271,7 @@ def status(jsonl: str, manifest_ids: "list[str] | None",
     used = sum(w["sessions"] for w in windows.values())
     return {
         "run_id": run_id,
+        "id_warning": id_warning,
         "jsonl": jsonl,
         "workdir": workdir,
         "lines": len(records),
@@ -330,7 +351,9 @@ def disk_view(workdir: str) -> dict:
 
 
 def render(s: dict, disk: "dict | None") -> str:
-    out = [f"# run {s['run_id']} — {s['jsonl']}", ""]
+    out = [f"# run {s['run_id'] or '(unknown)'} — {s['jsonl']}", ""]
+    if s.get("id_warning"):
+        out.append(f"NOTE: {s['id_warning']}")
     if s["dropped_line"]:
         out.append("WARNING: a malformed line was dropped reading the "
                   "checkpoint (the torn-last-line class of a SIGKILL — "
@@ -445,10 +468,9 @@ def main(argv: "list[str] | None" = None) -> int:
 
     if args.jsonl:
         jsonl = args.jsonl
-        run_id = Path(jsonl).name[4:-len(".jsonl")]
     else:
         try:
-            jsonl, run_id = find_jsonl(args.workdir, args.run_id)
+            jsonl, _run_id = find_jsonl(args.workdir, args.run_id)
         except SystemExit as exc:
             # the documented contract of this script is 0 = readable and
             # 2 = unreadable input; "no workdir"/"two checkpoints, pass

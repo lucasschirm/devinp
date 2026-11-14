@@ -1475,3 +1475,70 @@ def test_usable_cap_names_the_cap_the_eta_uses():
         cap, why = run_status.usable_cap(value)
         assert cap == expected, (value, cap)
         assert f"uses {expected}/window" in why, (value, why)
+
+
+# --------------------------------------------------------------------------
+# issue #44 review round 5 (Devin on #47): the injected flag was scannable
+# argv, and a name that carries no run id invented one
+# --------------------------------------------------------------------------
+
+def test_a_trailing_flag_never_eats_the_injected_one(tmp_path):
+    """``--run-id`` typed without its value used to make the scan read the
+    ``--stop-at-window-cap`` this script injects, so archive_run got
+    ``--run-id --stop-at-window-cap`` and the wrapper answered a bad
+    invocation with exit 5, "fix the destination"."""
+    work = _mk_run(tmp_path, [_rec(f"a__a-{i}", "resolved", T0 + i * 60)
+                             for i in range(2)])
+    p, _ = _window(tmp_path, rc=42, args=["--workdir", str(work),
+                                         "--run-id"],
+                   env={"WP6C_ARCHIVE_DEST": str(tmp_path / "offhost")})
+    assert "fix the destination" not in p.stdout, p.stdout
+    assert p.returncode == 42, (p.returncode, p.stdout[-600:])
+
+
+def test_a_trailing_workdir_is_the_documented_config_error(tmp_path):
+    """Same class: the value it never had must not become the injected
+    flag, which then turned into a bogus log-directory name."""
+    p, _ = _window(tmp_path, rc=42, args=["--run-id", "x", "--workdir"])
+    assert p.returncode == 2, (p.returncode, p.stdout, p.stderr)
+    assert "pass --workdir" in p.stderr, p.stderr
+
+
+@pytest.mark.parametrize("name,warns", [
+    ("run-full500.jsonl", ""),
+    ("run-x.jsonl", ""),
+    ("checkpoint.jsonl", "not run-<id>.jsonl"),
+    ("run-.jsonl", "not run-<id>.jsonl"),
+    ("jsonl", "not run-<id>.jsonl"),
+])
+def test_jsonl_run_id_refuses_to_guess(name, warns):
+    """Slicing ``checkpoint.jsonl`` into ``kpoint`` was a run id that
+    looked real, missed the state file, and silently dropped the previous
+    window's flags from the dashboard (issue #44 review round 5)."""
+    rid, why = run_status.jsonl_run_id(f"/some/dir/{name}")
+    if warns:
+        assert rid == "" and warns in why, (name, rid, why)
+    else:
+        assert rid == name[4:-len(".jsonl")] and why == "", (name, rid, why)
+
+
+def test_status_says_aloud_when_it_has_no_run_id(tmp_path, capsys):
+    """The refusal must be visible, not a run id that quietly reads as a
+    real one three screens down."""
+    work = _mk_run(tmp_path, [_rec("a__a-1", "resolved", T0)],
+                   name="checkpoint.jsonl")
+    (work / "pilot-kpoint.state.json").write_text(json.dumps(
+        {"final_state": "WINDOW_CAP", "window_cap": True}))
+    rc = run_status.main(["--jsonl", str(work / "checkpoint.jsonl"),
+                        "--manifest", ""])
+    out = capsys.readouterr()
+    assert rc == run_status.EXIT_OK, (rc, out.err)
+    assert "NOTE" in out.out and "not run-<id>.jsonl" in out.out, out.out
+    assert "WINDOW_CAP" not in out.out, out.out
+    # the --json form carries the same statement
+    proc = subprocess.run([sys.executable, str(_SCRIPTS / "run_status.py"),
+                           "--jsonl", str(work / "checkpoint.jsonl"),
+                           "--manifest", "", "--json"],
+                          capture_output=True, text=True,
+                          env=dict(os.environ, PYTHONPATH=str(_BENCH)))
+    assert json.loads(proc.stdout)["id_warning"], proc.stdout

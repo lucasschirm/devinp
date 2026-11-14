@@ -729,3 +729,21 @@ def test_package_reports_a_corrupt_run_meta_as_input(tmp_path, capsys):
     assert rc == ps.EXIT_INPUT, (rc, err)
     assert err.startswith("INPUT:") and "Traceback" not in err, err
     assert "run_meta.json" in err, err
+
+
+@pytest.mark.parametrize("doc", [
+    '{"instances": [{"instance_id": "a"}, {"instance_id": "a"}]}',
+    '{"instances": [{"instance_id": "a"}, {"instance_id": "b"}, '
+    '{"instance_id": "a"}]}',
+])
+def test_a_manifest_with_a_duplicate_id_is_input(tmp_path, capsys, doc):
+    """A 500-entry manifest holding 480 distinct ids would otherwise report
+    a complete run at 480: every consumer dedupes, so the denominator
+    shrinks in silence (issue #44 review round 5)."""
+    f = build(tmp_path)
+    man = tmp_path / "dupes.json"
+    man.write_text(doc)
+    rc = vmain("--jsonl", f["jsonl"], "--manifest", str(man))
+    err = capsys.readouterr().err
+    assert rc == vs.EXIT_INPUT, (rc, err)
+    assert "repeats instance_id" in err and "Traceback" not in err, err

@@ -129,7 +129,13 @@ printable() {
 WORKDIR=""
 RUN_ID=""
 prev=""
-for a in ${EFF[@]+"${EFF[@]}"}; do
+# the operator's OWN argv, not EFF: EFF already carries the
+# --stop-at-window-cap this script injects, and a trailing flag-without-a-
+# value ("--run-id" typed on its own) would have the scan eat the injected
+# flag — archive_run then got --run-id --stop-at-window-cap and the wrapper
+# reported exit 5 "fix the destination" for what is a bad invocation
+# (documented exit 2) — issue #44 review round 5
+for a in ${1+"$@"}; do
 	case "$prev" in
 	--workdir) WORKDIR="$a" ;;
 	--run-id) RUN_ID="$a" ;;

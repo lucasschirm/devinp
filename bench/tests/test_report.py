@@ -1048,3 +1048,13 @@ def test_manifest_ids_refuses_a_hollow_document(doc, why):
     with pytest.raises(ValueError) as e:
         report.manifest_ids(doc)
     assert why in str(e.value)
+
+
+def test_manifest_ids_rejects_a_duplicate():
+    """Uniqueness is part of the shape, not a nicety: the pin script
+    guarantees it for the committed file, and --manifest takes any path."""
+    with pytest.raises(ValueError, match="repeats instance_id"):
+        report.manifest_ids({"instances": [{"instance_id": "a"},
+                                           {"instance_id": "a"}]})
+    assert report.manifest_ids(
+        [{"instance_id": "a"}, {"instance_id": "b"}]) == ["a", "b"]
