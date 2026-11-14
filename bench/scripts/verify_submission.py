@@ -383,7 +383,7 @@ def verify(jsonl: str, report_dir: str,
             # and "meaningless" must not read as "verified"
             raise InputError(
                 f"{manifest_path!r} is not a pinned instance manifest "
-                f"({'{{"instances": [...]}}' } required): {exc}") from exc
+                f"({{\"instances\": [...]}} required): {exc}") from exc
         check_queue(finals, ids, res)
     if bundle:
         check_bundle(bundle, bundle_run_id(jsonl), finals,
